@@ -3,6 +3,8 @@
 /**
  * Standalone sweep: probe BMC web UI (auto-login + iLO /json/session_info) for every non-suspended server.
  * Cron example (daily): 0 3 * * * php /var/www/html/jobs/ipmi_web_probe.php --limit=200
+ * Optional deep checks: --deep=1
+ * Optional proxy-flow checks (same path as Open IPMI Session): --proxy=1
  *
  * Disable all web probes: env IPMI_WEB_PROBE=0 or define IPMI_WEB_PROBE_AUTO false in config.php
  */
@@ -22,12 +24,20 @@ if (!ipmiWebProbeShouldRun()) {
 
 $limit = 500;
 $targetId = 0;
+$deep = false;
+$proxyFlow = false;
 foreach ($_SERVER['argv'] ?? [] as $arg) {
     if (strpos($arg, '--limit=') === 0) {
         $limit = max(1, (int) substr($arg, 8));
     }
     if (strpos($arg, '--id=') === 0) {
         $targetId = (int) substr($arg, 5);
+    }
+    if (strpos($arg, '--deep=') === 0) {
+        $deep = substr($arg, 7) === '1';
+    }
+    if (strpos($arg, '--proxy=') === 0) {
+        $proxyFlow = substr($arg, 8) === '1';
     }
 }
 
@@ -43,7 +53,7 @@ $fail = 0;
 $skip = 0;
 
 if ($targetId > 0) {
-    $probe = ipmiWebProbeServerWebUi($mysqli, $targetId);
+    $probe = ipmiWebProbeServerWebUiDetailed($mysqli, $targetId, $deep, $proxyFlow);
     ipmiWebProbeLogResult($targetId, $probe);
     if (!empty($probe['skipped'])) {
         $skip++;
@@ -52,7 +62,12 @@ if ($targetId > 0) {
     } else {
         $fail++;
     }
-    echo json_encode(['server_id' => $targetId, 'result' => $probe], JSON_UNESCAPED_SLASHES) . "\n";
+    echo json_encode([
+        'server_id' => $targetId,
+        'deep' => $deep ? 1 : 0,
+        'proxy' => $proxyFlow ? 1 : 0,
+        'result' => $probe
+    ], JSON_UNESCAPED_SLASHES) . "\n";
 } else {
     $stmt = $mysqli->prepare("
         SELECT s.id
@@ -73,7 +88,7 @@ if ($targetId > 0) {
     $res = $stmt->get_result();
     while ($res && ($row = $res->fetch_assoc())) {
         $sid = (int) $row['id'];
-        $probe = ipmiWebProbeServerWebUi($mysqli, $sid);
+        $probe = ipmiWebProbeServerWebUiDetailed($mysqli, $sid, $deep, $proxyFlow);
         ipmiWebProbeLogResult($sid, $probe);
         if (!empty($probe['skipped'])) {
             $skip++;
@@ -84,7 +99,14 @@ if ($targetId > 0) {
         }
     }
     $stmt->close();
-    echo json_encode(['ok' => $ok, 'fail' => $fail, 'skipped' => $skip, 'limit' => $limit], JSON_UNESCAPED_SLASHES) . "\n";
+    echo json_encode([
+        'ok' => $ok,
+        'fail' => $fail,
+        'skipped' => $skip,
+        'limit' => $limit,
+        'deep' => $deep ? 1 : 0,
+        'proxy' => $proxyFlow ? 1 : 0
+    ], JSON_UNESCAPED_SLASHES) . "\n";
 }
 
 flock($lockFp, LOCK_UN);

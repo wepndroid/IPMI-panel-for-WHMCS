@@ -39,19 +39,11 @@ try {
 
 $launchUrl = null;
 if ($error === '' && $sessionData) {
-  // Launch at a vendor-appropriate landing path.
-  // Supermicro/ASRockRack often expects topmenu to render the dashboard frame.
-  $launchPath = '/';
-  $typeNorm = ipmiWebNormalizeBmcType((string) ($sessionData['bmc_type'] ?? 'generic'));
-  if ($typeNorm === 'supermicro') {
-    // Force legacy topmenu for Supermicro to avoid SPA #login/#dashboard loops.
-    $launchPath = '/cgi/url_redirect.cgi?url_name=topmenu&sm_topmenu=1';
-  } elseif ($typeNorm === 'ilo4') {
-    $launchPath = '/';
-  } elseif ($typeNorm === 'ami') {
+  // Launch to vendor-appropriate post-login entry (same class of page as manual login flow).
+  $launchPath = ipmiWebPostLoginLandingPath((string) ($sessionData['bmc_type'] ?? 'generic'));
+  if (!is_string($launchPath) || $launchPath === '') {
     $launchPath = '/';
   }
-  // Forcing #/dashboard can create login<->dashboard loops on some BMC UIs.
   $launchUrl = ipmiWebBuildProxyUrl($sessionData['token'], $launchPath);
   if ($debugProxy) {
     $launchUrl .= (str_contains($launchUrl, '?') ? '&' : '?') . 'ipmi_proxy_debug=1';

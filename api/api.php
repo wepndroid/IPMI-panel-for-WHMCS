@@ -37,6 +37,17 @@ function requestValue($key, $default = '')
   return $default;
 }
 
+function requestValueRaw($key, $default = '')
+{
+  if (isset($_POST[$key])) {
+    return (string)$_POST[$key];
+  }
+  if (isset($_GET[$key])) {
+    return (string)$_GET[$key];
+  }
+  return $default;
+}
+
 function randomPassword($length = 16)
 {
   $length = max(12, (int)$length);
@@ -422,7 +433,8 @@ function ensureServerAndAssignment($mysqli, $userId, $hostname, $serverIp, $ipmi
   $serverIp = trim((string)$serverIp);
   $ipmiIp = trim((string)$ipmiIp);
   $ipmiUser = trim((string)$ipmiUser);
-  $ipmiPass = trim((string)$ipmiPass);
+  // Keep exact password bytes (no trim) to avoid corrupting credentials.
+  $ipmiPass = (string)$ipmiPass;
   $notes = trim((string)$notes);
 
   if ($hostname === '') {
@@ -446,8 +458,8 @@ function ensureServerAndAssignment($mysqli, $userId, $hostname, $serverIp, $ipmi
     throw new Exception('Duplicate hostname in panel');
   }
 
-  $encryptedUser = Encryption::encrypt($ipmiUser);
-  $encryptedPass = Encryption::encrypt($ipmiPass);
+  $encryptedUser = Encryption::normalizeForStorage($ipmiUser, 'ipmi_user');
+  $encryptedPass = Encryption::normalizeForStorage($ipmiPass, 'ipmi_pass');
 
   if ($count === 1) {
     $row = $res->fetch_assoc();
@@ -683,7 +695,7 @@ try {
       $serverIp = requestValue('server_ip', requestValue('dedicated_ip', ''));
       $ipmiIp = requestValue('ipmi_ip', '');
       $ipmiUser = requestValue('ipmi_user', '');
-      $ipmiPass = requestValue('ipmi_pass', '');
+      $ipmiPass = requestValueRaw('ipmi_pass', '');
       $notes = requestValue('notes', 'Provisioned via WHMCS');
 
       if ($email === '' || !filter_var($email, FILTER_VALIDATE_EMAIL)) {

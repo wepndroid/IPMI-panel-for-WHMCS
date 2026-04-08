@@ -567,6 +567,64 @@ function ipmiWebLoginResponseBodyIsFailure(string $raw): bool
 }
 
 /**
+ * Best-effort reason classifier for failed login responses.
+ * Used for faster fail paths and clearer probe diagnostics.
+ */
+function ipmiWebLoginResponseFailureReason(string $raw, int $httpCode, string $bmcType): string
+{
+    $typeNorm = ipmiWebNormalizeBmcType($bmcType);
+    $j = ipmiWebDecodeJsonBody($raw);
+    if (is_array($j)) {
+        $jsonText = strtolower((string) json_encode($j, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+        if (isset($j['code']) && is_numeric($j['code']) && (int) $j['code'] === 15000) {
+            return 'session_limit';
+        }
+        if (str_contains($jsonText, 'maximum number of sessions')) {
+            return 'session_limit';
+        }
+        if (str_contains($jsonText, 'js_err_no_priv')
+            || str_contains($jsonText, 'invalid login attempt')
+            || str_contains($jsonText, 'could not login')
+            || str_contains($jsonText, 'invalid user')
+            || str_contains($jsonText, 'unauthorized name')
+            || str_contains($jsonText, 'access denied')
+            || str_contains($jsonText, 'invalid username')
+            || str_contains($jsonText, 'invalid password')) {
+            return 'invalid_credentials';
+        }
+    }
+
+    [, $body] = ipmiWebCurlExtractFinalHeadersAndBody($raw);
+    $lb = strtolower(substr((string) $body, 0, 240000));
+    if ($lb !== '') {
+        if (str_contains($lb, 'lang_event_sensor_specific_event_str42_2')
+            || str_contains($lb, 'invalid login')
+            || str_contains($lb, 'invalid user')
+            || str_contains($lb, 'invalid password')
+            || str_contains($lb, 'access denied')
+            || str_contains($lb, 'unauthorized name')
+            || str_contains($lb, 'authentication failed')) {
+            return 'invalid_credentials';
+        }
+        if (str_contains($lb, 'maximum number of sessions')) {
+            return 'session_limit';
+        }
+    }
+
+    if ($httpCode === 401 || $httpCode === 403) {
+        if ($typeNorm === 'ilo4' || $typeNorm === 'idrac' || $typeNorm === 'ami' || $typeNorm === 'supermicro') {
+            return 'invalid_credentials';
+        }
+        return 'auth_rejected';
+    }
+    if ($httpCode === 0) {
+        return 'connect_failed';
+    }
+
+    return '';
+}
+
+/**
  * Parse JSON from a BMC response (if present).
  *
  * @return array<string, mixed>|null
@@ -776,6 +834,97 @@ function ipmiWebAmiCleanupSessionsFromDb(?mysqli $mysqli, int $serverId, string 
     return $freed > 0;
 }
 
+function ipmiWebSupermicroAttemptLogout(string $baseUrl, string $bmcIp, array $cookieJar): bool
+{
+    $baseUrl = rtrim($baseUrl, '/');
+    $originBase = ipmiWebBmcOriginBaseFromConnectUrl($baseUrl, $bmcIp);
+    $cookieParts = [];
+    foreach ($cookieJar as $k => $v) {
+        if ($v !== null && trim((string) $v) !== '') {
+            $cookieParts[] = $k . '=' . $v;
+        }
+    }
+    $cookieHeader = $cookieParts !== [] ? implode('; ', $cookieParts) : '';
+
+    [$raw, $code] = ipmiWebCurlExecBmc($bmcIp, $baseUrl . '/cgi/logout.cgi', static function ($ch) use ($originBase, $cookieHeader): void {
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 20);
+        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 8);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+        curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+        curl_setopt($ch, CURLOPT_HEADER, true);
+        curl_setopt($ch, CURLOPT_USERAGENT, ipmiWebCurlUserAgent());
+        curl_setopt($ch, CURLOPT_HTTPGET, true);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, [
+            'Origin: ' . $originBase,
+            'Referer: ' . $originBase . '/',
+        ]);
+        if ($cookieHeader !== '') {
+            curl_setopt($ch, CURLOPT_COOKIE, $cookieHeader);
+        }
+    });
+
+    ipmiWebDebugLog('supermicro_logout_http', [
+        'path' => '/cgi/logout.cgi',
+        'http' => $code,
+    ]);
+
+    return $raw !== false && $code >= 200 && $code < 400;
+}
+
+function ipmiWebSupermicroCleanupSessionsFromDb(?mysqli $mysqli, int $serverId, string $currentToken, string $baseUrl, string $bmcIp, int $limit = 5): bool
+{
+    if (!$mysqli || $serverId <= 0) {
+        return false;
+    }
+    $sql = "
+        SELECT token, bmc_cookies
+        FROM ipmi_web_sessions
+        WHERE server_id = ? AND revoked_at IS NULL AND expires_at > NOW() AND token <> ?
+        ORDER BY COALESCE(last_access_at, created_at) DESC
+        LIMIT ?
+    ";
+    $stmt = $mysqli->prepare($sql);
+    if (!$stmt) {
+        return false;
+    }
+    $stmt->bind_param('isi', $serverId, $currentToken, $limit);
+    $stmt->execute();
+    $res = $stmt->get_result();
+    $rows = $res ? $res->fetch_all(MYSQLI_ASSOC) : [];
+    $stmt->close();
+
+    $freed = 0;
+    foreach ($rows as $row) {
+        $rawCookies = (string) ($row['bmc_cookies'] ?? '');
+        if ($rawCookies === '') {
+            continue;
+        }
+        [$cookies, $forwardHeaders] = ipmiWebUnpackStoredAuth($rawCookies);
+        if (!ipmiWebHasUsableBmcAuth($cookies, $forwardHeaders) || !ipmiWebHasSupermicroAuthCookie($cookies)) {
+            continue;
+        }
+        if (ipmiWebSupermicroAttemptLogout($baseUrl, $bmcIp, $cookies)) {
+            $freed++;
+            $upd = $mysqli->prepare("UPDATE ipmi_web_sessions SET revoked_at = NOW() WHERE token = ? LIMIT 1");
+            if ($upd) {
+                $tok = (string) ($row['token'] ?? '');
+                $upd->bind_param('s', $tok);
+                $upd->execute();
+                $upd->close();
+            }
+        }
+    }
+
+    ipmiWebDebugLog('supermicro_logout_db_cleanup', [
+        'server_id' => $serverId,
+        'freed' => $freed,
+    ]);
+
+    return $freed > 0;
+}
+
 function ipmiWebTryReuseExistingSession(mysqli $mysqli, int $serverId, int $userId, int $ttlSeconds): ?array
 {
     $sql = "
@@ -819,7 +968,10 @@ function ipmiWebTryReuseExistingSession(mysqli $mysqli, int $serverId, int $user
  */
 function ipmiWebLoginShouldRejectAsLoginHtml(string $raw, array $cookieJar, array $forwardHeaders, string $bmcType): bool
 {
-    if (trim((string)($forwardHeaders['X-Auth-Token'] ?? '')) !== '') {
+    $typeNorm = ipmiWebNormalizeBmcType($bmcType);
+    // X-Auth-Token is reliable for iLO/iDRAC web auth bootstrap.
+    // For Supermicro/AMI flows it can appear in non-auth contexts; do not bypass login-page checks there.
+    if (trim((string)($forwardHeaders['X-Auth-Token'] ?? '')) !== '' && in_array($typeNorm, ['ilo4', 'idrac'], true)) {
         return false;
     }
     [, $body] = ipmiWebCurlExtractFinalHeadersAndBody($raw);
@@ -859,7 +1011,22 @@ function ipmiWebLoginResponseHtmlIsLoginPage(string $raw): bool
     $hasPw = strpos($l, 'type="password"') !== false
         || strpos($l, "type='password'") !== false
         || strpos($l, 'type=password') !== false;
+    // Some Supermicro/ATEN login shells render password as plain text input initially
+    // (then switch by JS), so type=password can be absent in raw HTML.
     if (!$hasPw) {
+        $smTextPwdMarkers = (
+            (strpos($l, 'supermicro bmc login') !== false || strpos($l, 'aten international') !== false)
+            && (strpos($l, '/cgi/login.cgi') !== false || strpos($l, 'action="/cgi/login.cgi"') !== false)
+            && (
+                strpos($l, 'name="pwd"') !== false
+                || strpos($l, "name='pwd'") !== false
+                || strpos($l, 'id="pwd"') !== false
+                || strpos($l, "id='pwd'") !== false
+            )
+        );
+        if ($smTextPwdMarkers) {
+            return true;
+        }
         return false;
     }
     if (strpos($l, 'supermicro bmc login') !== false) {
@@ -881,8 +1048,22 @@ function ipmiWebLoginResponseHtmlIsLoginPage(string $raw): bool
 function ipmiWebResponseLooksLikeBmcLoginPage(string $body, string $contentType): bool
 {
     $ct = strtolower($contentType);
-    $l = strtolower(substr($body, 0, 200000));
+    // Ignore JS/CSS payload text when detecting login pages; proxy-injected scripts can contain
+    // strings like input[type=password] and login keywords that would create false positives.
+    $visible = preg_replace('~<script\b[^>]*>.*?</script>~is', ' ', $body);
+    if (!is_string($visible)) {
+        $visible = $body;
+    }
+    $visible = preg_replace('~<style\b[^>]*>.*?</style>~is', ' ', $visible);
+    if (!is_string($visible)) {
+        $visible = $body;
+    }
+
+    $l = strtolower(substr($visible, 0, 200000));
     if (ipmiWebResponseLooksLikeSupermicroAuthedShell($body)) {
+        return false;
+    }
+    if (ipmiWebResponseLooksLikeIloAuthedShell($body)) {
         return false;
     }
     $maybeHtml = strpos($ct, 'html') !== false
@@ -898,7 +1079,24 @@ function ipmiWebResponseLooksLikeBmcLoginPage(string $body, string $contentType)
     if (strpos($l, 'session has timed out') !== false || strpos($l, 'session timed out') !== false) {
         return true;
     }
-    if (strpos($l, 'type="password"') === false && strpos($l, "type='password'") === false && strpos($l, 'type=password') === false) {
+    $hasPw = strpos($l, 'type="password"') !== false
+        || strpos($l, "type='password'") !== false
+        || strpos($l, 'type=password') !== false;
+    if (!$hasPw) {
+        // Supermicro/ATEN can ship login page with text password field and JS-driven masking.
+        $smTextPwdMarkers = (
+            (strpos($l, 'supermicro bmc login') !== false || strpos($l, 'aten international') !== false)
+            && (strpos($l, '/cgi/login.cgi') !== false || strpos($l, 'action="/cgi/login.cgi"') !== false)
+            && (
+                strpos($l, 'name="pwd"') !== false
+                || strpos($l, "name='pwd'") !== false
+                || strpos($l, 'id="pwd"') !== false
+                || strpos($l, "id='pwd'") !== false
+            )
+        );
+        if ($smTextPwdMarkers) {
+            return true;
+        }
         return false;
     }
     if (strpos($l, 'login') !== false
@@ -941,6 +1139,36 @@ function ipmiWebResponseLooksLikeSupermicroAuthedShell(string $body): bool
         $hits++;
     }
     if (strpos($l, 'new redfish (null, session_id)') !== false) {
+        $hits++;
+    }
+
+    return $hits >= 2;
+}
+
+/**
+ * iLO authenticated shell includes login-related strings in JS, which should not be treated as login page.
+ */
+function ipmiWebResponseLooksLikeIloAuthedShell(string $body): bool
+{
+    if ($body === '') {
+        return false;
+    }
+    $l = strtolower(substr($body, 0, 260000));
+    if ($l === '') {
+        return false;
+    }
+
+    $hits = 0;
+    if (strpos($l, 'function starteventwatchdog') !== false) {
+        $hits++;
+    }
+    if (strpos($l, '/json/session_info') !== false) {
+        $hits++;
+    }
+    if (strpos($l, 'id=modalframe') !== false || strpos($l, 'id="modalframe"') !== false || strpos($l, "id='modalframe'") !== false) {
+        $hits++;
+    }
+    if (strpos($l, 'showapplication()') !== false || strpos($l, 'showlogin()') !== false) {
         $hits++;
     }
 
@@ -1015,6 +1243,83 @@ function ipmiWebNeedsAutoLogin(array $session): bool
     }
 
     return !ipmiWebHasUsableBmcAuth($c, $h);
+}
+
+/**
+ * Validate that a previously stored BMC auth jar still represents a live authenticated session.
+ * This prevents reusing stale cookies that immediately bounce to login/timeout loops.
+ */
+function ipmiWebStoredSessionAuthStillValid(array $session): bool
+{
+    $ip = trim((string) ($session['ipmi_ip'] ?? ''));
+    if ($ip === '') {
+        return false;
+    }
+    $cookies = is_array($session['cookies'] ?? null) ? $session['cookies'] : [];
+    $forwardHeaders = is_array($session['forward_headers'] ?? null) ? $session['forward_headers'] : [];
+    if (!ipmiWebHasUsableBmcAuth($cookies, $forwardHeaders)) {
+        return false;
+    }
+
+    $storedType = ipmiWebNormalizeBmcType((string) ($session['bmc_type'] ?? 'generic'));
+    $storedScheme = (($session['bmc_scheme'] ?? 'https') === 'http') ? 'http' : 'https';
+    $bases = [$storedScheme . '://' . $ip];
+    $altScheme = ($storedScheme === 'https') ? 'http' : 'https';
+    $bases[] = $altScheme . '://' . $ip;
+
+    $verifyByType = static function (string $type, string $baseUrl) use ($ip, $cookies, $forwardHeaders): bool {
+        switch ($type) {
+            case 'supermicro':
+                return ipmiWebSupermicroVerifyAuthed($baseUrl, $ip, $cookies);
+            case 'ilo4':
+                return ipmiWebIloVerifyAuthed($baseUrl, $ip, $cookies, $forwardHeaders);
+            case 'idrac':
+                return ipmiWebIdracVerifyAuthed($baseUrl, $ip, $cookies);
+            case 'ami':
+                return ipmiWebAmiVerifyAuthed($baseUrl, $ip, $cookies, $forwardHeaders);
+            default:
+                return false;
+        }
+    };
+
+    if ($storedType !== 'generic') {
+        foreach ($bases as $baseUrl) {
+            if ($verifyByType($storedType, $baseUrl)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    $candidates = [];
+    if (ipmiWebHasSupermicroAuthCookie($cookies)) {
+        $candidates[] = 'supermicro';
+    }
+    if (isset($cookies['QSESSIONID']) || isset($cookies['garc'])
+        || isset($forwardHeaders['X-CSRFTOKEN']) || isset($forwardHeaders['X-CSRF-Token'])) {
+        $candidates[] = 'ami';
+    }
+    if (isset($cookies['session']) || isset($cookies['sessionKey'])) {
+        $candidates[] = 'ilo4';
+    }
+    if (isset($cookies['-http-session-']) || isset($cookies['ST2']) || isset($cookies['sid']) || isset($cookies['sessionid'])) {
+        $candidates[] = 'idrac';
+    }
+    $candidates = array_values(array_unique($candidates));
+    if ($candidates === []) {
+        return false;
+    }
+
+    foreach ($candidates as $type) {
+        foreach ($bases as $baseUrl) {
+            if ($verifyByType($type, $baseUrl)) {
+                return true;
+            }
+        }
+    }
+
+    return false;
 }
 
 function ipmiWebCreateSession(mysqli $mysqli, int $serverId, int $userId, string $role, int $ttlSeconds = 7200): array
@@ -1093,11 +1398,19 @@ function ipmiWebCreateSession(mysqli $mysqli, int $serverId, int $userId, string
             if ($oldSession) {
                 $cc = is_array($oldSession['cookies'] ?? null) ? $oldSession['cookies'] : [];
                 $ch = is_array($oldSession['forward_headers'] ?? null) ? $oldSession['forward_headers'] : [];
-                if (ipmiWebHasUsableBmcAuth($cc, $ch)) {
+                if (ipmiWebHasUsableBmcAuth($cc, $ch) && ipmiWebStoredSessionAuthStillValid($oldSession)) {
                     $carryCookies = $cc;
                     $carryHeaders = $ch;
                     $carryScheme = (string)($oldSession['bmc_scheme'] ?? '');
                     $carryType = (string)($oldSession['bmc_type'] ?? '');
+                } else {
+                    $oldToken = (string) $rowCarry['token'];
+                    $redacted = (strlen($oldToken) >= 8) ? ('…' . substr($oldToken, -8)) : '…';
+                    ipmiWebDebugLog('carry_session_rejected', [
+                        'server_id' => $serverId,
+                        'user_id' => $userId,
+                        'token' => $redacted,
+                    ]);
                 }
             }
         }
@@ -1221,6 +1534,10 @@ function ipmiWebCreateSession(mysqli $mysqli, int $serverId, int $userId, string
             $upd->close();
         }
     }
+
+    // If server row is still generic but runtime detection identified a concrete vendor,
+    // persist it so next sessions/probes follow vendor-specific paths from the start.
+    ipmiWebPersistDetectedServerType($mysqli, $serverId, $bmcType, $finalType);
 
     return $session;
 }
@@ -1962,8 +2279,44 @@ function ipmiWebAttemptAutoLogin(array &$session, ?mysqli $mysqli = null): bool
         $session['forward_headers'] = [];
     }
 
-    // Prefer HTTPS; retry all endpoints over HTTP if nothing succeeded (some BMCs / lab setups).
-    $bases = ['https://' . $ip, 'http://' . $ip];
+    // Quick reachability preflight keeps unreachable hosts from spending minutes in endpoint retries.
+    $quickReach = static function (string $host): array {
+        foreach (['https', 'http'] as $scheme) {
+            $url = $scheme . '://' . $host . '/';
+            [$raw, $code] = ipmiWebCurlExecBmc($host, $url, static function ($ch): void {
+                curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+                curl_setopt($ch, CURLOPT_TIMEOUT, 6);
+                curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 3);
+                curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+                curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+                curl_setopt($ch, CURLOPT_FOLLOWLOCATION, false);
+                curl_setopt($ch, CURLOPT_HEADER, true);
+                curl_setopt($ch, CURLOPT_USERAGENT, ipmiWebCurlUserAgent());
+                curl_setopt($ch, CURLOPT_HTTPGET, true);
+            });
+            if ($raw !== false && $code > 0 && $code < 500) {
+                return ['ok' => true, 'scheme' => $scheme, 'http' => $code];
+            }
+        }
+
+        return ['ok' => false, 'scheme' => '', 'http' => 0];
+    };
+    $pre = $quickReach($ip);
+    if (empty($pre['ok'])) {
+        $session['auto_login_error'] = 'connect_failed';
+        ipmiWebDebugLog('autologin_unreachable', [
+            'ip' => $ip,
+            'type' => $bmcType,
+        ]);
+        return false;
+    }
+
+    // Prefer preflight scheme first, then fallback to the other scheme.
+    $bases = [];
+    $firstScheme = (($pre['scheme'] ?? 'https') === 'http') ? 'http' : 'https';
+    $bases[] = $firstScheme . '://' . $ip;
+    $bases[] = ($firstScheme === 'https' ? 'http' : 'https') . '://' . $ip;
+    $firstFailureReason = '';
 
     foreach ($bases as $baseUrl) {
         $baseUrl = rtrim($baseUrl, '/');
@@ -2012,6 +2365,7 @@ function ipmiWebAttemptAutoLogin(array &$session, ?mysqli $mysqli = null): bool
         }
 
         $retryAmi = true;
+        $retrySmCount = 0;
         while ($retryAmi) {
             $retryAmi = false;
             $loginEndpoints = ipmiWebLoginEndpoints($typeNorm, $user, $pass);
@@ -2060,8 +2414,8 @@ function ipmiWebAttemptAutoLogin(array &$session, ?mysqli $mysqli = null): bool
 
             [$raw, $code] = ipmiWebCurlExecBmc($ip, $url, static function ($ch) use ($endpoint, $originBase, $postPayload): void {
                 curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-                curl_setopt($ch, CURLOPT_TIMEOUT, 45);
-                curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 15);
+                curl_setopt($ch, CURLOPT_TIMEOUT, 25);
+                curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 8);
                 curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
                 curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
                 curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
@@ -2115,6 +2469,9 @@ function ipmiWebAttemptAutoLogin(array &$session, ?mysqli $mysqli = null): bool
                     'http' => 0,
                     'result' => 'curl_failed',
                 ]);
+                if ($firstFailureReason === '') {
+                    $firstFailureReason = 'connect_failed';
+                }
                 continue;
             }
 
@@ -2127,6 +2484,7 @@ function ipmiWebAttemptAutoLogin(array &$session, ?mysqli $mysqli = null): bool
 
             $loginHtml = ipmiWebLoginResponseHtmlIsLoginPage($raw);
             $loginJsonFail = ipmiWebLoginResponseBodyIsFailure($raw);
+            $failureReason = ipmiWebLoginResponseFailureReason($raw, (int) $code, (string) ($session['bmc_type'] ?? $bmcType));
             if ($typeNorm === 'ami' && $amiRetryCount < 1 && ipmiWebAmiSessionLimitDetected($raw)) {
                 ipmiWebDebugLog('ami_session_limit_detected', [
                     'path' => (string) ($endpoint['path'] ?? ''),
@@ -2146,6 +2504,32 @@ function ipmiWebAttemptAutoLogin(array &$session, ?mysqli $mysqli = null): bool
                     break;
                 }
             }
+            if ($typeNorm === 'supermicro' && $retrySmCount < 1 && $failureReason === 'session_limit') {
+                ipmiWebDebugLog('supermicro_session_limit_detected', [
+                    'path' => (string) ($endpoint['path'] ?? ''),
+                    'http' => $code,
+                ]);
+                $smLogoutOk = ipmiWebSupermicroAttemptLogout($baseUrl, $ip, $cookieJar);
+                ipmiWebDebugLog('supermicro_logout_attempt', [
+                    'ok' => $smLogoutOk ? 1 : 0,
+                ]);
+                $smDbCleanupOk = false;
+                if (!$smLogoutOk && $mysqli) {
+                    $smDbCleanupOk = ipmiWebSupermicroCleanupSessionsFromDb(
+                        $mysqli,
+                        (int)($session['server_id'] ?? 0),
+                        (string)($session['token'] ?? ''),
+                        $baseUrl,
+                        $ip,
+                        5
+                    );
+                }
+                if ($smLogoutOk || $smDbCleanupOk) {
+                    $retrySmCount++;
+                    $retryAmi = true;
+                    break;
+                }
+            }
             ipmiWebDebugLog('autologin_attempt', [
                 'path' => (string) ($endpoint['path'] ?? ''),
                 'http' => $code,
@@ -2154,7 +2538,11 @@ function ipmiWebAttemptAutoLogin(array &$session, ?mysqli $mysqli = null): bool
                 'headers' => array_keys(array_filter($forwardHeaders, 'ipmiWebIsAuthValueUsable')),
                 'loginHtml' => $loginHtml ? 1 : 0,
                 'loginJsonFail' => $loginJsonFail ? 1 : 0,
+                'failureReason' => $failureReason,
             ]);
+            if ($failureReason !== '' && $firstFailureReason === '') {
+                $firstFailureReason = $failureReason;
+            }
 
             if (ipmiWebLoginResponseLooksAuthed($code, $cookieJar, $forwardHeaders)
                 && !$loginJsonFail
@@ -2224,7 +2612,19 @@ function ipmiWebAttemptAutoLogin(array &$session, ?mysqli $mysqli = null): bool
                     'base' => $baseUrl,
                     'cookies' => array_keys(array_filter($cookieJar, 'ipmiWebIsAuthValueUsable')),
                 ]);
+                unset($session['auto_login_error']);
                 return true;
+            }
+
+            // Credential failures are definitive for current endpoint family; avoid long retry storms.
+            if ($failureReason === 'invalid_credentials') {
+                $session['auto_login_error'] = 'invalid_credentials';
+                ipmiWebDebugLog('autologin_failed_fast', [
+                    'ip' => $ip,
+                    'type' => $bmcType,
+                    'reason' => 'invalid_credentials',
+                ]);
+                return false;
             }
         }
         }
@@ -2233,10 +2633,12 @@ function ipmiWebAttemptAutoLogin(array &$session, ?mysqli $mysqli = null): bool
     $session['cookies'] = $prevCookies;
     $session['forward_headers'] = $prevHeaders;
     $session['bmc_scheme'] = $prevScheme;
+    $session['auto_login_error'] = $firstFailureReason !== '' ? $firstFailureReason : 'unknown';
 
     ipmiWebDebugLog('autologin_failed', [
         'ip' => $ip,
         'type' => $bmcType,
+        'reason' => $session['auto_login_error'],
     ]);
     return false;
 }
@@ -2345,6 +2747,53 @@ function ipmiWebNormalizeBmcType(string $bmcType): string
     }
 
     return 'generic';
+}
+
+function ipmiWebCanPersistDetectedType(string $currentType, string $detectedType): bool
+{
+    $current = ipmiWebNormalizeBmcType($currentType);
+    $detected = ipmiWebNormalizeBmcType($detectedType);
+    if ($current !== 'generic') {
+        return false;
+    }
+
+    return in_array($detected, ['supermicro', 'ilo4', 'idrac', 'ami'], true);
+}
+
+function ipmiWebPersistDetectedServerType(mysqli $mysqli, int $serverId, string $currentType, string $detectedType): void
+{
+    if ($serverId <= 0 || !ipmiWebCanPersistDetectedType($currentType, $detectedType)) {
+        return;
+    }
+    $detected = ipmiWebNormalizeBmcType($detectedType);
+    $stmt = $mysqli->prepare('UPDATE servers SET bmc_type = ? WHERE id = ? AND bmc_type = ? LIMIT 1');
+    if ($stmt) {
+        $generic = 'generic';
+        $stmt->bind_param('sis', $detected, $serverId, $generic);
+        $stmt->execute();
+        $stmt->close();
+    }
+}
+
+function ipmiWebPostLoginLandingPath(string $bmcType): string
+{
+    $type = ipmiWebNormalizeBmcType($bmcType);
+    if ($type === 'supermicro') {
+        // Supermicro post-login container route.
+        // Inner content is loaded from this shell; direct dashboard route can render as a broken subframe.
+        return '/cgi/url_redirect.cgi?url_name=topmenu';
+    }
+    if ($type === 'ilo4') {
+        return '/';
+    }
+    if ($type === 'idrac') {
+        return '/restgui/start.html';
+    }
+    if ($type === 'ami') {
+        return '/';
+    }
+
+    return '/';
 }
 
 function ipmiWebKvmConsolePath(array $session): string

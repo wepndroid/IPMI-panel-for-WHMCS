@@ -477,7 +477,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['bulk_upload'])) {
     $serverIp = trim((string)($row[$headerMap['server_ip']] ?? ''));
     $ipmiIp = trim((string)($row[$headerMap['ipmi_ip']] ?? ''));
     $ipmiUser = trim((string)($row[$headerMap['ipmi_user']] ?? ''));
-    $ipmiPass = trim((string)($row[$headerMap['ipmi_pass']] ?? ''));
+    $ipmiPass = (string)($row[$headerMap['ipmi_pass']] ?? '');
     $bmcRaw = trim((string)($row[$headerMap['bmc_type']] ?? 'auto'));
     $notes = trim((string)($row[$headerMap['notes']] ?? ''));
 
@@ -504,12 +504,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['bulk_upload'])) {
     }
 
     try {
-      $encryptedUser = Encryption::encrypt($ipmiUser);
-      $encryptedPass = Encryption::encrypt($ipmiPass);
+      $encryptedUser = Encryption::normalizeForStorage($ipmiUser, 'ipmi_user');
+      $encryptedPass = Encryption::normalizeForStorage($ipmiPass, 'ipmi_pass');
     } catch (Exception $e) {
       $failed++;
       if (count($errors) < $maxErrorsToShow) {
-        $errors[] = "Line {$lineNumber}: encryption failed.";
+        $errors[] = "Line {$lineNumber}: credential processing failed ({$e->getMessage()}).";
       }
       continue;
     }
@@ -611,10 +611,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !isset($_POST['bulk_upload'])) {
     $autoDetectSuffix = " (BMC auto-detected: " . strtoupper($detected['type']) . " / vendor: " . $detected['vendor'] . ")";
   }
 
-  // Encrypt credentials
+  // Encrypt credentials safely (plaintext -> encrypted; already-encrypted value preserved).
   require_once __DIR__ . '/lib/encryption.php';
-  $encrypted_user = Encryption::encrypt($ipmi_user);
-  $encrypted_pass = Encryption::encrypt($ipmi_pass);
+  try {
+    $encrypted_user = Encryption::normalizeForStorage($ipmi_user, 'ipmi_user');
+    $encrypted_pass = Encryption::normalizeForStorage($ipmi_pass, 'ipmi_pass');
+  } catch (Exception $e) {
+    $_SESSION['message'] = 'Credential save failed: ' . $e->getMessage();
+    $_SESSION['messageType'] = "error";
+    header('Location: admin_servers.php' . ($id > 0 ? '?edit=' . $id : ''));
+    exit();
+  }
 
   if ($id > 0) {
     // Update

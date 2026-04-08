@@ -106,12 +106,13 @@ function ipmipanel_apiCall($params, $action, $extraData = [])
     return $json;
 }
 
-function ipmipanel_getCustomField($params, $fieldName)
+function ipmipanel_getCustomField($params, $fieldName, $trim = true)
 {
     $customFields = $params['customfields'] ?? [];
     foreach ($customFields as $key => $value) {
         if (strcasecmp($key, $fieldName) === 0) {
-            return trim((string)$value);
+            $v = (string)$value;
+            return $trim ? trim($v) : $v;
         }
     }
     return '';
@@ -124,7 +125,8 @@ function ipmipanel_CreateAccount(array $params)
     $serverIp = trim((string)($params['dedicatedip'] ?? ''));
     $ipmiIp = ipmipanel_getCustomField($params, 'IPMI IP');
     $ipmiUser = ipmipanel_getCustomField($params, 'IPMI User');
-    $ipmiPass = ipmipanel_getCustomField($params, 'IPMI Password');
+    // Keep exact password value from custom field; do not trim spaces.
+    $ipmiPass = ipmipanel_getCustomField($params, 'IPMI Password', false);
 
     if ($email === '') {
         return 'Client email is required';
