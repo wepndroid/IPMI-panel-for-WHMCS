@@ -157,7 +157,7 @@ body.ipmi-login {
   max-width: 300px;
   height: auto;
   margin: 0 auto;
-  border-radius: var(--ipmi-radius-sm);
+  border-radius: 9999px;
 }
 
 .ipmi-login-brand-title {

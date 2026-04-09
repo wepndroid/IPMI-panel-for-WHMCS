@@ -12,6 +12,7 @@
  *   php /var/www/html/jobs/ipmi_web_probe_matrix.php --samples=3
  *   php /var/www/html/jobs/ipmi_web_probe_matrix.php --deep=1
  *   php /var/www/html/jobs/ipmi_web_probe_matrix.php --proxy=1
+ *   php /var/www/html/jobs/ipmi_web_probe_matrix.php --e2e=1 --proxy=1
  *   php /var/www/html/jobs/ipmi_web_probe_matrix.php --json=/tmp/ipmi_probe_matrix.json
  */
 
@@ -57,6 +58,7 @@ $includeSuspendedArg = ipmiProbeMatrixArg('--include-suspended=', $argv);
 $samplesArg = ipmiProbeMatrixArg('--samples=', $argv);
 $deepArg = ipmiProbeMatrixArg('--deep=', $argv);
 $proxyArg = ipmiProbeMatrixArg('--proxy=', $argv);
+$e2eArg = ipmiProbeMatrixArg('--e2e=', $argv);
 $jsonPath = ipmiProbeMatrixArg('--json=', $argv);
 
 $limit = $limitArg !== null ? max(0, (int) $limitArg) : 0;
@@ -65,6 +67,7 @@ $includeSuspended = $includeSuspendedArg === '1';
 $samplePerGroup = $samplesArg !== null ? max(1, min(10, (int) $samplesArg)) : 2;
 $deep = ($deepArg === null) ? true : ($deepArg === '1');
 $proxyFlow = ($proxyArg === '1');
+$e2e = ($e2eArg === '1');
 
 $ids = [];
 if ($idsArg !== null) {
@@ -155,7 +158,7 @@ foreach ($rows as $row) {
     }
     $byType[$stype]['total']++;
 
-    $result = ipmiWebProbeServerWebUiDetailed($mysqli, $sid, $deep, $proxyFlow);
+    $result = ipmiWebProbeServerWebUiDetailed($mysqli, $sid, $deep, $proxyFlow, $e2e);
     ipmiWebProbeLogResult($sid, $result);
 
     if (!empty($result['skipped'])) {
@@ -208,7 +211,7 @@ ksort($byType);
 $durationSec = round(microtime(true) - $start, 3);
 
 echo "IPMI Web Probe Matrix\n";
-echo "Scanned: {$totals['scanned']}  OK: {$totals['ok']}  FAIL: {$totals['fail']}  SKIPPED: {$totals['skipped']}  Duration: {$durationSec}s  Deep=" . ($deep ? '1' : '0') . "  Proxy=" . ($proxyFlow ? '1' : '0') . "\n";
+echo "Scanned: {$totals['scanned']}  OK: {$totals['ok']}  FAIL: {$totals['fail']}  SKIPPED: {$totals['skipped']}  Duration: {$durationSec}s  Deep=" . ($deep ? '1' : '0') . "  Proxy=" . ($proxyFlow ? '1' : '0') . "  E2E=" . ($e2e ? '1' : '0') . "\n";
 echo "\nBy BMC type:\n";
 foreach ($byType as $type => $stats) {
     echo "  {$type}: total={$stats['total']} ok={$stats['ok']} fail={$stats['fail']} skipped={$stats['skipped']}\n";
@@ -227,6 +230,28 @@ if (empty($failureGroups)) {
                 foreach ($sample['checks'] as $chk) {
                     $kind = (string) ($chk['kind'] ?? 'direct');
                     $path = (string) ($chk['path'] ?? '');
+                    if ($kind === 'proxy_assets') {
+                        $aTotal = (int) ($chk['asset_total'] ?? 0);
+                        $aFail = (int) ($chk['asset_fail'] ?? 0);
+                        $aCritTotal = (int) ($chk['asset_critical_total'] ?? 0);
+                        $aCritFail = (int) ($chk['asset_critical_fail'] ?? 0);
+                        $aOk = !empty($chk['asset_ok']) ? 1 : 0;
+                        echo "       · check kind={$kind} path={$path} assets={$aTotal} fail={$aFail} critical={$aCritFail}/{$aCritTotal} ok={$aOk}\n";
+                        if (!empty($chk['asset_failed_samples']) && is_array($chk['asset_failed_samples'])) {
+                            $sampleIdx = 0;
+                            foreach ($chk['asset_failed_samples'] as $af) {
+                                $sampleIdx++;
+                                if ($sampleIdx > 3) {
+                                    break;
+                                }
+                                $asset = (string) ($af['asset'] ?? '');
+                                $resolved = (string) ($af['resolved_path'] ?? '');
+                                $aHttp = (int) ($af['http'] ?? 0);
+                                echo "         · asset http={$aHttp} src={$asset} resolved={$resolved}\n";
+                            }
+                        }
+                        continue;
+                    }
                     $http = (int) ($chk['http'] ?? 0);
                     $bytes = (int) ($chk['body_bytes'] ?? 0);
                     $lp = !empty($chk['login_page']) ? 1 : 0;
@@ -264,6 +289,7 @@ $report = [
         'sample_per_group' => $samplePerGroup,
         'deep' => $deep,
         'proxy' => $proxyFlow,
+        'e2e' => $e2e,
         'ids' => $ids,
     ],
     'totals' => $totals,

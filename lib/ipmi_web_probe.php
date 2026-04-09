@@ -34,6 +34,71 @@ function ipmiWebProbeSessionJsonValid(string $body): bool
 }
 
 /**
+ * Best-effort cleanup of BMC web session created during probe login.
+ * This prevents probe runs from accumulating stale sessions on BMC side.
+ */
+function ipmiWebProbeBestEffortLogout(array $session): void
+{
+    $ip = trim((string) ($session['ipmi_ip'] ?? ''));
+    if ($ip === '') {
+        return;
+    }
+    $type = ipmiWebNormalizeBmcType((string) ($session['bmc_type'] ?? 'generic'));
+    $scheme = (($session['bmc_scheme'] ?? 'https') === 'http') ? 'http' : 'https';
+    $baseUrl = $scheme . '://' . $ip;
+    $cookies = is_array($session['cookies'] ?? null) ? $session['cookies'] : [];
+    $forwardHeaders = is_array($session['forward_headers'] ?? null) ? $session['forward_headers'] : [];
+    if (!ipmiWebHasUsableBmcAuth($cookies, $forwardHeaders)) {
+        return;
+    }
+
+    try {
+        if ($type === 'idrac') {
+            ipmiWebIdracAttemptLogout($baseUrl, $ip, $cookies);
+            return;
+        }
+        if ($type === 'supermicro') {
+            ipmiWebSupermicroAttemptLogout($baseUrl, $ip, $cookies);
+            return;
+        }
+        if ($type === 'ami') {
+            ipmiWebAmiAttemptLogout($baseUrl, $ip, $cookies, $forwardHeaders);
+            return;
+        }
+    } catch (Throwable $e) {
+        // ignore probe logout errors
+    }
+}
+
+/**
+ * Proxy-path cleanup for probe sessions created with ipmiWebCreateSession().
+ */
+function ipmiWebProbeProxyBestEffortLogout(string $token, string $bmcType): void
+{
+    if ($token === '' || !preg_match('/^[a-f0-9]{64}$/', $token)) {
+        return;
+    }
+    $type = ipmiWebNormalizeBmcType($bmcType);
+    try {
+        if ($type === 'idrac') {
+            ipmiWebProbeFetchProxyPathWithMethod($token, '/data/logout', 'GET', null);
+            ipmiWebProbeFetchProxyPathWithMethod($token, '/logout', 'GET', null);
+            return;
+        }
+        if ($type === 'supermicro') {
+            ipmiWebProbeFetchProxyPathWithMethod($token, '/cgi/logout.cgi', 'POST', '');
+            return;
+        }
+        if ($type === 'ami') {
+            ipmiWebProbeFetchProxyPathWithMethod($token, '/api/session', 'DELETE', '');
+            return;
+        }
+    } catch (Throwable $e) {
+        // ignore probe logout errors
+    }
+}
+
+/**
  * Lightweight parser for final response content-type from cURL raw output.
  */
 function ipmiWebProbeExtractContentType(string $raw): string
@@ -175,9 +240,9 @@ function ipmiWebProbeUiPathsForType(string $bmcType): array
         case 'supermicro':
             return ['/', '/cgi/url_redirect.cgi?url_name=topmenu', '/cgi/url_redirect.cgi?url_name=dashboard'];
         case 'ilo4':
-            return ['/', '/html/application.html'];
+            return ['/', '/index.html'];
         case 'idrac':
-            return ['/', '/restgui/start.html'];
+            return ['/', '/start.html', '/index.html', '/restgui/start.html'];
         case 'ami':
             return ['/', '/html/application.html'];
         default:
@@ -197,14 +262,69 @@ function ipmiWebProbeProxyUiPathsForType(string $bmcType): array
         case 'supermicro':
             return ['/', '/cgi/url_redirect.cgi?url_name=topmenu', '/cgi/url_redirect.cgi?url_name=dashboard'];
         case 'ilo4':
-            return ['/', '/html/application.html'];
+            return ['/', '/index.html'];
         case 'idrac':
-            return ['/'];
+            return ['/', '/start.html'];
         case 'ami':
             return ['/'];
         default:
             return ['/'];
     }
+}
+
+function ipmiWebProbeIsSupermicroRuntimeApiPath(string $path): bool
+{
+    $p = strtolower((string) parse_url($path, PHP_URL_PATH));
+    if ($p === '') {
+        return false;
+    }
+
+    return in_array($p, ['/cgi/xml_dispatcher.cgi', '/cgi/op.cgi', '/cgi/ipmi.cgi', '/cgi/upgrade_process.cgi'], true);
+}
+
+function ipmiWebProbeLooksLikeSupermicroRuntimeAuthFailure(string $body): bool
+{
+    $l = strtolower(substr((string) $body, 0, 120000));
+    if ($l === '') {
+        return false;
+    }
+
+    if (str_contains($l, 'please log in a new session') || str_contains($l, 'please login in a new session')) {
+        return true;
+    }
+    if (str_contains($l, 'your session has timed out') || str_contains($l, 'session timed out')) {
+        return true;
+    }
+    if (str_contains($l, 'invalid session') || str_contains($l, 'no valid session')) {
+        return true;
+    }
+    if (str_contains($l, 'session expired')) {
+        return true;
+    }
+
+    return false;
+}
+
+/**
+ * Parse Supermicro inline CSRF bootstrap call:
+ *   SmcCsrfInsert("CSRF_TOKEN", "<token>")
+ *
+ * @return array{0:string,1:string} [headerName, headerValue]
+ */
+function ipmiWebProbeExtractSupermicroCsrfFromHtml(string $html): array
+{
+    if ($html === '') {
+        return ['', ''];
+    }
+    if (preg_match('/SmcCsrfInsert\s*\(\s*["\']([^"\']+)["\']\s*,\s*["\']([^"\']+)["\']\s*\)/i', $html, $m)) {
+        $name = trim((string) ($m[1] ?? ''));
+        $value = trim((string) ($m[2] ?? ''));
+        if ($name !== '' && $value !== '') {
+            return [$name, $value];
+        }
+    }
+
+    return ['', ''];
 }
 
 function ipmiWebProbeProxyBaseUrl(): string
@@ -255,13 +375,27 @@ function ipmiWebProbeExtractRedirectChain(string $raw): array
  *   redirect_loop: bool,
  *   curl_error: string,
  *   final_url: string
+ *   redirect_chain: array<int, array{http:int, location:string}>,
+ *   logout_redirect: bool,
+ *   topmenu_redirect: bool,
+ *   loop_hint: bool
  * }
  */
-function ipmiWebProbeFetchProxyPath(string $token, string $path): array
+function ipmiWebProbeFetchProxyPathWithMethod(
+    string $token,
+    string $path,
+    string $method = 'GET',
+    ?string $postBody = null,
+    array $extraHeaders = []
+): array
 {
     $base = ipmiWebProbeProxyBaseUrl();
     $url = $base . '/ipmi_proxy.php/' . rawurlencode($token) . '/' . ltrim($path, '/');
     $ch = curl_init($url);
+    $method = strtoupper(trim($method));
+    if ($method === '') {
+        $method = 'GET';
+    }
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
     curl_setopt($ch, CURLOPT_TIMEOUT, 30);
     curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 8);
@@ -270,6 +404,29 @@ function ipmiWebProbeFetchProxyPath(string $token, string $path): array
     curl_setopt($ch, CURLOPT_HEADER, true);
     curl_setopt($ch, CURLOPT_ENCODING, '');
     curl_setopt($ch, CURLOPT_USERAGENT, ipmiWebCurlUserAgent());
+    if ($method === 'POST') {
+        curl_setopt($ch, CURLOPT_POST, true);
+        if ($postBody !== null) {
+            curl_setopt($ch, CURLOPT_POSTFIELDS, $postBody);
+        }
+    } elseif ($method !== 'GET') {
+        curl_setopt($ch, CURLOPT_CUSTOMREQUEST, $method);
+        if ($postBody !== null) {
+            curl_setopt($ch, CURLOPT_POSTFIELDS, $postBody);
+        }
+    }
+    if ($extraHeaders !== []) {
+        $hdrs = [];
+        foreach ($extraHeaders as $h) {
+            $h = trim((string) $h);
+            if ($h !== '') {
+                $hdrs[] = $h;
+            }
+        }
+        if ($hdrs !== []) {
+            curl_setopt($ch, CURLOPT_HTTPHEADER, $hdrs);
+        }
+    }
     $raw = curl_exec($ch);
     $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
     $finalUrl = (string) curl_getinfo($ch, CURLINFO_EFFECTIVE_URL);
@@ -353,15 +510,320 @@ function ipmiWebProbeFetchProxyPath(string $token, string $path): array
     ];
 }
 
+function ipmiWebProbeFetchProxyPath(string $token, string $path): array
+{
+    return ipmiWebProbeFetchProxyPathWithMethod($token, $path, 'GET', null);
+}
+
+function ipmiWebProbeLooksLikeIdracStartLauncher(string $body): bool
+{
+    $l = strtolower(substr((string) $body, 0, 200000));
+    if ($l === '') {
+        return false;
+    }
+    return str_contains($l, 'aimgetintprop=scl_int_enabled,pam_int_ldap_enable_mode')
+        && str_contains($l, 'aimgetboolprop=pam_bool_sso_enabled')
+        && (
+            str_contains($l, 'top.document.location.href = "/login.html"')
+            || str_contains($l, 'top.document.location.href="/login.html"')
+        );
+}
+
+/**
+ * Resolve a relative asset URL against the current BMC path.
+ */
+function ipmiWebProbeResolveRelativeBmcPath(string $basePath, string $rel): string
+{
+    $basePathOnly = (string) parse_url($basePath, PHP_URL_PATH);
+    if ($basePathOnly === '') {
+        $basePathOnly = '/';
+    }
+    if (!str_starts_with($basePathOnly, '/')) {
+        $basePathOnly = '/' . $basePathOnly;
+    }
+    $baseDir = rtrim(str_replace('\\', '/', dirname($basePathOnly)), '/');
+    if ($baseDir === '') {
+        $baseDir = '/';
+    }
+
+    $raw = trim($rel);
+    if ($raw === '') {
+        return '/';
+    }
+    if (str_starts_with($raw, '/')) {
+        return $raw;
+    }
+
+    $qPos = strpos($raw, '?');
+    $fragPos = strpos($raw, '#');
+    $cutPos = false;
+    if ($qPos !== false && $fragPos !== false) {
+        $cutPos = min($qPos, $fragPos);
+    } elseif ($qPos !== false) {
+        $cutPos = $qPos;
+    } elseif ($fragPos !== false) {
+        $cutPos = $fragPos;
+    }
+    $tail = '';
+    $pathPart = $raw;
+    if ($cutPos !== false) {
+        $pathPart = substr($raw, 0, $cutPos);
+        $tail = substr($raw, $cutPos);
+    }
+
+    $segments = [];
+    foreach (explode('/', $baseDir . '/' . $pathPart) as $seg) {
+        if ($seg === '' || $seg === '.') {
+            continue;
+        }
+        if ($seg === '..') {
+            array_pop($segments);
+            continue;
+        }
+        $segments[] = $seg;
+    }
+
+    return '/' . implode('/', $segments) . $tail;
+}
+
+/**
+ * Extract candidate script/style/image URLs from HTML.
+ *
+ * @return array<int, string>
+ */
+function ipmiWebProbeExtractHtmlAssetUrls(string $html): array
+{
+    $urls = [];
+
+    // script src
+    if (preg_match_all('/<script\b[^>]*\bsrc\s*=\s*(["\'])(.*?)\1[^>]*>/is', $html, $m1)) {
+        foreach ($m1[2] as $u) {
+            $u = trim((string) $u);
+            if ($u !== '') {
+                $urls[] = $u;
+            }
+        }
+    }
+
+    // link href (styles/icons/preloads that affect rendering)
+    if (preg_match_all('/<link\b[^>]*\bhref\s*=\s*(["\'])(.*?)\1[^>]*>/is', $html, $m2, PREG_SET_ORDER)) {
+        foreach ($m2 as $row) {
+            $tag = (string) $row[0];
+            $u = trim((string) ($row[2] ?? ''));
+            if ($u === '') {
+                continue;
+            }
+            $tagLc = strtolower($tag);
+            $rel = '';
+            if (preg_match('/\brel\s*=\s*(["\'])(.*?)\1/i', $tag, $rm)) {
+                $rel = strtolower(trim((string) ($rm[2] ?? '')));
+            }
+            $as = '';
+            if (preg_match('/\bas\s*=\s*(["\'])(.*?)\1/i', $tag, $am)) {
+                $as = strtolower(trim((string) ($am[2] ?? '')));
+            }
+
+            $isUsefulLink = false;
+            if ($rel !== '') {
+                if (
+                    str_contains($rel, 'stylesheet')
+                    || str_contains($rel, 'icon')
+                    || str_contains($rel, 'preload')
+                ) {
+                    $isUsefulLink = true;
+                }
+            }
+            if (!$isUsefulLink && ($as === 'style' || $as === 'script' || $as === 'font')) {
+                $isUsefulLink = true;
+            }
+
+            // Fallback by extension when rel/as attributes are absent.
+            if (!$isUsefulLink) {
+                $pathOnly = strtolower((string) parse_url($u, PHP_URL_PATH));
+                if (
+                    str_ends_with($pathOnly, '.css')
+                    || str_ends_with($pathOnly, '.js')
+                    || str_ends_with($pathOnly, '.ico')
+                    || str_ends_with($pathOnly, '.png')
+                    || str_ends_with($pathOnly, '.jpg')
+                    || str_ends_with($pathOnly, '.jpeg')
+                    || str_ends_with($pathOnly, '.svg')
+                    || str_ends_with($pathOnly, '.woff')
+                    || str_ends_with($pathOnly, '.woff2')
+                ) {
+                    $isUsefulLink = true;
+                }
+            }
+
+            if ($isUsefulLink) {
+                $urls[] = $u;
+            }
+        }
+    }
+
+    // img src
+    if (preg_match_all('/<img\b[^>]*\bsrc\s*=\s*(["\'])(.*?)\1[^>]*>/is', $html, $m3)) {
+        foreach ($m3[2] as $u) {
+            $u = trim((string) $u);
+            if ($u !== '') {
+                $urls[] = $u;
+            }
+        }
+    }
+
+    $clean = [];
+    foreach ($urls as $u) {
+        $u = trim((string) $u);
+        if ($u === '' || $u[0] === '#') {
+            continue;
+        }
+        $lu = strtolower($u);
+        if (
+            str_starts_with($lu, 'javascript:')
+            || str_starts_with($lu, 'data:')
+            || str_starts_with($lu, 'mailto:')
+            || str_starts_with($lu, 'tel:')
+        ) {
+            continue;
+        }
+        $clean[] = $u;
+    }
+
+    return array_values(array_unique($clean));
+}
+
+/**
+ * Convert extracted HTML URL to BMC-relative path for proxy fetch.
+ */
+function ipmiWebProbeAssetUrlToBmcPath(string $token, string $basePath, string $url): string
+{
+    $u = trim($url);
+    if ($u === '') {
+        return '/';
+    }
+
+    $tokenPrefix = '/ipmi_proxy.php/' . rawurlencode($token) . '/';
+
+    if (preg_match('#^https?://#i', $u)) {
+        $path = (string) parse_url($u, PHP_URL_PATH);
+        $query = (string) parse_url($u, PHP_URL_QUERY);
+        $candidate = $path . ($query !== '' ? ('?' . $query) : '');
+        if (str_starts_with($candidate, $tokenPrefix)) {
+            $candidate = '/' . ltrim(substr($candidate, strlen($tokenPrefix)), '/');
+        }
+        if ($candidate === '') {
+            return '/';
+        }
+        return $candidate;
+    }
+
+    if (str_starts_with($u, '/ipmi_proxy.php/')) {
+        $needle = '/ipmi_proxy.php/' . rawurlencode($token) . '/';
+        if (str_starts_with($u, $needle)) {
+            $rest = substr($u, strlen($needle));
+            return '/' . ltrim((string) $rest, '/');
+        }
+        return '/';
+    }
+
+    if (str_starts_with($u, '/')) {
+        return $u;
+    }
+
+    return ipmiWebProbeResolveRelativeBmcPath($basePath, $u);
+}
+
+/**
+ * Probe essential assets for a proxied HTML page (JS/CSS heavy failures => UI likely broken).
+ *
+ * @return array{ok: bool, total: int, critical_total: int, fail: int, critical_fail: int, sample_failed: array<int, array<string, mixed>>}
+ */
+function ipmiWebProbeValidateProxyAssets(string $token, string $basePath, string $html): array
+{
+    $assets = ipmiWebProbeExtractHtmlAssetUrls($html);
+    $maxAssets = 50;
+    if (count($assets) > $maxAssets) {
+        $assets = array_slice($assets, 0, $maxAssets);
+    }
+
+    $total = 0;
+    $criticalTotal = 0;
+    $fail = 0;
+    $criticalFail = 0;
+    $failedSamples = [];
+
+    foreach ($assets as $assetUrl) {
+        $bmcPath = ipmiWebProbeAssetUrlToBmcPath($token, $basePath, $assetUrl);
+        if ($bmcPath === '' || $bmcPath === '/') {
+            continue;
+        }
+
+        $total++;
+        $pathOnly = strtolower((string) parse_url($bmcPath, PHP_URL_PATH));
+        $isOptionalLegacy = (
+            str_ends_with($pathOnly, '/libs/js/html5shiv.js')
+            || str_ends_with($pathOnly, '/libs/js/respond.min.js')
+            || str_contains($pathOnly, '/html5shiv.js')
+            || str_contains($pathOnly, '/respond.min.js')
+        );
+        $isCritical = str_ends_with($pathOnly, '.js')
+            || str_ends_with($pathOnly, '.css')
+            || str_contains($pathOnly, '/js/')
+            || str_contains($pathOnly, '/css/');
+        if ($isCritical) {
+            $criticalTotal++;
+        }
+
+        $res = ipmiWebProbeFetchProxyPath($token, $bmcPath);
+        $http = (int) ($res['http'] ?? 0);
+        $isFailed = empty($res['raw_ok']) || $http === 0 || $http >= 400;
+        if ($isFailed) {
+            if ($isOptionalLegacy && ($http === 404 || $http === 0)) {
+                continue;
+            }
+            $fail++;
+            if ($isCritical) {
+                $criticalFail++;
+            }
+            if (count($failedSamples) < 10) {
+                $failedSamples[] = [
+                    'asset' => $assetUrl,
+                    'resolved_path' => $bmcPath,
+                    'http' => $http,
+                    'curl_error' => (string) ($res['curl_error'] ?? ''),
+                ];
+            }
+        }
+    }
+
+    // Conservative threshold to avoid noisy image/font misses while still catching broken UI.
+    $ok = true;
+    if ($criticalFail >= 2) {
+        $ok = false;
+    }
+    if ($criticalTotal > 0 && $criticalFail / max(1, $criticalTotal) >= 0.35) {
+        $ok = false;
+    }
+    return [
+        'ok' => $ok,
+        'total' => $total,
+        'critical_total' => $criticalTotal,
+        'fail' => $fail,
+        'critical_fail' => $criticalFail,
+        'sample_failed' => $failedSamples,
+    ];
+}
+
 /**
  * Deep proxy-flow checks. Uses same session creation path as UI open action.
  *
  * @return array{ok: bool, error?: string, checks?: array<int, array<string, mixed>>}
  */
-function ipmiWebProbeProxyFlowValidation(mysqli $mysqli, int $serverId): array
+function ipmiWebProbeProxyFlowValidation(mysqli $mysqli, int $serverId, bool $e2e = false): array
 {
     $checks = [];
     $token = '';
+    $bmcType = 'generic';
     $prevRemoteAddr = $_SERVER['REMOTE_ADDR'] ?? null;
     $prevUserAgent = $_SERVER['HTTP_USER_AGENT'] ?? null;
     try {
@@ -395,6 +857,14 @@ function ipmiWebProbeProxyFlowValidation(mysqli $mysqli, int $serverId): array
                 'loop_hint' => !empty($res['loop_hint']),
             ];
 
+            if (ipmiWebNormalizeBmcType($bmcType) === 'ilo4' && $path === '/') {
+                $final = strtolower((string) ($res['final_url'] ?? ''));
+                $iloLandingOk = str_contains($final, '/index.html') || str_contains($final, '/html/application.html');
+                if ($final !== '' && str_contains($final, '/ipmi_proxy.php/') && !$iloLandingOk) {
+                    return ['ok' => false, 'error' => 'proxy_ilo_root_not_redirected', 'checks' => $checks];
+                }
+            }
+
             if (empty($res['raw_ok'])) {
                 if (!empty($res['redirect_loop'])) {
                     return ['ok' => false, 'error' => 'proxy_redirect_loop:' . $path, 'checks' => $checks];
@@ -411,9 +881,207 @@ function ipmiWebProbeProxyFlowValidation(mysqli $mysqli, int $serverId): array
             if (!empty($res['logout_redirect']) && !empty($res['topmenu_redirect']) && !empty($res['loop_hint'])) {
                 return ['ok' => false, 'error' => 'proxy_logout_topmenu_loop:' . $path, 'checks' => $checks];
             }
-            $ignoreIloLoginMarker = (ipmiWebNormalizeBmcType($bmcType) === 'ilo4' && $path === '/html/application.html');
+            $ignoreIloLoginMarker = (ipmiWebNormalizeBmcType($bmcType) === 'ilo4'
+                && ($path === '/html/application.html' || $path === '/index.html'));
             if (!empty($res['login_page']) && !$ignoreIloLoginMarker) {
                 return ['ok' => false, 'error' => 'proxy_login_page:' . $path, 'checks' => $checks];
+            }
+
+            if ($e2e) {
+                $ct = strtolower((string) ($res['content_type'] ?? ''));
+                if (str_contains($ct, 'text/html')) {
+                    $assetCheck = ipmiWebProbeValidateProxyAssets($token, $path, (string) ($res['body'] ?? ''));
+                    $checks[] = [
+                        'kind' => 'proxy_assets',
+                        'path' => $path,
+                        'asset_total' => $assetCheck['total'],
+                        'asset_fail' => $assetCheck['fail'],
+                        'asset_critical_total' => $assetCheck['critical_total'],
+                        'asset_critical_fail' => $assetCheck['critical_fail'],
+                        'asset_ok' => $assetCheck['ok'],
+                        'asset_failed_samples' => $assetCheck['sample_failed'],
+                    ];
+                    if (empty($assetCheck['ok'])) {
+                        return ['ok' => false, 'error' => 'proxy_asset_failures:' . $path, 'checks' => $checks];
+                    }
+                }
+            }
+        }
+
+        if ($e2e && ipmiWebNormalizeBmcType($bmcType) === 'supermicro') {
+            // Verify a real dashboard API call (not just shell HTML/assets):
+            // POST /cgi/xml_dispatcher.cgi with GENERIC_INFO.XML must return XML payload.
+            $topmenuForCsrf = ipmiWebProbeFetchProxyPath($token, '/cgi/url_redirect.cgi?url_name=topmenu');
+            [$csrfHeaderName, $csrfHeaderValue] = ipmiWebProbeExtractSupermicroCsrfFromHtml((string) ($topmenuForCsrf['body'] ?? ''));
+            $proxyBase = rtrim(ipmiWebProbeProxyBaseUrl(), '/');
+            $topmenuRef = $proxyBase . '/ipmi_proxy.php/' . rawurlencode($token) . '/cgi/url_redirect.cgi?url_name=topmenu';
+            $apiHeaders = [
+                'Content-Type: application/x-www-form-urlencoded; charset=UTF-8',
+                'X-Requested-With: XMLHttpRequest',
+                'Referer: ' . $topmenuRef,
+                'Origin: ' . $proxyBase,
+            ];
+            if ($csrfHeaderName !== '' && $csrfHeaderValue !== '') {
+                $apiHeaders[] = $csrfHeaderName . ': ' . $csrfHeaderValue;
+            }
+            $apiPath = '/cgi/xml_dispatcher.cgi';
+            $apiRes = ipmiWebProbeFetchProxyPathWithMethod(
+                $token,
+                $apiPath,
+                'POST',
+                'op=GENERIC_INFO.XML&r=(0,0)',
+                $apiHeaders
+            );
+            $apiBody = (string) ($apiRes['body'] ?? '');
+            $apiAuthFail = ipmiWebProbeLooksLikeSupermicroRuntimeAuthFailure($apiBody);
+            $apiXmlOk = (stripos($apiBody, '<GENERIC_INFO') !== false) || (stripos($apiBody, '<GENERIC ') !== false);
+            $csrfProbeBlocked = ((int) ($apiRes['http'] ?? 0) === 403)
+                && (stripos($apiBody, 'token value is not matched') !== false);
+            $checks[] = [
+                'kind' => 'proxy_supermicro_runtime_api',
+                'path' => $apiPath,
+                'method' => 'POST',
+                'http' => (int) ($apiRes['http'] ?? 0),
+                'raw_ok' => !empty($apiRes['raw_ok']),
+                'login_page' => !empty($apiRes['login_page']),
+                'timeout_text' => !empty($apiRes['timeout_text']),
+                'timeout_shell' => !empty($apiRes['timeout_shell']),
+                'proxy_expired' => !empty($apiRes['proxy_expired']),
+                'auth_fail_text' => $apiAuthFail,
+                'xml_ok' => $apiXmlOk,
+                'csrf_probe_blocked' => $csrfProbeBlocked,
+                'csrf_header' => $csrfHeaderName !== '' ? $csrfHeaderName : '',
+                'body_bytes' => (int) ($apiRes['body_bytes'] ?? 0),
+            ];
+            $apiHttp = (int) ($apiRes['http'] ?? 0);
+            if (
+                empty($apiRes['raw_ok'])
+                || $apiHttp === 0
+                || ($apiHttp >= 400 && !$csrfProbeBlocked)
+                || !empty($apiRes['login_page'])
+                || !empty($apiRes['timeout_text'])
+                || !empty($apiRes['timeout_shell'])
+                || !empty($apiRes['proxy_expired'])
+                || $apiAuthFail
+                || (!$apiXmlOk && !$csrfProbeBlocked)
+            ) {
+                return ['ok' => false, 'error' => 'proxy_supermicro_runtime_api_invalid:' . $apiPath, 'checks' => $checks];
+            }
+
+            $logout = ipmiWebProbeFetchProxyPathWithMethod($token, '/cgi/logout.cgi', 'POST', '');
+            $checks[] = [
+                'kind' => 'proxy_action',
+                'path' => '/cgi/logout.cgi',
+                'method' => 'POST',
+                'http' => (int) ($logout['http'] ?? 0),
+                'raw_ok' => !empty($logout['raw_ok']),
+            ];
+            $after = ipmiWebProbeFetchProxyPath($token, '/cgi/url_redirect.cgi?url_name=topmenu');
+            $checks[] = [
+                'kind' => 'proxy_after_logout_probe',
+                'path' => '/cgi/url_redirect.cgi?url_name=topmenu',
+                'http' => (int) ($after['http'] ?? 0),
+                'login_page' => !empty($after['login_page']),
+                'timeout_text' => !empty($after['timeout_text']),
+                'timeout_shell' => !empty($after['timeout_shell']),
+                'proxy_expired' => !empty($after['proxy_expired']),
+            ];
+            if (
+                empty($after['raw_ok'])
+                || (int) ($after['http'] ?? 0) >= 400
+                || !empty($after['proxy_expired'])
+                || !empty($after['timeout_shell'])
+                || !empty($after['timeout_text'])
+            ) {
+                return ['ok' => false, 'error' => 'proxy_supermicro_logout_instability', 'checks' => $checks];
+            }
+        }
+        if ($e2e && ipmiWebNormalizeBmcType($bmcType) === 'ilo4') {
+            // iLO white-screen regressions often come from runtime auth drift:
+            // shell HTML is 200 but /json/session_info flips to 401/403.
+            $iloApiPath = '/json/session_info';
+            $iloApiRes = ipmiWebProbeFetchProxyPath($token, $iloApiPath);
+            $iloApiBody = (string) ($iloApiRes['body'] ?? '');
+            $iloApiJsonOk = ipmiWebProbeSessionJsonValid($iloApiBody);
+            $checks[] = [
+                'kind' => 'proxy_ilo_session_api',
+                'path' => $iloApiPath,
+                'http' => (int) ($iloApiRes['http'] ?? 0),
+                'raw_ok' => !empty($iloApiRes['raw_ok']),
+                'login_page' => !empty($iloApiRes['login_page']),
+                'json_ok' => $iloApiJsonOk,
+                'body_bytes' => (int) ($iloApiRes['body_bytes'] ?? 0),
+            ];
+            if (
+                empty($iloApiRes['raw_ok'])
+                || (int) ($iloApiRes['http'] ?? 0) >= 400
+                || (int) ($iloApiRes['http'] ?? 0) === 0
+                || !empty($iloApiRes['login_page'])
+                || !$iloApiJsonOk
+            ) {
+                return ['ok' => false, 'error' => 'proxy_ilo_session_api_invalid', 'checks' => $checks];
+            }
+        }
+        if ($e2e && ipmiWebNormalizeBmcType($bmcType) === 'idrac') {
+            // iDRAC-specific loop guard:
+            // /login.html must not bounce to /restgui/start.html launcher (start -> login -> start loop).
+            $loginRes = ipmiWebProbeFetchProxyPath($token, '/login.html');
+            $redirToStart = false;
+            foreach (($loginRes['redirect_chain'] ?? []) as $hop) {
+                $loc = strtolower((string) ($hop['location'] ?? ''));
+                if ($loc === '') {
+                    continue;
+                }
+                if (str_contains($loc, '/restgui/start.html') || str_contains($loc, '/start.html')) {
+                    $redirToStart = true;
+                    break;
+                }
+            }
+            $startLauncher = ipmiWebProbeLooksLikeIdracStartLauncher((string) ($loginRes['body'] ?? ''));
+            $checks[] = [
+                'kind' => 'proxy_idrac_login',
+                'path' => '/login.html',
+                'http' => (int) ($loginRes['http'] ?? 0),
+                'raw_ok' => !empty($loginRes['raw_ok']),
+                'final_url' => (string) ($loginRes['final_url'] ?? ''),
+                'redirect_to_start' => $redirToStart,
+                'looks_like_start_launcher' => $startLauncher,
+            ];
+            if (empty($loginRes['raw_ok']) || (int) ($loginRes['http'] ?? 0) >= 400 || (int) ($loginRes['http'] ?? 0) === 0) {
+                return ['ok' => false, 'error' => 'proxy_idrac_login_unreachable', 'checks' => $checks];
+            }
+            if ($redirToStart && $startLauncher) {
+                return ['ok' => false, 'error' => 'proxy_idrac_start_login_loop', 'checks' => $checks];
+            }
+
+            // iDRAC start page depends on these session API calls; if they return login/html
+            // the UI stays on spinner even though /start.html itself is 200.
+            $sessionApiPaths = [
+                '/session?aimGetIntProp=scl_int_enabled,pam_int_ldap_enable_mode',
+                '/session?aimGetBoolProp=pam_bool_sso_enabled',
+            ];
+            foreach ($sessionApiPaths as $apiPath) {
+                $apiRes = ipmiWebProbeFetchProxyPath($token, $apiPath);
+                $apiBody = (string) ($apiRes['body'] ?? '');
+                $apiJsonOk = ipmiWebProbeSessionJsonValid($apiBody);
+                $checks[] = [
+                    'kind' => 'proxy_idrac_session_api',
+                    'path' => $apiPath,
+                    'http' => (int) ($apiRes['http'] ?? 0),
+                    'raw_ok' => !empty($apiRes['raw_ok']),
+                    'login_page' => !empty($apiRes['login_page']),
+                    'json_ok' => $apiJsonOk,
+                    'body_bytes' => (int) ($apiRes['body_bytes'] ?? 0),
+                ];
+                if (
+                    empty($apiRes['raw_ok'])
+                    || (int) ($apiRes['http'] ?? 0) >= 400
+                    || (int) ($apiRes['http'] ?? 0) === 0
+                    || !empty($apiRes['login_page'])
+                    || !$apiJsonOk
+                ) {
+                    return ['ok' => false, 'error' => 'proxy_idrac_session_api_invalid', 'checks' => $checks];
+                }
             }
         }
     } catch (Throwable $e) {
@@ -430,6 +1098,7 @@ function ipmiWebProbeProxyFlowValidation(mysqli $mysqli, int $serverId): array
             $_SERVER['HTTP_USER_AGENT'] = $prevUserAgent;
         }
         if ($token !== '' && preg_match('/^[a-f0-9]{64}$/', $token)) {
+            ipmiWebProbeProxyBestEffortLogout($token, $bmcType);
             $stmt = $mysqli->prepare("UPDATE ipmi_web_sessions SET revoked_at = NOW() WHERE token = ? LIMIT 1");
             if ($stmt) {
                 $stmt->bind_param('s', $token);
@@ -558,7 +1227,7 @@ function ipmiWebProbeDeepUiValidation(array $session): array
     }
 
     if ($type === 'idrac') {
-        $idracCandidates = ['/restgui/start.html', '/restgui/launch'];
+        $idracCandidates = ['/start.html', '/index.html', '/restgui/start.html', '/restgui/launch'];
         $anyOk = false;
         foreach ($idracCandidates as $path) {
             $res = ipmiWebProbeFetchUiPath($session, $path);
@@ -774,9 +1443,11 @@ function ipmiWebProbeServerWebUi(mysqli $mysqli, int $serverId): array
     }
 
     if (!ipmiWebProbeIloSessionInfoOk($session)) {
+        ipmiWebProbeBestEffortLogout($session);
         return ['ok' => false, 'error' => 'session_info_failed', 'scheme' => (string) ($session['bmc_scheme'] ?? 'https')];
     }
 
+    ipmiWebProbeBestEffortLogout($session);
     return ['ok' => true, 'scheme' => (string) ($session['bmc_scheme'] ?? 'https')];
 }
 
@@ -785,7 +1456,7 @@ function ipmiWebProbeServerWebUi(mysqli $mysqli, int $serverId): array
  *
  * @return array{ok: bool, skipped?: bool, reason?: string, error?: string, scheme?: string, checks?: array<int, array<string, mixed>>, proxy_checks?: array<int, array<string, mixed>>}
  */
-function ipmiWebProbeServerWebUiDetailed(mysqli $mysqli, int $serverId, bool $deep = true, bool $proxyFlow = false): array
+function ipmiWebProbeServerWebUiDetailed(mysqli $mysqli, int $serverId, bool $deep = true, bool $proxyFlow = false, bool $e2e = false): array
 {
     $base = ipmiWebProbeServerWebUi($mysqli, $serverId);
     if (empty($base['ok']) || !empty($base['skipped'])) {
@@ -848,6 +1519,7 @@ function ipmiWebProbeServerWebUiDetailed(mysqli $mysqli, int $serverId, bool $de
             if (isset($deepResult['checks']) && is_array($deepResult['checks'])) {
                 $base['checks'] = $deepResult['checks'];
             }
+            ipmiWebProbeBestEffortLogout($session);
             return $base;
         }
         if (isset($deepResult['checks']) && is_array($deepResult['checks'])) {
@@ -856,7 +1528,7 @@ function ipmiWebProbeServerWebUiDetailed(mysqli $mysqli, int $serverId, bool $de
     }
 
     if ($proxyFlow) {
-        $proxyResult = ipmiWebProbeProxyFlowValidation($mysqli, $serverId);
+        $proxyResult = ipmiWebProbeProxyFlowValidation($mysqli, $serverId, $e2e);
         if (isset($proxyResult['checks']) && is_array($proxyResult['checks'])) {
             $base['proxy_checks'] = $proxyResult['checks'];
             if (!isset($base['checks']) || !is_array($base['checks'])) {
@@ -867,10 +1539,12 @@ function ipmiWebProbeServerWebUiDetailed(mysqli $mysqli, int $serverId, bool $de
         if (empty($proxyResult['ok'])) {
             $base['ok'] = false;
             $base['error'] = (string) ($proxyResult['error'] ?? 'proxy_flow_failed');
+            ipmiWebProbeBestEffortLogout($session);
             return $base;
         }
     }
 
+    ipmiWebProbeBestEffortLogout($session);
     return $base;
 }
 

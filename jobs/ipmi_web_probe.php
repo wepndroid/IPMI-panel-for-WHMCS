@@ -5,6 +5,7 @@
  * Cron example (daily): 0 3 * * * php /var/www/html/jobs/ipmi_web_probe.php --limit=200
  * Optional deep checks: --deep=1
  * Optional proxy-flow checks (same path as Open IPMI Session): --proxy=1
+ * Optional deeper E2E checks (asset/load/logout stability): --e2e=1
  *
  * Disable all web probes: env IPMI_WEB_PROBE=0 or define IPMI_WEB_PROBE_AUTO false in config.php
  */
@@ -26,6 +27,7 @@ $limit = 500;
 $targetId = 0;
 $deep = false;
 $proxyFlow = false;
+$e2e = false;
 foreach ($_SERVER['argv'] ?? [] as $arg) {
     if (strpos($arg, '--limit=') === 0) {
         $limit = max(1, (int) substr($arg, 8));
@@ -38,6 +40,9 @@ foreach ($_SERVER['argv'] ?? [] as $arg) {
     }
     if (strpos($arg, '--proxy=') === 0) {
         $proxyFlow = substr($arg, 8) === '1';
+    }
+    if (strpos($arg, '--e2e=') === 0) {
+        $e2e = substr($arg, 6) === '1';
     }
 }
 
@@ -53,7 +58,7 @@ $fail = 0;
 $skip = 0;
 
 if ($targetId > 0) {
-    $probe = ipmiWebProbeServerWebUiDetailed($mysqli, $targetId, $deep, $proxyFlow);
+    $probe = ipmiWebProbeServerWebUiDetailed($mysqli, $targetId, $deep, $proxyFlow, $e2e);
     ipmiWebProbeLogResult($targetId, $probe);
     if (!empty($probe['skipped'])) {
         $skip++;
@@ -66,6 +71,7 @@ if ($targetId > 0) {
         'server_id' => $targetId,
         'deep' => $deep ? 1 : 0,
         'proxy' => $proxyFlow ? 1 : 0,
+        'e2e' => $e2e ? 1 : 0,
         'result' => $probe
     ], JSON_UNESCAPED_SLASHES) . "\n";
 } else {
@@ -88,7 +94,7 @@ if ($targetId > 0) {
     $res = $stmt->get_result();
     while ($res && ($row = $res->fetch_assoc())) {
         $sid = (int) $row['id'];
-        $probe = ipmiWebProbeServerWebUiDetailed($mysqli, $sid, $deep, $proxyFlow);
+        $probe = ipmiWebProbeServerWebUiDetailed($mysqli, $sid, $deep, $proxyFlow, $e2e);
         ipmiWebProbeLogResult($sid, $probe);
         if (!empty($probe['skipped'])) {
             $skip++;
@@ -105,7 +111,8 @@ if ($targetId > 0) {
         'skipped' => $skip,
         'limit' => $limit,
         'deep' => $deep ? 1 : 0,
-        'proxy' => $proxyFlow ? 1 : 0
+        'proxy' => $proxyFlow ? 1 : 0,
+        'e2e' => $e2e ? 1 : 0
     ], JSON_UNESCAPED_SLASHES) . "\n";
 }
 

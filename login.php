@@ -92,8 +92,6 @@ if (isset($_POST['login'])) {
         <div class="ipmi-login-brand-logo">
           <img src="logo.png" width="300" height="120" alt="IPMI Panel Logo">
         </div>
-        <p class="ipmi-login-brand-title">Dedicated Server Panel</p>
-        <p class="ipmi-login-brand-sub">Remote power &amp; BMC access</p>
       </div>
     </aside>
 

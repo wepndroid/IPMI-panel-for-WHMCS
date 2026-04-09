@@ -530,6 +530,14 @@ function ipmiWebLoginResponseBodyIsFailure(string $raw): bool
     [, $body] = ipmiWebCurlExtractFinalHeadersAndBody($raw);
     $trim = ltrim($body);
     if ($trim === '' || ($trim[0] !== '{' && $trim[0] !== '[')) {
+        // iDRAC /data/login often responds with XML, e.g.:
+        // <authResult>5</authResult><errorMsg>The maximum number of user sessions has been reached!</errorMsg>
+        if (preg_match('~<authResult>\s*([^<]+)\s*</authResult>~i', $body, $m)) {
+            $authResult = trim((string) ($m[1] ?? ''));
+            if ($authResult !== '' && $authResult !== '0') {
+                return true;
+            }
+        }
         return false;
     }
     $j = json_decode($body, true);
@@ -595,6 +603,26 @@ function ipmiWebLoginResponseFailureReason(string $raw, int $httpCode, string $b
     }
 
     [, $body] = ipmiWebCurlExtractFinalHeadersAndBody($raw);
+    if (preg_match('~<authResult>\s*([^<]+)\s*</authResult>~i', $body, $m)) {
+        $authResult = trim((string) ($m[1] ?? ''));
+        if ($authResult !== '' && $authResult !== '0') {
+            $errorMsg = '';
+            if (preg_match('~<errorMsg>\s*([^<]*)\s*</errorMsg>~i', $body, $em)) {
+                $errorMsg = strtolower(trim((string) ($em[1] ?? '')));
+            }
+            if ($authResult === '5' || str_contains($errorMsg, 'maximum number of user sessions')) {
+                return 'session_limit';
+            }
+            if (str_contains($errorMsg, 'invalid')
+                || str_contains($errorMsg, 'wrong')
+                || str_contains($errorMsg, 'incorrect')
+                || str_contains($errorMsg, 'authentication')) {
+                return 'invalid_credentials';
+            }
+            return 'auth_rejected';
+        }
+    }
+
     $lb = strtolower(substr((string) $body, 0, 240000));
     if ($lb !== '') {
         if (str_contains($lb, 'lang_event_sensor_specific_event_str42_2')
@@ -923,6 +951,250 @@ function ipmiWebSupermicroCleanupSessionsFromDb(?mysqli $mysqli, int $serverId, 
     ]);
 
     return $freed > 0;
+}
+
+function ipmiWebIdracAttemptLogout(string $baseUrl, string $bmcIp, array $cookieJar): bool
+{
+    $baseUrl = rtrim($baseUrl, '/');
+    $originBase = ipmiWebBmcOriginBaseFromConnectUrl($baseUrl, $bmcIp);
+    $cookieParts = [];
+    foreach ($cookieJar as $k => $v) {
+        if ($v !== null && trim((string) $v) !== '') {
+            $cookieParts[] = $k . '=' . $v;
+        }
+    }
+    $cookieHeader = $cookieParts !== [] ? implode('; ', $cookieParts) : '';
+
+    $targets = [
+        ['path' => '/data/logout', 'method' => 'GET', 'xhr' => true],
+        ['path' => '/data/logout', 'method' => 'POST', 'xhr' => true, 'body' => ''],
+        ['path' => '/logout', 'method' => 'GET', 'xhr' => false],
+        ['path' => '/logout.html', 'method' => 'GET', 'xhr' => false],
+        ['path' => '/restgui/logout', 'method' => 'GET', 'xhr' => false],
+    ];
+
+    foreach ($targets as $t) {
+        $path = (string) ($t['path'] ?? '/data/logout');
+        $method = strtoupper((string) ($t['method'] ?? 'GET'));
+        $xhr = !empty($t['xhr']);
+        $body = (string) ($t['body'] ?? '');
+        [$raw, $code] = ipmiWebCurlExecBmc($bmcIp, $baseUrl . $path, static function ($ch) use ($originBase, $cookieHeader, $method, $xhr, $body): void {
+            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+            curl_setopt($ch, CURLOPT_TIMEOUT, 20);
+            curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 8);
+            curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+            curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+            curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+            curl_setopt($ch, CURLOPT_HEADER, true);
+            curl_setopt($ch, CURLOPT_USERAGENT, ipmiWebCurlUserAgent());
+            $headers = [
+                'Accept: */*',
+                'Origin: ' . $originBase,
+                'Referer: ' . $originBase . '/login.html',
+            ];
+            if ($xhr) {
+                $headers[] = 'X-Requested-With: XMLHttpRequest';
+            }
+            curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+            if ($method === 'POST') {
+                curl_setopt($ch, CURLOPT_POST, true);
+                curl_setopt($ch, CURLOPT_POSTFIELDS, $body);
+            } else {
+                curl_setopt($ch, CURLOPT_HTTPGET, true);
+            }
+            if ($cookieHeader !== '') {
+                curl_setopt($ch, CURLOPT_COOKIE, $cookieHeader);
+            }
+        });
+
+        ipmiWebDebugLog('idrac_logout_http', [
+            'path' => $path,
+            'method' => $method,
+            'http' => $code,
+        ]);
+
+        if ($raw !== false && $code >= 200 && $code < 500) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/**
+ * Try to clear stale iDRAC sessions via Redfish using account Basic auth.
+ * This is used only as a fallback when normal auto-login reports session_limit.
+ */
+function ipmiWebIdracCleanupSessionsViaRedfish(string $baseUrl, string $bmcIp, string $user, string $pass, int $maxDeletes = 20): bool
+{
+    $baseUrl = rtrim($baseUrl, '/');
+    if ($baseUrl === '' || $bmcIp === '' || $user === '' || $pass === '') {
+        return false;
+    }
+
+    $request = static function (string $path, string $method = 'GET', string $body = '') use ($baseUrl, $bmcIp, $user, $pass): array {
+        $url = $baseUrl . $path;
+        return ipmiWebCurlExecBmc($bmcIp, $url, static function ($ch) use ($method, $body, $user, $pass): void {
+            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+            curl_setopt($ch, CURLOPT_TIMEOUT, 20);
+            curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 8);
+            curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+            curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+            curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+            curl_setopt($ch, CURLOPT_HEADER, true);
+            curl_setopt($ch, CURLOPT_USERAGENT, ipmiWebCurlUserAgent());
+            curl_setopt($ch, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
+            curl_setopt($ch, CURLOPT_USERPWD, $user . ':' . $pass);
+            $headers = [
+                'Accept: application/json',
+            ];
+            $m = strtoupper($method);
+            if ($m === 'POST') {
+                curl_setopt($ch, CURLOPT_POST, true);
+                curl_setopt($ch, CURLOPT_POSTFIELDS, $body);
+                $headers[] = 'Content-Type: application/json';
+            } elseif ($m === 'DELETE') {
+                curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'DELETE');
+                if ($body !== '') {
+                    curl_setopt($ch, CURLOPT_POSTFIELDS, $body);
+                    $headers[] = 'Content-Type: application/json';
+                }
+            } else {
+                curl_setopt($ch, CURLOPT_HTTPGET, true);
+            }
+            curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+        });
+    };
+
+    $listPaths = [
+        '/redfish/v1/SessionService/Sessions',
+        '/redfish/v1/SessionService/Sessions/',
+    ];
+
+    foreach ($listPaths as $listPath) {
+        [$raw, $code] = $request($listPath, 'GET');
+        if ($raw === false || $code < 200 || $code >= 400) {
+            ipmiWebDebugLog('idrac_redfish_list_failed', [
+                'path' => $listPath,
+                'http' => $code,
+            ]);
+            continue;
+        }
+
+        [, $body] = ipmiWebCurlExtractFinalHeadersAndBody($raw);
+        $json = json_decode((string) $body, true);
+        if (!is_array($json) || empty($json['Members']) || !is_array($json['Members'])) {
+            ipmiWebDebugLog('idrac_redfish_list_empty', [
+                'path' => $listPath,
+                'http' => $code,
+            ]);
+            continue;
+        }
+
+        $deleted = 0;
+        $attempted = 0;
+        foreach ($json['Members'] as $member) {
+            if (!is_array($member)) {
+                continue;
+            }
+            $odata = trim((string) ($member['@odata.id'] ?? ''));
+            if ($odata === '' || !str_starts_with($odata, '/')) {
+                continue;
+            }
+            $attempted++;
+            [$dRaw, $dCode] = $request($odata, 'DELETE');
+            ipmiWebDebugLog('idrac_redfish_delete', [
+                'path' => $odata,
+                'http' => $dCode,
+            ]);
+            if ($dRaw !== false && in_array((int) $dCode, [200, 202, 204, 404], true)) {
+                $deleted++;
+            }
+            if ($deleted >= max(1, $maxDeletes)) {
+                break;
+            }
+        }
+
+        ipmiWebDebugLog('idrac_redfish_cleanup', [
+            'list_path' => $listPath,
+            'attempted' => $attempted,
+            'deleted' => $deleted,
+        ]);
+
+        if ($deleted > 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+function ipmiWebIdracCleanupSessionsFromDb(?mysqli $mysqli, int $serverId, string $currentToken, string $baseUrl, string $bmcIp, int $limit = 5): bool
+{
+    if (!$mysqli || $serverId <= 0) {
+        return false;
+    }
+    $sql = "
+        SELECT token, bmc_cookies
+        FROM ipmi_web_sessions
+        WHERE server_id = ? AND revoked_at IS NULL AND expires_at > NOW() AND token <> ?
+        ORDER BY COALESCE(last_access_at, created_at) DESC
+        LIMIT ?
+    ";
+    $stmt = $mysqli->prepare($sql);
+    if (!$stmt) {
+        return false;
+    }
+    $stmt->bind_param('isi', $serverId, $currentToken, $limit);
+    $stmt->execute();
+    $res = $stmt->get_result();
+    $rows = $res ? $res->fetch_all(MYSQLI_ASSOC) : [];
+    $stmt->close();
+
+    $freed = 0;
+    foreach ($rows as $row) {
+        $rawCookies = (string) ($row['bmc_cookies'] ?? '');
+        if ($rawCookies === '') {
+            continue;
+        }
+        [$cookies, $forwardHeaders] = ipmiWebUnpackStoredAuth($rawCookies);
+        if (!ipmiWebHasUsableBmcAuth($cookies, $forwardHeaders)) {
+            continue;
+        }
+        if (ipmiWebIdracAttemptLogout($baseUrl, $bmcIp, $cookies)) {
+            $freed++;
+            $upd = $mysqli->prepare("UPDATE ipmi_web_sessions SET revoked_at = NOW() WHERE token = ? LIMIT 1");
+            if ($upd) {
+                $tok = (string) ($row['token'] ?? '');
+                $upd->bind_param('s', $tok);
+                $upd->execute();
+                $upd->close();
+            }
+        }
+    }
+
+    ipmiWebDebugLog('idrac_logout_db_cleanup', [
+        'server_id' => $serverId,
+        'freed' => $freed,
+    ]);
+
+    return $freed > 0;
+}
+
+function ipmiWebResponseLooksLikeIdracLauncherShell(string $body): bool
+{
+    if ($body === '') {
+        return false;
+    }
+    $lb = strtolower(substr($body, 0, 120000));
+    if ($lb === '') {
+        return false;
+    }
+
+    return strpos($lb, '/session?aimgetintprop=scl_int_enabled') !== false
+        && strpos($lb, 'aimgetboolprop=pam_bool_sso_enabled') !== false
+        && strpos($lb, 'top.document.location.href') !== false
+        && strpos($lb, '/login.html') !== false;
 }
 
 function ipmiWebTryReuseExistingSession(mysqli $mysqli, int $serverId, int $userId, int $ttlSeconds): ?array
@@ -1491,20 +1763,34 @@ function ipmiWebCreateSession(mysqli $mysqli, int $serverId, int $userId, string
     }
 
     // Wrong bmc_type (e.g. supermicro vs iLO) skips whole vendor endpoint lists — retry with generic.
+    // Important: never permanently downgrade the session type to generic on failed fallback.
+    // Otherwise iDRAC/iLO vendor-specific recovery logic is skipped on first open.
     if (ipmiWebNeedsAutoLogin($session) && ipmiWebNormalizeBmcType($bmcType) !== 'generic') {
+        $restoreType = ipmiWebNormalizeBmcType((string)($session['bmc_type'] ?? $bmcType));
+        if ($restoreType === '') {
+            $restoreType = ipmiWebNormalizeBmcType($bmcType);
+        }
+
         $session['bmc_type'] = 'generic';
         $session['cookies'] = [];
         $session['forward_headers'] = [];
         $session['bmc_scheme'] = 'https';
         if (ipmiWebAttemptAutoLogin($session, $mysqli)) {
+            $fallbackDetectedType = ipmiWebNormalizeBmcType((string)($session['bmc_type'] ?? 'generic'));
+            if ($fallbackDetectedType === '') {
+                $fallbackDetectedType = 'generic';
+            }
             $upd = $mysqli->prepare('UPDATE ipmi_web_sessions SET bmc_type = ? WHERE token = ? LIMIT 1');
             if ($upd) {
-                $gt = 'generic';
-                $upd->bind_param('ss', $gt, $token);
+                $upd->bind_param('ss', $fallbackDetectedType, $token);
                 $upd->execute();
                 $upd->close();
             }
-            $session['bmc_type'] = 'generic';
+            $session['bmc_type'] = $fallbackDetectedType;
+        } else {
+            // Keep the vendor hint when fallback auth fails so proxy-side type-specific
+            // verification/relogin can still run on the first browser request.
+            $session['bmc_type'] = $restoreType;
         }
     }
 
@@ -1549,8 +1835,10 @@ function ipmiWebLoadSession(mysqli $mysqli, string $token): ?array
     }
 
     $stmt = $mysqli->prepare("
-        SELECT * FROM ipmi_web_sessions
-        WHERE token = ? AND expires_at > NOW() AND revoked_at IS NULL
+        SELECT ws.*, s.bmc_type AS server_bmc_type
+        FROM ipmi_web_sessions ws
+        LEFT JOIN servers s ON s.id = ws.server_id
+        WHERE ws.token = ? AND ws.expires_at > NOW() AND ws.revoked_at IS NULL
         LIMIT 1
     ");
     $stmt->bind_param("s", $token);
@@ -1588,6 +1876,18 @@ function ipmiWebLoadSession(mysqli $mysqli, string $token): ?array
     }
 
     $bmcType = strtolower(trim((string)($row['bmc_type'] ?? 'generic')));
+    $serverType = ipmiWebNormalizeBmcType((string)($row['server_bmc_type'] ?? 'generic'));
+    // Legacy/bad fallback tokens may be downgraded to generic; recover iDRAC behavior from server metadata.
+    if (ipmiWebNormalizeBmcType($bmcType) === 'generic' && $serverType === 'idrac') {
+        $bmcType = 'idrac';
+        $fix = $mysqli->prepare('UPDATE ipmi_web_sessions SET bmc_type = ? WHERE id = ? LIMIT 1');
+        if ($fix) {
+            $rowId = (int)$row['id'];
+            $fix->bind_param('si', $bmcType, $rowId);
+            $fix->execute();
+            $fix->close();
+        }
+    }
     if (ipmiWebIsIloFamilyType($bmcType)) {
         ipmiWebSyncIloSessionAndSessionKeyCookies($cookies);
     }
@@ -1805,12 +2105,8 @@ function ipmiWebIdracVerifyAuthed(string $baseUrl, string $bmcIp, array $cookieJ
 
     $baseUrl = rtrim($baseUrl, '/');
     $originBase = ipmiWebBmcOriginBaseFromConnectUrl($baseUrl, $bmcIp);
-    $targets = [
-        '/restgui/start.html',
-        '/restgui/launch',
-        '/',
-    ];
-
+    $targets = ['/index.html', '/start.html', '/', '/restgui/start.html', '/restgui/launch'];
+    $hasAuthedUi = false;
     foreach ($targets as $path) {
         $url = $baseUrl . $path;
         [$raw, $code] = ipmiWebCurlExecBmc($bmcIp, $url, static function ($ch) use ($originBase, $cookieJar): void {
@@ -1846,11 +2142,51 @@ function ipmiWebIdracVerifyAuthed(string $baseUrl, string $bmcIp, array $cookieJ
         if (ipmiWebResponseLooksLikeBmcLoginPage($body, 'text/html')) {
             continue;
         }
+        if (ipmiWebResponseLooksLikeIdracLauncherShell($body)) {
+            continue;
+        }
 
-        return true;
+        $hasAuthedUi = true;
+        break;
     }
 
-    return false;
+    if (!$hasAuthedUi) {
+        return false;
+    }
+
+    // Extra guard: if explicit login page still renders a login shell, the cookie is not authenticated.
+    [$rawLogin, $codeLogin] = ipmiWebCurlExecBmc($bmcIp, $baseUrl . '/login.html', static function ($ch) use ($originBase, $cookieJar): void {
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 20);
+        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 8);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+        curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+        curl_setopt($ch, CURLOPT_HEADER, true);
+        curl_setopt($ch, CURLOPT_USERAGENT, ipmiWebCurlUserAgent());
+        curl_setopt($ch, CURLOPT_HTTPGET, true);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, [
+            'Origin: ' . $originBase,
+            'Referer: ' . $originBase . '/',
+        ]);
+        $parts = [];
+        foreach ($cookieJar as $k => $v) {
+            if ($v !== null && trim((string) $v) !== '') {
+                $parts[] = $k . '=' . $v;
+            }
+        }
+        if ($parts !== []) {
+            curl_setopt($ch, CURLOPT_COOKIE, implode('; ', $parts));
+        }
+    });
+    if ($rawLogin !== false && $codeLogin >= 200 && $codeLogin < 400) {
+        [, $loginBody] = ipmiWebCurlExtractFinalHeadersAndBody($rawLogin);
+        if (ipmiWebResponseLooksLikeBmcLoginPage($loginBody, 'text/html')) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 function ipmiWebIloVerifyAuthed(string $baseUrl, string $bmcIp, array $cookieJar, array $forwardHeaders): bool
@@ -2366,6 +2702,7 @@ function ipmiWebAttemptAutoLogin(array &$session, ?mysqli $mysqli = null): bool
 
         $retryAmi = true;
         $retrySmCount = 0;
+        $retryIdracCount = 0;
         while ($retryAmi) {
             $retryAmi = false;
             $loginEndpoints = ipmiWebLoginEndpoints($typeNorm, $user, $pass);
@@ -2526,6 +2863,45 @@ function ipmiWebAttemptAutoLogin(array &$session, ?mysqli $mysqli = null): bool
                 }
                 if ($smLogoutOk || $smDbCleanupOk) {
                     $retrySmCount++;
+                    $retryAmi = true;
+                    break;
+                }
+            }
+            if ($typeNorm === 'idrac' && $retryIdracCount < 1
+                && ($failureReason === 'session_limit'
+                    || stripos($raw, 'maximum number of user sessions') !== false
+                    || stripos($raw, 'maximum number of sessions') !== false)) {
+                ipmiWebDebugLog('idrac_session_limit_detected', [
+                    'path' => (string) ($endpoint['path'] ?? ''),
+                    'http' => $code,
+                ]);
+                $idracLogoutOk = ipmiWebIdracAttemptLogout($baseUrl, $ip, $cookieJar);
+                ipmiWebDebugLog('idrac_logout_attempt', [
+                    'ok' => $idracLogoutOk ? 1 : 0,
+                ]);
+                $idracDbCleanupOk = false;
+                if (!$idracLogoutOk && $mysqli) {
+                    $idracDbCleanupOk = ipmiWebIdracCleanupSessionsFromDb(
+                        $mysqli,
+                        (int)($session['server_id'] ?? 0),
+                        (string)($session['token'] ?? ''),
+                        $baseUrl,
+                        $ip,
+                        20
+                    );
+                }
+                $idracRedfishCleanupOk = false;
+                if (!$idracLogoutOk && !$idracDbCleanupOk) {
+                    $idracRedfishCleanupOk = ipmiWebIdracCleanupSessionsViaRedfish(
+                        $baseUrl,
+                        $ip,
+                        (string) $user,
+                        (string) $pass,
+                        20
+                    );
+                }
+                if ($idracLogoutOk || $idracDbCleanupOk || $idracRedfishCleanupOk) {
+                    $retryIdracCount++;
                     $retryAmi = true;
                     break;
                 }
@@ -2784,10 +3160,14 @@ function ipmiWebPostLoginLandingPath(string $bmcType): string
         return '/cgi/url_redirect.cgi?url_name=topmenu';
     }
     if ($type === 'ilo4') {
-        return '/';
+        // Some iLO4 builds return 404 on /html/application.html for top-level navigation.
+        // /index.html is a safer authenticated entry and still loads the full UI shell.
+        return '/index.html';
     }
     if ($type === 'idrac') {
-        return '/restgui/start.html';
+        // /start.html is often a pre-login launcher and can bounce to /login.html.
+        // Use authenticated app entry to avoid login/start loops in proxy mode.
+        return '/index.html';
     }
     if ($type === 'ami') {
         return '/';
@@ -2819,6 +3199,8 @@ function ipmiWebKvmConsolePath(array $session): string
         case 'idrac':
             return ipmiWebPickReachablePath($session, [
                 '/viewer.html',
+                '/start.html',
+                '/index.html',
                 '/restgui/start.html',
                 '/restgui/launch',
                 '/',
