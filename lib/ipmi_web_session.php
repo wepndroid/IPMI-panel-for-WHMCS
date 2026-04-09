@@ -534,7 +534,25 @@ function ipmiWebLoginResponseBodyIsFailure(string $raw): bool
         // <authResult>5</authResult><errorMsg>The maximum number of user sessions has been reached!</errorMsg>
         if (preg_match('~<authResult>\s*([^<]+)\s*</authResult>~i', $body, $m)) {
             $authResult = trim((string) ($m[1] ?? ''));
-            if ($authResult !== '' && $authResult !== '0') {
+            $status = '';
+            if (preg_match('~<status>\s*([^<]+)\s*</status>~i', $body, $sm)) {
+                $status = strtolower(trim((string) ($sm[1] ?? '')));
+            }
+            $errorMsg = '';
+            if (preg_match('~<errorMsg>\s*([^<]*)\s*</errorMsg>~i', $body, $em)) {
+                $errorMsg = strtolower(trim((string) ($em[1] ?? '')));
+            }
+            $forwardUrl = '';
+            if (preg_match('~<forwardUrl>\s*([^<]+)\s*</forwardUrl>~i', $body, $fm)) {
+                $forwardUrl = trim((string) ($fm[1] ?? ''));
+            }
+            // Some iDRAC builds return authResult=99 with status=ok and a forwardUrl for an already-valid session.
+            // Treat this as success, otherwise we incorrectly mark valid auto-login as failed.
+            $isIdracAlreadyAuthed = ($authResult === '99')
+                && ($status === 'ok' || $forwardUrl !== '')
+                && $errorMsg === '';
+
+            if ($authResult !== '' && $authResult !== '0' && !$isIdracAlreadyAuthed) {
                 return true;
             }
         }
@@ -606,9 +624,21 @@ function ipmiWebLoginResponseFailureReason(string $raw, int $httpCode, string $b
     if (preg_match('~<authResult>\s*([^<]+)\s*</authResult>~i', $body, $m)) {
         $authResult = trim((string) ($m[1] ?? ''));
         if ($authResult !== '' && $authResult !== '0') {
+            $status = '';
+            if (preg_match('~<status>\s*([^<]+)\s*</status>~i', $body, $sm)) {
+                $status = strtolower(trim((string) ($sm[1] ?? '')));
+            }
             $errorMsg = '';
             if (preg_match('~<errorMsg>\s*([^<]*)\s*</errorMsg>~i', $body, $em)) {
                 $errorMsg = strtolower(trim((string) ($em[1] ?? '')));
+            }
+            $forwardUrl = '';
+            if (preg_match('~<forwardUrl>\s*([^<]+)\s*</forwardUrl>~i', $body, $fm)) {
+                $forwardUrl = trim((string) ($fm[1] ?? ''));
+            }
+            // Some iDRAC builds signal "already authenticated" with authResult=99.
+            if ($authResult === '99' && ($status === 'ok' || $forwardUrl !== '') && $errorMsg === '') {
+                return '';
             }
             if ($authResult === '5' || str_contains($errorMsg, 'maximum number of user sessions')) {
                 return 'session_limit';
@@ -1067,6 +1097,8 @@ function ipmiWebIdracCleanupSessionsViaRedfish(string $baseUrl, string $bmcIp, s
     };
 
     $listPaths = [
+        '/redfish/v1/Sessions',
+        '/redfish/v1/Sessions/',
         '/redfish/v1/SessionService/Sessions',
         '/redfish/v1/SessionService/Sessions/',
     ];
@@ -2956,10 +2988,24 @@ function ipmiWebAttemptAutoLogin(array &$session, ?mysqli $mysqli = null): bool
                     continue;
                 }
                 if ($effectiveType === 'idrac' && !ipmiWebIdracVerifyAuthed($baseUrl, $ip, $cookieJar)) {
+                    // iDRAC can still allocate a web session cookie even when our post-login page checks fail.
+                    // Best effort logout here avoids leaking sessions and hitting iDRAC session-limit quickly.
+                    $logoutOk = ipmiWebIdracAttemptLogout($baseUrl, $ip, $cookieJar);
+                    $redfishCleanupOk = ipmiWebIdracCleanupSessionsViaRedfish(
+                        $baseUrl,
+                        $ip,
+                        (string) $user,
+                        (string) $pass,
+                        20
+                    );
+                    $cleanupOk = $logoutOk || $redfishCleanupOk;
                     ipmiWebDebugLog('autologin_attempt', [
                         'path' => (string) ($endpoint['path'] ?? ''),
                         'http' => $code,
                         'result' => 'idrac_verify_failed',
+                        'logout_ok' => $logoutOk ? 1 : 0,
+                        'redfish_cleanup_ok' => $redfishCleanupOk ? 1 : 0,
+                        'cleanup_ok' => $cleanupOk ? 1 : 0,
                     ]);
                     continue;
                 }
@@ -3185,6 +3231,8 @@ function ipmiWebKvmConsolePath(array $session): string
             return ipmiWebPickReachablePath($session, [
                 '/cgi/url_redirect.cgi?url_name=ikvm&url_type=jwsk',
                 '/cgi/url_redirect.cgi?url_name=ikvm',
+                '/cgi/url_redirect.cgi?url_name=ikvm&url_type=java',
+                '/cgi/url_redirect.cgi?url_name=ikvm&url_type=html5',
                 '/cgi/url_redirect.cgi?url_name=topmenu',
             ], '/cgi/url_redirect.cgi?url_name=topmenu');
         case 'ilo4':
@@ -3193,12 +3241,15 @@ function ipmiWebKvmConsolePath(array $session): string
                 '/html/irc.html',
                 '/html/java_irc.html',
                 '/html/intgapp.html',
+                '/html/intgapp3.html',
+                '/html/kvmsession.html',
                 '/html/iLO.html',
                 '/',
             ], '/');
         case 'idrac':
             return ipmiWebPickReachablePath($session, [
                 '/viewer.html',
+                '/console.html',
                 '/start.html',
                 '/index.html',
                 '/restgui/start.html',
@@ -3216,52 +3267,200 @@ function ipmiWebKvmConsoleUrl(array $session): string
     return ipmiWebBuildProxyUrl($session['token'], $path);
 }
 
-function ipmiWebPickReachablePath(array $session, array $candidates, string $fallback): string
+function ipmiWebKvmPathLooksConsoleLike(string $path, string $body): bool
 {
-    $ip = $session['ipmi_ip'] ?? '';
-    if ($ip === '') {
-        return $fallback;
+    $p = strtolower((string) parse_url($path, PHP_URL_PATH));
+    if ($p === '') {
+        $p = strtolower($path);
+    }
+    if (str_contains($p, 'ikvm')
+        || str_contains($p, 'viewer')
+        || str_contains($p, 'console')
+        || str_contains($p, 'irc')
+        || str_contains($p, 'intgapp')
+    ) {
+        return true;
     }
 
-    $cookieHeader = ipmiWebBuildCookieString($session);
+    $sample = strtolower(substr((string) $body, 0, 200000));
+    if ($sample === '') {
+        return false;
+    }
+
+    return str_contains($sample, 'remote console')
+        || str_contains($sample, 'ikvm')
+        || str_contains($sample, 'jviewer')
+        || str_contains($sample, 'avct')
+        || str_contains($sample, 'novnc')
+        || str_contains($sample, 'launch console')
+        || str_contains($sample, 'launch kvm');
+}
+
+function ipmiWebKvmPathLooksUnavailable(string $body): bool
+{
+    $sample = strtolower(substr((string) $body, 0, 200000));
+    if ($sample === '') {
+        return false;
+    }
+
+    return str_contains($sample, 'can not open remote control page')
+        || str_contains($sample, 'cannot open remote control page')
+        || str_contains($sample, 'ikvm server port')
+        || str_contains($sample, 'remote control is disabled')
+        || str_contains($sample, 'console is disabled');
+}
+
+function ipmiWebKvmBodyHasTimeoutText(string $body): bool
+{
+    if ($body === '') {
+        return false;
+    }
+    $sample = strtolower(substr((string) $body, 0, 200000));
+
+    return str_contains($sample, 'ipmi session expired')
+        || str_contains($sample, 'session has timed out')
+        || str_contains($sample, 'session timed out')
+        || str_contains($sample, 'please log in a new session')
+        || str_contains($sample, 'please login in a new session');
+}
+
+/**
+ * Lightweight KVM path probe against current authenticated BMC session.
+ *
+ * @return array{ok: bool, score: int, code: int, login: bool, timeout: bool, unavailable: bool}
+ */
+function ipmiWebProbeKvmPath(array $session, string $path): array
+{
+    $ip = trim((string) ($session['ipmi_ip'] ?? ''));
+    if ($ip === '') {
+        return ['ok' => false, 'score' => -1000, 'code' => 0, 'login' => false, 'timeout' => false, 'unavailable' => false];
+    }
 
     $scheme = (($session['bmc_scheme'] ?? 'https') === 'http') ? 'http' : 'https';
+    $url = $scheme . '://' . $ip . '/' . ltrim($path, '/');
+    $cookieHeader = ipmiWebBuildCookieString($session);
+    $ch = curl_init($url);
+    $appliedResolve = ipmiBmcApplyCurlUrlAndResolve($ch, $url, $ip);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 7);
+    curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 3);
+    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+    curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+    curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+    curl_setopt($ch, CURLOPT_HEADER, true);
+    curl_setopt($ch, CURLOPT_ENCODING, '');
+    curl_setopt($ch, CURLOPT_HTTPGET, true);
+    curl_setopt($ch, CURLOPT_USERAGENT, ipmiWebCurlUserAgent());
+    if ($cookieHeader !== '') {
+        curl_setopt($ch, CURLOPT_COOKIE, $cookieHeader);
+    }
+    $reqHeaders = [];
+    $fh = $session['forward_headers'] ?? [];
+    if (is_array($fh)) {
+        foreach ($fh as $hn => $hv) {
+            $hn = trim((string) $hn);
+            if ($hn === '' || strcasecmp($hn, 'Cookie') === 0) {
+                continue;
+            }
+            $reqHeaders[] = $hn . ': ' . $hv;
+        }
+    }
+    if ($reqHeaders !== []) {
+        curl_setopt($ch, CURLOPT_HTTPHEADER, $reqHeaders);
+    }
+    $raw = curl_exec($ch);
+    $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    if (($raw === false || $code === 0) && $appliedResolve) {
+        $ch = curl_init($url);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 7);
+        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 3);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+        curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+        curl_setopt($ch, CURLOPT_HEADER, true);
+        curl_setopt($ch, CURLOPT_ENCODING, '');
+        curl_setopt($ch, CURLOPT_HTTPGET, true);
+        curl_setopt($ch, CURLOPT_USERAGENT, ipmiWebCurlUserAgent());
+        if ($cookieHeader !== '') {
+            curl_setopt($ch, CURLOPT_COOKIE, $cookieHeader);
+        }
+        if ($reqHeaders !== []) {
+            curl_setopt($ch, CURLOPT_HTTPHEADER, $reqHeaders);
+        }
+        $raw = curl_exec($ch);
+        $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+    }
+
+    $contentType = '';
+    $body = '';
+    if (is_string($raw) && $raw !== '') {
+        [$hdr, $respBody] = ipmiWebCurlExtractFinalHeadersAndBody($raw);
+        $body = (string) $respBody;
+        if ($hdr !== '' && preg_match('/^Content-Type:\s*([^\r\n]+)/mi', $hdr, $mCt)) {
+            $contentType = trim((string) ($mCt[1] ?? ''));
+        }
+    }
+
+    $login = ipmiWebResponseLooksLikeBmcLoginPage($body, $contentType);
+    $timeout = ipmiWebKvmBodyHasTimeoutText($body);
+    $unavailable = ipmiWebKvmPathLooksUnavailable($body);
+    $ok = ($code >= 200 && $code < 400) && !$login && !$timeout;
+
+    $score = 0;
+    if ($ok) {
+        $score += 20;
+    }
+    if (ipmiWebKvmPathLooksConsoleLike($path, $body)) {
+        $score += 30;
+    }
+    if ($unavailable) {
+        $score -= 60;
+    }
+    if ($code >= 400 || $code === 0) {
+        $score -= 80;
+    }
+    if ($login || $timeout) {
+        $score -= 50;
+    }
+
+    return [
+        'ok' => $ok,
+        'score' => $score,
+        'code' => $code,
+        'login' => $login,
+        'timeout' => $timeout,
+        'unavailable' => $unavailable,
+    ];
+}
+
+function ipmiWebPickReachablePath(array $session, array $candidates, string $fallback): string
+{
+    $bestPath = $fallback;
+    $bestScore = -100000;
     foreach ($candidates as $path) {
-        $url = $scheme . '://' . $ip . '/' . ltrim($path, '/');
-        [, $code] = ipmiWebCurlExecBmc($ip, $url, static function ($ch) use ($cookieHeader, $session): void {
-            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-            curl_setopt($ch, CURLOPT_TIMEOUT, 5);
-            curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 3);
-            curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-            curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
-            curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
-            curl_setopt($ch, CURLOPT_NOBODY, true);
-
-            $reqHeaders = [];
-            if ($cookieHeader !== '') {
-                curl_setopt($ch, CURLOPT_COOKIE, $cookieHeader);
-            }
-            $fh = $session['forward_headers'] ?? [];
-            if (is_array($fh)) {
-                foreach ($fh as $hn => $hv) {
-                    $hn = trim((string) $hn);
-                    if ($hn === '' || strcasecmp($hn, 'Cookie') === 0) {
-                        continue;
-                    }
-                    $reqHeaders[] = $hn . ': ' . $hv;
-                }
-            }
-            if ($reqHeaders !== []) {
-                curl_setopt($ch, CURLOPT_HTTPHEADER, $reqHeaders);
-            }
-        });
-
-        if ($code >= 200 && $code < 400) {
+        $probe = ipmiWebProbeKvmPath($session, $path);
+        if (!empty($probe['ok']) && !empty($probe['unavailable']) && $bestScore < 10) {
+            // Console endpoint is reachable but disabled by vendor policy; keep best effort path.
+            $bestPath = $path;
+            $bestScore = 10;
+            continue;
+        }
+        $score = (int) ($probe['score'] ?? -1000);
+        if ($score > $bestScore) {
+            $bestScore = $score;
+            $bestPath = $path;
+        }
+        if (!empty($probe['ok']) && $score >= 45) {
+            // Good console-like hit; no need to keep probing.
             return $path;
         }
     }
 
-    return $fallback;
+    return $bestPath;
 }
 
 function ipmiWebBuildCookieString(array $session): string
