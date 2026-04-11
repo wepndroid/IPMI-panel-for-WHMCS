@@ -36,7 +36,7 @@ function ipmiProxyDebugEnabled(): bool
 }
 
 /**
- * Remove debug-only query keys so they are not forwarded to the BMC.
+ * Remove proxy-only query keys so they are not forwarded to the BMC.
  */
 function ipmiProxyDebugStripFromQuery(string $queryString): string
 {
@@ -47,7 +47,15 @@ function ipmiProxyDebugStripFromQuery(string $queryString): string
     if (!is_array($params)) {
         return $queryString;
     }
-    unset($params['ipmi_proxy_debug'], $params['ipmi_proxy_console']);
+    unset(
+        $params['ipmi_proxy_debug'],
+        $params['ipmi_proxy_console'],
+        $params['ipmi_kvm_auto'],
+        $params['ipmi_kvm_legacy'],
+        $params['ipmi_kvm_force_html5'],
+        $params['ipmi_kvm_stage'],
+        $params['ipmi_kvm_unavailable']
+    );
 
     return http_build_query($params);
 }

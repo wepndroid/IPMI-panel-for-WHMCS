@@ -16,8 +16,9 @@ function kvmCandidates(string $bmcType): array
     switch ($type) {
         case 'ilo4':
             return [
-                '/html/irc.html',
                 '/html/application.html?ipmi_kvm_auto=1',
+                '/html/rc_info.html?ipmi_kvm_auto=1',
+                '/html/irc.html',
                 '/html/jnlp_template.html',
                 '/html/java_irc.html',
                 '/html/IRC.application?cofc_goback=false',
@@ -154,4 +155,3 @@ while ($row = $q->fetch_assoc()) {
         csvCell($error),
     ]) . "\n";
 }
-

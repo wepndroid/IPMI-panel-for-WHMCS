@@ -3238,22 +3238,10 @@ function ipmiWebKvmConsolePath(array $session): string
             $iloAutoPath = $iloStandaloneHtml5
                 ? '/html/application.html?ipmi_kvm_auto=1&ipmi_kvm_force_html5=1'
                 : '/html/application.html?ipmi_kvm_auto=1';
-            $iloIndexAutoPath = $iloStandaloneHtml5
-                ? '/index.html?ipmi_kvm_auto=1&ipmi_kvm_force_html5=1'
-                : '/index.html?ipmi_kvm_auto=1';
-            return ipmiWebPickReachablePath($session, [
-                // Prefer proxy-driven autolaunch from application shell first.
-                // On many iLO4 builds this context has the HTML5 console JS loaded directly.
-                $iloAutoPath,
-                // Keep index-shell autolaunch as a secondary path for firmware variants.
-                $iloIndexAutoPath,
-                '/html/intgapp.html',
-                '/html/intgapp3.html',
-                '/html/IRC.html',
-                '/html/irc.html',
-                '/html/kvmsession.html',
-                '/html/iLO.html',
-            ], '/index.html?ipmi_kvm_unavailable=1', true);
+            // Browser-native iLO4 KVM is a runtime-driven flow rooted at application.html.
+            // Server-side path probes can misclassify this route because the real browser
+            // establishes additional client-side state before the inner pages load.
+            return $iloAutoPath;
         case 'idrac':
             return ipmiWebPickReachablePath($session, [
                 '/viewer.html',
@@ -3347,6 +3335,19 @@ function ipmiWebKvmPathLooksUnavailable(string $body): bool
 {
     $sample = strtolower(substr((string) $body, 0, 200000));
     if ($sample === '') {
+        return false;
+    }
+
+    $looksLikeIloChooser = str_contains($sample, 'html5 integrated remote console')
+        || (
+            str_contains($sample, 'html5 console')
+            && (
+                str_contains($sample, '.net integrated remote console')
+                || str_contains($sample, 'java integrated remote console')
+                || str_contains($sample, 'web start')
+            )
+        );
+    if ($looksLikeIloChooser) {
         return false;
     }
 

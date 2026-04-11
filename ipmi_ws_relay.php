@@ -17,13 +17,6 @@ session_start();
 require_once __DIR__ . '/config.php';
 require_once __DIR__ . '/lib/ipmi_web_session.php';
 
-if (!isset($_SESSION['user_id'])) {
-    http_response_code(401);
-    header('Content-Type: application/json');
-    echo json_encode(['error' => 'Authentication required']);
-    exit;
-}
-
 $token = strtolower(trim((string)($_GET['token'] ?? '')));
 
 if (!preg_match('/^[a-f0-9]{64}$/', $token)) {
@@ -39,6 +32,31 @@ if (!$session) {
     header('Content-Type: application/json');
     echo json_encode(['error' => 'Session expired or invalid']);
     exit;
+}
+
+$panelUserId = $_SESSION['user_id'] ?? null;
+if (!$panelUserId) {
+    $createdIp = (string)($session['created_ip'] ?? '');
+    $createdUa = (string)($session['user_agent'] ?? '');
+    $remoteIp = (string)($_SERVER['REMOTE_ADDR'] ?? '');
+    $currentUa = (string)($_SERVER['HTTP_USER_AGENT'] ?? '');
+    $allowTokenOnly = false;
+
+    if ($createdIp !== '' && $remoteIp !== '' && $createdIp === $remoteIp) {
+        if ($createdUa === '' || $currentUa === '') {
+            $allowTokenOnly = true;
+        } else {
+            $allowTokenOnly = (strncmp($currentUa, $createdUa, strlen($createdUa)) === 0)
+                || (strncmp($createdUa, $currentUa, strlen($currentUa)) === 0);
+        }
+    }
+
+    if (!$allowTokenOnly) {
+        http_response_code(401);
+        header('Content-Type: application/json');
+        echo json_encode(['error' => 'Authentication required']);
+        exit;
+    }
 }
 
 $isWsUpgrade = (

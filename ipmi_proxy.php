@@ -211,6 +211,10 @@ function ipmiProxyInjectIloHeadFixes(string $html, string $token, ?string $redfi
 
     $px = '/ipmi_proxy.php/' . rawurlencode($token);
     $pxJs = json_encode($px, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_SLASHES);
+    $wsRelay = '/ipmi_ws_relay.php?token=' . rawurlencode($token) . '&target=';
+    $wsRelayJs = json_encode($wsRelay, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_SLASHES);
+    $wsRelay = '/ipmi_ws_relay.php?token=' . rawurlencode($token) . '&target=';
+    $wsRelayJs = json_encode($wsRelay, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_SLASHES);
     $xTok = $redfishXAuthToken !== null ? trim($redfishXAuthToken) : '';
     $xJs = json_encode($xTok, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
 
@@ -240,12 +244,13 @@ function ipmiProxyInjectIloHeadFixes(string $html, string $token, ?string $redfi
         . '(function(){try{var _a=window.alert;window.alert=function(msg){try{var s=String(msg||"").toLowerCase();'
         . 'if(s.indexOf("session has timed out")>=0||s.indexOf("session timed out")>=0||s.indexOf("session is running")>=0||s.indexOf("already a session")>=0){return;}'
         . '}catch(e){}return _a.apply(this,arguments);};}catch(e){}'
-        . 'var P=' . $pxJs . ';var A=' . $xJs . ';var H=' . $hostsJs . ';'
+        . 'var P=' . $pxJs . ';var W=' . $wsRelayJs . ';var A=' . $xJs . ';var H=' . $hostsJs . ';'
         . 'var R=["/redfish/v1/","/redfish/","/rest/v1/","/rest/","/restapi/","/js/","/css/","/fonts/","/img/","/images/","/json/","/api/","/html/","/themes/","/sse/","/cgi/","/java/","/Java/","/viewer/","/console/","/kvm/","/avct/","/favicon.ico"];'
-        . 'var L=location;var po=L.protocol+"//"+L.host;'
+        . 'var L=location;var po=L.protocol+"//"+L.host;var wo=(L.protocol==="https:"?"wss:":"ws:")+"//"+L.host;'
         . 'function iH(h){if(!h)return false;h=String(h).toLowerCase();for(var i=0;i<H.length;i++){if(H[i]&&String(H[i]).toLowerCase()===h)return true;}return false;}'
         . 'function sp(s){if(typeof s!=="string"||s.indexOf(P)===0)return false;for(var i=0;i<R.length;i++){if(s.indexOf(R[i])===0)return true;}return false;}'
         . 'function fu(s){if(typeof s!=="string")return s;if(s.indexOf(po+P)===0)return s;try{var u=new URL(s,po);var sh=(String(u.hostname||"").toLowerCase()===String(L.hostname||"").toLowerCase());if(sh&&u.pathname.indexOf(P)===0)return po+u.pathname+u.search+u.hash;if(iH(u.hostname)||(sh&&sp(u.pathname))||(u.origin===po&&sp(u.pathname)))return po+P+u.pathname+u.search+u.hash;}catch(e){}return sp(s)?po+P+s:s;}'
+        . 'function wru(s){if(typeof s!=="string")return s;try{var u=new URL(s,L.href);if((u.origin===po)&&u.pathname.indexOf("/ipmi_ws_relay.php")===0)return wo+u.pathname+u.search+u.hash;var sh=(String(u.hostname||"").toLowerCase()===String(L.hostname||"").toLowerCase());var wsScheme=String(u.protocol||"").toLowerCase();if(wsScheme!=="ws:"&&wsScheme!=="wss:"){wsScheme=(L.protocol==="https:"?"wss:":"ws:");}var targetHost=u.host;if((sh&&sp(u.pathname))&&H.length>0){targetHost=String(H[0]);}if(iH(u.hostname)||(sh&&sp(u.pathname))||(u.origin===po&&sp(u.pathname))){var target=wsScheme.replace(":","")+"://"+targetHost+u.pathname+u.search;return wo+W+encodeURIComponent(target);}}catch(e){}return s;}'
         . 'function fx(n){if(typeof A!=="string"||!A)return n;n=n||{};try{var Hd=new Headers(n.headers||{});if(!Hd.has("X-Auth-Token"))Hd.set("X-Auth-Token",A);n.headers=Hd;}catch(e){}return n;}'
         . 'if(window.fetch){var of=window.fetch;window.fetch=function(i,n){try{n=fx(n||{});'
         . 'if(typeof i==="string")return of.call(this,fu(i),n);'
@@ -255,10 +260,7 @@ function ipmiProxyInjectIloHeadFixes(string $html, string $token, ?string $redfi
         . '}catch(e){}return of.call(this,i,n);};}'
         . 'var xp=XMLHttpRequest&&XMLHttpRequest.prototype;if(xp&&xp.open){var oo=xp.open;xp.open=function(m,u,a3,a4,a5){try{if(typeof u==="string")u=fu(u);}catch(e){}return oo.call(this,m,u,a3,a4,a5);};}'
         . 'if(xp&&xp.send){var xs=xp.send;xp.send=function(b){try{if(typeof A==="string"&&A){try{this.setRequestHeader("X-Auth-Token",A);}catch(e3){}}}catch(e4){}return xs.call(this,b);};}'
-        . 'if(window.WebSocket){var OW=WebSocket;window.WebSocket=function(u,p){try{'
-        . 'if(typeof u==="string"){var wu=new URL(u,L.href);if(iH(wu.hostname)||sp(wu.pathname)||(wu.origin===po&&sp(wu.pathname)))'
-        . 'u=(L.protocol==="https:"?"wss:":"ws:")+"//"+L.host+P+wu.pathname+wu.search;}'
-        . '}catch(e){}return new OW(u,p);};}'
+        . 'if(window.WebSocket){var OW=WebSocket;window.WebSocket=function(u,p){try{if(typeof u==="string")u=wru(u);}catch(e){}return new OW(u,p);};}'
         . 'if(window.EventSource){var OES=EventSource;window.EventSource=function(u,c){try{if(typeof u==="string")u=fu(u);}catch(e6){}return new OES(u,c);};'
         . 'try{window.EventSource.prototype=OES.prototype;}catch(e7){}}'
         . 'try{if(typeof A==="string"){var dc=String(document.cookie||"");'
@@ -357,15 +359,16 @@ function ipmiProxyInjectGenericHeadFixes(
         . 'try{var _a=window.alert;window.alert=function(msg){try{var s=String(msg||"").toLowerCase();'
         . 'if(s.indexOf("session has timed out")>=0||s.indexOf("session timed out")>=0||s.indexOf("session is running")>=0||s.indexOf("already a session")>=0){return;}'
         . '}catch(e){}return _a.apply(this,arguments);};}catch(e){}'
-        . 'var P=' . $pxJs . ';var A=' . $authJs . ';var C=' . $csrfJs . ';var H=' . $hostsJs . ';'
+        . 'var P=' . $pxJs . ';var W=' . $wsRelayJs . ';var A=' . $authJs . ';var C=' . $csrfJs . ';var H=' . $hostsJs . ';'
         . 'var R=["/redfish/v1/","/redfish/","/rest/v1/","/rest/","/restapi/","/session","/data/","/rpc/","/js/","/css/","/fonts/","/img/","/images/","/json/","/api/","/html/","/themes/","/sse/","/cgi/","/res/","/java/","/Java/","/viewer/","/console/","/kvm/","/avct/","/favicon.ico"];'
-        . 'var L=location;var po=L.protocol+"//"+L.host;'
+        . 'var L=location;var po=L.protocol+"//"+L.host;var wo=(L.protocol==="https:"?"wss:":"ws:")+"//"+L.host;'
         . 'var F=' . $forceSm . ';'
         . 'var D=' . $disableHashRedirect . ';'
         . 'if(F){try{if(window.sessionStorage&&!sessionStorage.getItem("_x_auth")){sessionStorage.setItem("_x_auth","ipmi_proxy");}}catch(e0){}}'
         . 'function iH(h){if(!h)return false;h=String(h).toLowerCase();for(var i=0;i<H.length;i++){if(H[i]&&String(H[i]).toLowerCase()===h)return true;}return false;}'
         . 'function sp(s){if(typeof s!=="string"||s.indexOf(P)===0)return false;for(var i=0;i<R.length;i++){if(s.indexOf(R[i])===0)return true;}return false;}'
         . 'function fu(s){if(typeof s!=="string")return s;if(s.indexOf(po+P)===0)return s;try{var u=new URL(s,po);var sh=(String(u.hostname||"").toLowerCase()===String(L.hostname||"").toLowerCase());if(sh&&u.pathname.indexOf(P)===0)return po+u.pathname+u.search+u.hash;if(iH(u.hostname)||(sh&&sp(u.pathname))||(u.origin===po&&sp(u.pathname)))return po+P+u.pathname+u.search+u.hash;}catch(e){}return sp(s)?po+P+s:s;}'
+        . 'function wru(s){if(typeof s!=="string")return s;try{var u=new URL(s,L.href);if((u.origin===po)&&u.pathname.indexOf("/ipmi_ws_relay.php")===0)return wo+u.pathname+u.search+u.hash;var sh=(String(u.hostname||"").toLowerCase()===String(L.hostname||"").toLowerCase());var wsScheme=String(u.protocol||"").toLowerCase();if(wsScheme!=="ws:"&&wsScheme!=="wss:"){wsScheme=(L.protocol==="https:"?"wss:":"ws:");}var targetHost=u.host;if((sh&&sp(u.pathname))&&H.length>0){targetHost=String(H[0]);}if(iH(u.hostname)||(sh&&sp(u.pathname))||(u.origin===po&&sp(u.pathname))){var target=wsScheme.replace(":","")+"://"+targetHost+u.pathname+u.search;return wo+W+encodeURIComponent(target);}}catch(e){}return s;}'
         . 'function isLogoutUrl(s){try{var u=new URL(String(s||""),po);var p=String(u.pathname||"").toLowerCase();if(p.indexOf("/cgi/logout.cgi")===0)return true;}catch(e){}try{return String(s||"").toLowerCase().indexOf("/cgi/logout.cgi")>=0;}catch(e2){return false;}}'
         . 'function gc(n){try{var m=document.cookie.match(new RegExp("(?:^|;\\\\s*)"+n+"=([^;]+)"));return m?decodeURIComponent(m[1]):"";}catch(e){return"";}}'
         . 'function csrf(){var v="";if(typeof C==="string"&&C)v=C;var g=gc("garc");if(g)v=g;var t=gc("CSRFToken");if(t)v=t;return v;}'
@@ -383,9 +386,7 @@ function ipmiProxyInjectGenericHeadFixes(
         . 'var xp=XMLHttpRequest&&XMLHttpRequest.prototype;if(xp&&xp.open){var oo=xp.open;xp.open=function(m,u,a3,a4,a5){try{this.__ipmi_proxy_url=u;if(typeof u==="string")u=fu(u);this.__ipmi_proxy_url=u;}catch(e){}return oo.call(this,m,u,a3,a4,a5);};}'
         . 'if(xp&&xp.send){var os=xp.send;xp.send=function(b){try{if(F&&isLogoutUrl(this.__ipmi_proxy_url)){try{this.abort();}catch(e0){}return;}if(typeof A==="string"&&A){try{this.setRequestHeader("X-Auth-Token",A);}catch(e3){}}'
         . 'var cv=csrf();if(cv){try{this.setRequestHeader("X-CSRFTOKEN",cv);}catch(e5){}try{this.setRequestHeader("X-CSRF-Token",cv);}catch(e6){}}}catch(e4){}return os.call(this,b);};}'
-        . 'if(window.WebSocket){var OW=WebSocket;window.WebSocket=function(u,p){try{if(typeof u==="string"){var wu=new URL(u,L.href);'
-        . 'if(iH(wu.hostname)||sp(wu.pathname)||(wu.origin===po&&sp(wu.pathname)))u=(L.protocol==="https:"?"wss:":"ws:")+"//"+L.host+P+wu.pathname+wu.search;}'
-        . '}catch(e){}return new OW(u,p);};}'
+        . 'if(window.WebSocket){var OW=WebSocket;window.WebSocket=function(u,p){try{if(typeof u==="string")u=wru(u);}catch(e){}return new OW(u,p);};}'
         . 'if(window.EventSource){var OES=EventSource;window.EventSource=function(u,c){try{if(typeof u==="string")u=fu(u);}catch(e6){}return new OES(u,c);};'
         . 'try{window.EventSource.prototype=OES.prototype;}catch(e7){}}'
         . 'if(F){try{'
@@ -450,6 +451,7 @@ function ipmiProxyInjectKvmAutoLaunchPatch(string $html, string $token, string $
         . 'function fnSrc(fn){try{return Function.prototype.toString.call(fn);}catch(e){return"";}}'
         . 'function isRendererStartFn(fn){var s=fnSrc(fn);if(!s)return false;return s.indexOf("new Renderer")!==-1||s.indexOf("renderer = new Renderer")!==-1||s.indexOf("htmlIrcWindowMode")!==-1;}'
         . 'function isWrapperStartFn(fn){var s=fnSrc(fn);if(!s)return false;return s.indexOf("iLO.startHtml5Irc")!==-1&&s.indexOf("new Renderer")===-1;}'
+        . 'function getIloDirectTopRenderer(ctx){try{var t=(ctx&&ctx.top)?ctx.top:window.top;if(t&&isRendererStartFn(t.startHtml5Irc))return t;}catch(e){}return null;}'
         . 'function hasIloRendererHost(ctx){try{'
         . 'if(!ctx)return false;'
         . 'if(isRendererStartFn(ctx.startHtml5Irc))return true;'
@@ -481,7 +483,10 @@ function ipmiProxyInjectKvmAutoLaunchPatch(string $html, string $token, string $
         . 'ctx.iLO.__ipmi_start_orig=ctx.iLO.startHtml5Irc;'
         . 'ctx.iLO.startHtml5Irc=function(){try{'
         . 'try{if(ctx.iLO&&typeof ctx.iLO.setCookie==="function"){ctx.iLO.setCookie("irc",["last","html5"]);}}catch(_c0){}'
+        . 'var directTop=getIloDirectTopRenderer(ctx);'
+        . 'if(directTop){forceSameTabOpen(directTop);ensureIloFrameResizeShim(directTop);clearIloStaleRenderer(directTop);try{directTop.startHtml5Irc({mode:"WINDOW"});return;}catch(_dt1){}try{directTop.startHtml5Irc();return;}catch(_dt2){}}'
         . 'var host=bindIloTopPage(ctx)||findIloRendererHost(ctx)||ctx;'
+        . 'ensureIloFrameResizeShim(host);clearIloStaleRenderer(host);clearIloStaleRenderer(ctx);'
         . 'if(host){forceSameTabOpen(host);'
         . 'if(isRendererStartFn(host.startHtml5Irc)){try{host.startHtml5Irc({mode:"WINDOW"});return;}catch(_e1){}try{host.startHtml5Irc();return;}catch(_e2){}}'
         . '}'
@@ -492,34 +497,140 @@ function ipmiProxyInjectKvmAutoLaunchPatch(string $html, string $token, string $
         . 'ctx.iLO.__ipmi_start_patched=true;'
         . '}catch(e){}}'
         . 'function isShown(node){try{return !!(node&&node.offsetParent!==null);}catch(e){return false;}}'
+        . 'function hasIloShellHost(ctx){try{return !!(ctx&&ctx.document&&ctx.document.getElementById&&ctx.document.getElementById("frameContent"));}catch(e){return false;}}'
+        . 'function getIloShellHost(ctx){var out=[];function add(c){if(!c)return;for(var i=0;i<out.length;i++){if(out[i]===c)return;}out.push(c);}try{add(ctx);}catch(e0){}try{if(ctx&&ctx.parent&&ctx.parent!==ctx)add(ctx.parent);}catch(e1){}try{if(ctx&&ctx.parent&&ctx.parent.parent&&ctx.parent.parent!==ctx.parent)add(ctx.parent.parent);}catch(e2){}try{if(ctx&&ctx.top&&ctx.top!==ctx)add(ctx.top);}catch(e3){}for(var j=0;j<out.length;j++){if(hasIloShellHost(out[j]))return out[j];}return null;}'
+        . 'function getIloFrameContent(ctx){try{var sh=getIloShellHost(ctx)||ctx;if(sh&&sh.frames&&sh.frames.frameContent)return sh.frames.frameContent;}catch(e){}return null;}'
+        . 'function getIloIframeContent(ctx){try{var fc=getIloFrameContent(ctx);if(fc&&fc.frames&&fc.frames.iframeContent)return fc.frames.iframeContent;}catch(e){}return null;}'
+        . 'function getIloIframeContentEl(ctx){try{var fc=getIloFrameContent(ctx);if(fc&&fc.document&&fc.document.getElementById){return fc.document.getElementById("iframeContent");}}catch(e){}return null;}'
+        . 'function ensureIloIndexAppLoaded(ctx){try{'
+        . 'if(!ctx||!ctx.document||!ctx.document.getElementById)return false;'
+        . 'var app=ctx.document.getElementById("appFrame");'
+        . 'if(!app)return false;'
+        . 'var src=String(app.getAttribute("src")||"").toLowerCase();'
+        . 'if(src.indexOf("html/application.html")!==-1)return false;'
+        . 'if(typeof ctx.showApplication==="function"){ctx.showApplication();return true;}'
+        . 'if(src===""||src==="about:blank"){app.setAttribute("src","html/application.html");return true;}'
+        . 'return false;'
+        . '}catch(e){return false;}}'
+        . 'function ensureIloFrameResizeShim(ctx){try{var host=getIloShellHost(ctx)||findIloRendererHost(ctx)||ctx;if(!host||!host.document||!host.document.getElementById)return;var fd=host.document.getElementById("frameDirectory");if(fd&&fd.contentWindow&&typeof fd.contentWindow.frameResize!=="function"){fd.contentWindow.frameResize=function(){};}}catch(e){}}'
+        . 'function hasIloRcPage(ctx){try{var ic=getIloIframeContent(ctx);var p=String((ic&&ic.location&&ic.location.pathname)||"").toLowerCase();var ok=(p.indexOf("/html/rc_info.html")!==-1);if(ok){try{var shell=getIloShellHost(ctx)||findIloRendererHost(ctx)||ctx;if(shell){shell.__ipmi_rc_info_loading_ts=0;}}catch(_e0){}}return ok;}catch(e){return false;}}'
+        . 'function ensureIloShellLoaded(ctx){try{'
+        . 'var host=getIloShellHost(ctx);'
+        . 'if(!host||ctx!==host||!host.document)return false;'
+        . 'try{if(host.iLOGlobal){host.iLOGlobal.initialLink="rc_info.html";host.iLOGlobal.content="rc_info.html";host.iLOGlobal.initialTab=0;}}catch(_e0){}'
+        . 'var frameEl=host.document.getElementById("frameContent");'
+        . 'if(!frameEl)return false;'
+        . 'var src=String(frameEl.getAttribute("src")||"").toLowerCase();'
+        . 'if(src===""||src==="about:blank"){frameEl.setAttribute("src","content.html");return true;}'
+        . 'return false;'
+        . '}catch(e){return false;}}'
+        . 'function rcWindowVisible(ctx){try{'
+        . 'if(!ctx||!ctx.document)return false;'
+        . 'var w=ctx.document.getElementById("ircWindow");'
+        . 'if(!w)return false;'
+        . 'try{if(typeof ctx.jQuery==="function"&&ctx.jQuery("#ircWindow").dialog("instance"))return true;}catch(_e0){}'
+        . 'return !!(w.offsetParent!==null||String((w.style&&w.style.display)||"").toLowerCase()!=="none");'
+        . '}catch(e){return false;}}'
+        . 'function clearIloStaleRenderer(ctx){try{'
+        . 'var host=findIloRendererHost(ctx)||ctx;if(!host)return false;'
+        . 'var target=host,stale=false;'
+        . 'try{stale=!!(host.renderer&&host.renderer.connected&&!rcWindowVisible(host));}catch(_e0){}'
+        . 'if(!stale&&ctx&&ctx!==host){try{if(ctx.renderer&&ctx.renderer.connected&&!rcWindowVisible(ctx)){target=ctx;stale=true;}}catch(_e1){}}'
+        . 'if(!stale||!target)return false;'
+        . 'try{if(target.renderer&&target.renderer.worker&&typeof target.renderer.worker.close==="function"){target.renderer.worker.close();}}catch(_e2){}'
+        . 'try{if(target.renderer&&target.renderer.decoder&&typeof target.renderer.decoder.terminate==="function"){target.renderer.decoder.terminate();}}catch(_e3){}'
+        . 'try{if(target.renderer&&typeof target.renderer.close==="function"){target.renderer.close();}}catch(_e4){}'
+        . 'try{if(target.renderer){target.renderer.connected=false;}}catch(_e5){}'
+        . 'try{target.renderer=null;}catch(_e6){}'
+        . 'try{var w=target.document&&target.document.getElementById?target.document.getElementById("ircWindow"):null;if(w){w.style.display="none";}}catch(_e7){}'
+        . 'return true;'
+        . '}catch(e){return false;}}'
+        . 'function rendererConnected(ctx){try{return !!(ctx&&ctx.renderer&&ctx.renderer.connected);}catch(e){return false;}}'
         . 'function consoleVisible(ctx){try{'
         . 'if(!ctx)return false;'
-        . 'if(ctx.renderer&&ctx.renderer.connected===true)return true;'
+        . 'if(rendererConnected(ctx))return true;'
+        . 'var host=findIloRendererHost(ctx)||ctx;'
+        . 'if(host&&host!==ctx&&rendererConnected(host))return true;'
         . '}catch(e){}return false;}'
+        . 'function findIloHtml5Button(ctx){try{'
+        . 'if(!ctx||!ctx.document)return null;'
+        . 'return ctx.document.getElementById("HRCButton")||ctx.document.querySelector("button[data-localize=\'rc_info.html5Console\']")||null;'
+        . '}catch(e){return null;}}'
         . 'function wireIloAppFrame(ctx){try{'
         . 'if(!ctx)return;'
         . 'var host=bindIloTopPage(ctx)||ctx;'
         . 'if(host&&host.iLOGlobal&&host.iLOGlobal.topPage){host.iLOGlobal.topPage.appFrame=host;}'
+        . '}catch(e){}}'
+        . 'function ensureIloRcPageLoaded(ctx){try{'
+        . 'var host=getIloShellHost(ctx);'
+        . 'if(!host||ctx!==host)return false;'
+        . 'var fc=getIloFrameContent(host);'
+        . 'if(!fc||typeof fc.loadContent!=="function")return false;'
+        . 'if(hasIloRcPage(host))return false;'
+        . 'var pendingTs=0;'
+        . 'try{pendingTs=Number(host.__ipmi_rc_info_loading_ts||0);}catch(_e2pre){pendingTs=0;}'
+        . 'if(pendingTs>0&&(Date.now()-pendingTs)<15000){return false;}'
+        . 'var iframeEl=getIloIframeContentEl(host);'
+        . 'if(iframeEl&&!iframeEl.__ipmi_rc_load_bound){try{iframeEl.addEventListener("load",function(){try{host.__ipmi_rc_info_loading_ts=0;}catch(_eL){}},true);iframeEl.__ipmi_rc_load_bound=true;}catch(_eLb){}}'
+        . 'var iframeSrc="";'
+        . 'try{iframeSrc=String((iframeEl&&iframeEl.getAttribute&&iframeEl.getAttribute("src"))||"").toLowerCase();}catch(_e2a){}'
+        . 'if(iframeSrc.indexOf("rc_info.html")!==-1){'
+        . 'try{'
+        . 'if(pendingTs<=0){host.__ipmi_rc_info_loading_ts=Date.now();return false;}'
+        . 'if((Date.now()-pendingTs)<15000){return false;}'
+        . '}catch(_e2b){return false;}'
+        . '}'
+        . 'try{if(host.iLOGlobal){host.iLOGlobal.initialLink="rc_info.html";host.iLOGlobal.content="rc_info.html";host.iLOGlobal.initialTab=0;}}catch(_e3){}'
+        . 'try{if(fc.iLOGlobal){fc.iLOGlobal.initialLink="rc_info.html";fc.iLOGlobal.initialTab=0;}}catch(_e3b){}'
+        . 'try{host.__ipmi_rc_info_loading_ts=Date.now();fc.loadContent("rc_info.html");return true;}catch(_e4){}'
+        . 'return false;'
+        . '}catch(e){return false;}}'
+        . 'function ensureIloGlobalStartPatched(ctx){try{'
+        . 'if(!ctx||typeof ctx.startHtml5Irc!=="function"||ctx.__ipmi_global_start_patched||!isWrapperStartFn(ctx.startHtml5Irc)){return;}'
+        . 'var orig=ctx.startHtml5Irc;'
+        . 'ctx.startHtml5Irc=function(){'
+        . 'var started=false,cc=collectContexts();'
+        . 'for(var i=0;i<cc.length;i++){if(callStart(cc[i])||callIloStart(cc[i])){started=true;break;}}'
+        . 'if(started){return false;}'
+        . 'try{return orig.apply(this,arguments);}catch(e){return false;}'
+        . '};'
+        . 'ctx.__ipmi_global_start_patched=true;'
+        . '}catch(e){}}'
+        . 'function ensureIloRcButtonPatched(ctx){try{'
+        . 'var btn=findIloHtml5Button(ctx);'
+        . 'if(!btn||btn.__ipmi_kvm_bound)return;'
+        . 'btn.__ipmi_kvm_bound=true;'
+        . 'try{btn.setAttribute("data-ipmi-kvm-ready","1");}catch(_e0){}'
         . '}catch(e){}}'
         . 'function callIloStart(ctx){'
         . 'if(!ctx)return false;'
         . 'var host=bindIloTopPage(ctx)||findIloRendererHost(ctx)||ctx;'
         . 'ensureIloStartPatched(ctx);'
         . 'if(host&&host!==ctx){ensureIloStartPatched(host);}'
+        . 'clearIloStaleRenderer(host);clearIloStaleRenderer(ctx);'
         . 'wireIloAppFrame(host||ctx);'
-        . 'try{if(host&&host.iLO&&typeof host.iLO.startHtml5Irc==="function"){host.iLO.startHtml5Irc();return true;}}catch(e0){}'
-        . 'try{if(ctx.iLO&&typeof ctx.iLO.startHtml5Irc==="function"){ctx.iLO.startHtml5Irc();return true;}}catch(e1){}'
-        . 'return false;}'
+        . 'var fired=false;'
+        . 'try{if(host&&host.iLO&&typeof host.iLO.startHtml5Irc==="function"){host.iLO.startHtml5Irc();fired=true;}}catch(e0){}'
+        . 'try{if(!fired&&ctx.iLO&&typeof ctx.iLO.startHtml5Irc==="function"){ctx.iLO.startHtml5Irc();fired=true;}}catch(e1){}'
+        . 'if(!fired)return false;'
+        . 'return consoleVisible(host)||consoleVisible(ctx);}'
         . 'function callStart(ctx){'
         . 'if(!ctx)return false;'
+        . 'var directTop=getIloDirectTopRenderer(ctx);'
+        . 'if(directTop){ensureIloFrameResizeShim(directTop);clearIloStaleRenderer(directTop);try{directTop.startHtml5Irc({mode:"WINDOW"});}catch(_dt1){}try{if(!consoleVisible(directTop)){directTop.startHtml5Irc();}}catch(_dt2){}if(consoleVisible(directTop))return true;}'
         . 'var host=findIloRendererHost(ctx)||bindIloTopPage(ctx)||ctx;'
+        . 'ensureIloFrameResizeShim(host);clearIloStaleRenderer(host);clearIloStaleRenderer(ctx);'
         . 'if(host&&isRendererStartFn(host.startHtml5Irc)){'
-        . 'try{host.startHtml5Irc({mode:"WINDOW"});return true;}catch(e1){}'
-        . 'try{host.startHtml5Irc();return true;}catch(e2){}'
+        . 'try{host.startHtml5Irc({mode:"WINDOW"});}catch(e1){}'
+        . 'try{if(!consoleVisible(host)&&!consoleVisible(ctx)){host.startHtml5Irc();}}catch(e2){}'
+        . 'if(consoleVisible(host)||consoleVisible(ctx))return true;'
         . '}'
         . 'return false;}'
-        . 'function clickHtml5Anchor(ctx){try{'
+        . 'function clickHtml5Anchor(ctx,skipButton){try{'
         . 'if(!ctx||!ctx.document||!ctx.document.querySelector)return false;'
+        . 'var btn=findIloHtml5Button(ctx);'
+        . 'if(!skipButton&&btn){if(typeof btn.click==="function"){btn.click();return true;}'
+        . 'if(ctx.document.createEvent){var bev=ctx.document.createEvent("MouseEvents");bev.initEvent("click",true,true);btn.dispatchEvent(bev);return true;}}'
         . 'var a=ctx.document.querySelector("#html5_irc_label a");'
         . 'if(!a)return false;'
         . 'if(typeof a.click==="function"){a.click();return true;}'
@@ -546,21 +657,31 @@ function ipmiProxyInjectKvmAutoLaunchPatch(string $html, string $token, string $
         . '}'
         . 'if(T==="ilo4"){'
         . 'var pl=pathLower();'
-        . 'if((pl==="/"||pl.indexOf("/index.html")!==-1)&&!wasAppRedirected()){markAppRedirected();go("/html/application.html?ipmi_kvm_auto=1&ipmi_kvm_stage=app");return;}'
+        . 'if(pl.indexOf("/html/rc_info.html")!==-1&&!hasIloRendererHost(window)&&(!window.parent||window.parent===window)){go("/html/application.html?ipmi_kvm_auto=1");return;}'
         . 'var n=0,max=220;'
         . '(function tick(){'
         . 'n++;'
         . 'var ctx=collectContexts();'
-        . 'for(var i=0;i<ctx.length;i++){forceSameTabOpen(ctx[i]);ensureIloStartPatched(ctx[i]);wireIloAppFrame(ctx[i]);if(consoleVisible(ctx[i])){markDone();return;}}'
+        . 'var shell=getIloShellHost(window);'
+        . 'var rootCtx=null;'
+        . 'try{rootCtx=(window.top&&window.top.document&&window.top.document.getElementById&&window.top.document.getElementById("appFrame"))?window.top:window;}catch(_eroot){rootCtx=window;}'
+        . 'if(rootCtx){ensureIloIndexAppLoaded(rootCtx);}'
+        . 'if(shell){forceSameTabOpen(shell);ensureIloFrameResizeShim(shell);ensureIloStartPatched(shell);ensureIloGlobalStartPatched(shell);wireIloAppFrame(shell);ensureIloShellLoaded(shell);ensureIloRcPageLoaded(shell);if((n%8)===0){clearIloStaleRenderer(shell);}}'
+        . 'for(var i=0;i<ctx.length;i++){forceSameTabOpen(ctx[i]);ensureIloFrameResizeShim(ctx[i]);ensureIloStartPatched(ctx[i]);ensureIloGlobalStartPatched(ctx[i]);wireIloAppFrame(ctx[i]);ensureIloRcButtonPatched(ctx[i]);if((n%8)===0){clearIloStaleRenderer(ctx[i]);}if(consoleVisible(ctx[i])){markDone();return;}}'
         . 'if(n===1||(n%3===0)){'
-        . 'var started=false;'
-        . 'for(var h=0;h<ctx.length;h++){if(callIloStart(ctx[h])){started=true;}}'
-        . 'for(var k=0;k<ctx.length;k++){if(callStart(ctx[k])){started=true;}}'
+        . 'var started=false,rcReady=false;'
+        . 'if(shell){ensureIloShellLoaded(shell);ensureIloRcPageLoaded(shell);}'
+        . 'for(var r=0;r<ctx.length;r++){if(hasIloRcPage(ctx[r])||findIloHtml5Button(ctx[r])){rcReady=true;}}'
+        . 'if(rcReady){'
+        . 'var directTop=getIloDirectTopRenderer(window);'
+        . 'if(directTop){started=callStart(directTop);}'
+        . 'for(var b=0;b<ctx.length;b++){if(callStart(ctx[b])){started=true;break;}}'
+        . 'if(!started){for(var h=0;h<ctx.length;h++){if(callIloStart(ctx[h])){started=true;break;}}}'
+        . 'if(!started){for(var k=0;k<ctx.length;k++){if(clickHtml5Anchor(ctx[k])){started=true;break;}}}'
+        . '}'
         . '}'
         . 'for(var m=0;m<ctx.length;m++){if(consoleVisible(ctx[m])){markDone();return;}}'
         . 'if(n<max){setTimeout(tick,250);return;}'
-        . 'var pnow=pathLower();'
-        . 'if(pnow.indexOf("/html/application.html")===-1&&pnow.indexOf("/html/summary.html")===-1&&!wasAppRedirected()){markAppRedirected();go("/html/application.html?ipmi_kvm_auto=1&ipmi_kvm_stage=app");return;}'
         . '})();'
         . 'return;'
         . '}'
@@ -681,6 +802,35 @@ function ipmiProxyRewriteBmcResponseBody(string $body, string $bmcIp, string $to
     }
 
     return $body;
+}
+
+function ipmiProxyRewriteIloSocketJs(string $body, string $bmcPath, string $token, string $bmcIp, string $bmcScheme): string
+{
+    $path = strtolower((string) parse_url($bmcPath, PHP_URL_PATH));
+    if (!in_array($path, ['/js/socket.js', '/html/js/socket.js'], true)) {
+        return $body;
+    }
+
+    $targetWs = (($bmcScheme === 'http') ? 'ws' : 'wss') . '://' . $bmcIp . '/wss/ircport';
+    $replacement = 'this.sessionKey = options.sessionKey, this.sockaddr = ((self.location && self.location.protocol === "https:") ? "wss://" : "ws://") + ((self.location && self.location.host) ? self.location.host : options.host) + "/ipmi_ws_relay.php?token='
+        . rawurlencode($token)
+        . '&target=" + encodeURIComponent('
+        . json_encode($targetWs, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_SLASHES)
+        . '),';
+
+    $needle = 'this.sessionKey = options.sessionKey, this.sockaddr = "wss://" + options.host + "/wss/ircport",';
+    if (strpos($body, $needle) !== false) {
+        return str_replace($needle, $replacement, $body);
+    }
+
+    $updated = preg_replace(
+        '/this\.sessionKey\s*=\s*options\.sessionKey,\s*this\.sockaddr\s*=\s*"wss:\/\/"\s*\+\s*options\.host\s*\+\s*"\/wss\/ircport",/s',
+        $replacement,
+        $body,
+        1
+    );
+
+    return is_string($updated) ? $updated : $body;
 }
 
 /**
@@ -2147,7 +2297,7 @@ if ($method === 'GET' && ipmiProxyShouldStreamBmcRequest($method, $bmcPath)) {
 if (
     $method === 'GET'
     && $typeNorm === 'ilo4'
-    && strtolower((string) parse_url($bmcPath, PHP_URL_PATH)) === '/html/application.html'
+    && in_array(strtolower((string) parse_url($bmcPath, PHP_URL_PATH)), ['/html/application.html', '/html/rc_info.html'], true)
     && (string) ($_GET['ipmi_kvm_auto'] ?? '') === '1'
     && (string) ($_GET['ipmi_kvm_legacy'] ?? '') !== '1'
 ) {
@@ -2350,7 +2500,7 @@ if ($method === 'GET' && ($httpCode === 404 || $httpCode === 400) && ipmiProxyIs
 // Determine content type early for login/timeout detection.
 $ct = strtolower(trim(explode(';', $contentTypeResp)[0] ?? ''));
 $isHtml = ($ct === '' || $ct === 'text/html' || strpos($ct, 'html') !== false || strpos($ct, 'text/plain') !== false);
-$isJs = ($ct === 'application/javascript' || $ct === 'text/javascript');
+$isJs = in_array($ct, ['application/javascript', 'text/javascript', 'application/x-javascript'], true);
 $isCss = ($ct === 'text/css');
 $isJson = (strpos($ct, 'json') !== false);
 
@@ -2860,7 +3010,7 @@ if (
             [, $responseBody] = ipmiWebCurlExtractFinalHeadersAndBody($rawResponse);
             $ct = strtolower(trim(explode(';', $contentTypeResp)[0] ?? ''));
             $isHtml = ($ct === '' || $ct === 'text/html' || strpos($ct, 'html') !== false || strpos($ct, 'text/plain') !== false);
-            $isJs = ($ct === 'application/javascript' || $ct === 'text/javascript');
+            $isJs = in_array($ct, ['application/javascript', 'text/javascript', 'application/x-javascript'], true);
             $isCss = ($ct === 'text/css');
             $isJson = (strpos($ct, 'json') !== false);
             if (ipmiProxyDebugEnabled()) {
@@ -2948,7 +3098,7 @@ if (
             [, $responseBody] = ipmiWebCurlExtractFinalHeadersAndBody($rawResponse);
             $ct = strtolower(trim(explode(';', $contentTypeResp)[0] ?? ''));
             $isHtml = ($ct === '' || $ct === 'text/html' || strpos($ct, 'html') !== false || strpos($ct, 'text/plain') !== false);
-            $isJs = ($ct === 'application/javascript' || $ct === 'text/javascript');
+            $isJs = in_array($ct, ['application/javascript', 'text/javascript', 'application/x-javascript'], true);
             $isCss = ($ct === 'text/css');
             $isJson = (strpos($ct, 'json') !== false);
             if (ipmiProxyDebugEnabled()) {
@@ -3026,7 +3176,7 @@ if (
             [, $responseBody] = ipmiWebCurlExtractFinalHeadersAndBody($rawResponse);
             $ct = strtolower(trim(explode(';', $contentTypeResp)[0] ?? ''));
             $isHtml = ($ct === '' || $ct === 'text/html' || strpos($ct, 'html') !== false || strpos($ct, 'text/plain') !== false);
-            $isJs = ($ct === 'application/javascript' || $ct === 'text/javascript');
+            $isJs = in_array($ct, ['application/javascript', 'text/javascript', 'application/x-javascript'], true);
             $isCss = ($ct === 'text/css');
             $isJson = (strpos($ct, 'json') !== false);
             if (ipmiProxyDebugEnabled()) {
@@ -3108,6 +3258,9 @@ if ($rewriteBody) {
     if ($isCss) {
         $responseBody = ipmiProxyRewriteCssResponseBody($responseBody, $bmcPath, $tokenPrefix, $bmcIp);
     }
+    if ($isJs && ipmiWebNormalizeBmcType($bmcTypeStr) === 'ilo4') {
+        $responseBody = ipmiProxyRewriteIloSocketJs($responseBody, $bmcPath, $token, $bmcIp, $bmcScheme);
+    }
     if ($isHtml) {
         $responseBody = ipmiProxyStripMetaCsp($responseBody);
         foreach (ipmiProxyGetBmcHostAliases($bmcIp) as $host) {
@@ -3163,7 +3316,7 @@ if ($rewriteBody) {
         $kvmAutoFlow = ipmiProxyIsKvmAutoFlowRequest();
         $shouldInjectKvmAutoPatch = ($httpCode >= 200 && $httpCode < 400)
             && ipmiWebNormalizeBmcType($bmcTypeStr) === 'ilo4'
-            && in_array($kvmAutoPath, ['/', '/index.html', '/html/application.html', '/html/summary.html', '/html/irc.html'], true);
+            && in_array($kvmAutoPath, ['/', '/index.html', '/html/application.html', '/html/summary.html', '/html/rc_info.html'], true);
         if ($shouldInjectKvmAutoPatch) {
             $responseBody = ipmiProxyInjectKvmAutoLaunchPatch($responseBody, $token, $bmcTypeStr, $kvmAutoFlow);
             if (ipmiProxyDebugEnabled()) {
@@ -3181,7 +3334,7 @@ if ($rewriteBody) {
         $kvmHintPath = strtolower((string) parse_url($bmcPath, PHP_URL_PATH));
         $shouldInjectKvmUnavailableHint = ($httpCode >= 200 && $httpCode < 400)
             && ipmiWebNormalizeBmcType($bmcTypeStr) === 'ilo4'
-            && in_array($kvmHintPath, ['/', '/index.html', '/html/application.html', '/html/summary.html', '/html/irc.html'], true);
+            && in_array($kvmHintPath, ['/', '/index.html', '/html/application.html', '/html/summary.html'], true);
         if ($shouldInjectKvmUnavailableHint) {
             $responseBody = ipmiProxyInjectKvmUnavailableHint($responseBody);
             if (ipmiProxyDebugEnabled()) {
