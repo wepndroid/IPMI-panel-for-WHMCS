@@ -109,7 +109,7 @@ while ($row = $q->fetch_assoc()) {
                 $bestUnavailable = !empty($probe['unavailable']) ? 1 : 0;
             }
 
-            if ($ok && in_array($mode, ['proxy_autolaunch', 'html'], true)) {
+            if ($ok && (ipmiWebKvmProbeIsBrowserOriented($probe) || in_array($mode, ['proxy_autolaunch', 'html'], true))) {
                 $hasBrowserNative = true;
             }
             if ($ok && in_array($mode, ['clickonce', 'jnlp', 'java_applet'], true)) {

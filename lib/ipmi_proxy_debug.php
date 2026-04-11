@@ -31,6 +31,9 @@ function ipmiProxyDebugEnabled(): bool
     if (isset($_GET['ipmi_proxy_debug']) && (string) $_GET['ipmi_proxy_debug'] === '1') {
         return true;
     }
+    if (isset($_GET['debug']) && (string) $_GET['debug'] === '1') {
+        return true;
+    }
 
     return false;
 }
@@ -49,6 +52,7 @@ function ipmiProxyDebugStripFromQuery(string $queryString): string
     }
     unset(
         $params['ipmi_proxy_debug'],
+        $params['debug'],
         $params['ipmi_proxy_console'],
         $params['ipmi_kvm_auto'],
         $params['ipmi_kvm_legacy'],

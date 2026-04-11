@@ -66,16 +66,21 @@ function ipmiProxyRewriteEscapedWebSocketUrls(string $body, string $bmcHost, str
 function ipmiProxyRewriteWebSocketUrls(string $body, string $bmcHost, string $token): string
 {
     $q = preg_quote($bmcHost, '#');
-    return preg_replace_callback(
-        '#\b(wss|ws)://' . $q . '(?::\d+)?(/[^"\'\\\\s\)\]\},;]*)?#i',
-        static function (array $m) use ($bmcHost, $token): string {
-            $scheme = strtolower($m[1]);
-            $path = (isset($m[2]) && $m[2] !== '') ? $m[2] : '/';
-            $fullTarget = $scheme . '://' . $bmcHost . $path;
-            return '/ipmi_ws_relay.php?token=' . rawurlencode($token) . '&target=' . rawurlencode($fullTarget);
-        },
-        $body
+    $cb = static function (array $m) use ($bmcHost, $token): string {
+        $scheme = strtolower($m[1]);
+        $path = (isset($m[2]) && $m[2] !== '') ? $m[2] : '/';
+        $fullTarget = $scheme . '://' . $bmcHost . $path;
+
+        return '/ipmi_ws_relay.php?token=' . rawurlencode($token) . '&target=' . rawurlencode($fullTarget);
+    };
+    $orig = $body;
+    $out = preg_replace_callback(
+        '#\b(wss|ws)://' . $q . '(?::\d+)?(/[^\s"\'<>]*)?#i',
+        $cb,
+        $orig
     );
+
+    return is_string($out) ? $out : $orig;
 }
 
 /**
@@ -296,8 +301,7 @@ function ipmiProxyInjectIloHeadFixes(string $html, string $token, ?string $redfi
 
 function ipmiProxyIsIloFamily(string $bmcType): bool
 {
-    $t = strtolower(trim($bmcType));
-    return $t === 'ilo4' || str_starts_with($t, 'ilo') || str_contains($t, 'ilo');
+    return ipmiWebBmcFamily($bmcType) === 'ilo';
 }
 
 function ipmiProxyInjectBmcAuthHeaderPatch(string $html, string $token, ?string $authToken = null): string
@@ -416,19 +420,39 @@ function ipmiProxyInjectGenericHeadFixes(
     return ipmiProxyInjectIntoHtmlHeadOrBody($html, $patch);
 }
 
-function ipmiProxyInjectKvmAutoLaunchPatch(string $html, string $token, string $bmcType, bool $kvmAutoFlow = false): string
+/**
+ * @param array<string, mixed>|string $sessionOrLegacyBmcType Full web session array, or legacy BMC type string (limited plan quality).
+ */
+function ipmiProxyInjectKvmAutoLaunchPatch(string $html, string $token, $sessionOrLegacyBmcType, bool $kvmAutoFlow = false, ?array $launchPlan = null): string
 {
     if (stripos($html, 'data-ipmi-proxy-kvm-autolaunch') !== false) {
         return $html;
     }
-    $type = ipmiWebNormalizeBmcType($bmcType);
-    $typeJs = json_encode($type, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_SLASHES);
+    if (!is_array($sessionOrLegacyBmcType)) {
+        $session = [
+            'bmc_type'        => (string) $sessionOrLegacyBmcType,
+            'ipmi_ip'         => '',
+            'bmc_scheme'      => 'https',
+            'cookies'         => [],
+            'forward_headers' => [],
+        ];
+    } else {
+        $session = $sessionOrLegacyBmcType;
+    }
+    $plan = $launchPlan ?? ipmiWebResolveKvmLaunchPlan($session);
+    $planLite = [
+        'kvm_entry_path' => (string) ($plan['kvm_entry_path'] ?? '/'),
+        'fallback_path'  => (string) ($plan['fallback_path'] ?? '/'),
+        'mode'           => (string) ($plan['mode'] ?? 'fallback'),
+    ];
+    $familyJs = json_encode((string) ($plan['vendor_family'] ?? 'generic'), JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_SLASHES);
+    $planJs = json_encode($planLite, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_SLASHES);
     $px = '/ipmi_proxy.php/' . rawurlencode($token);
     $pxJs = json_encode($px, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_SLASHES);
     $autoJs = $kvmAutoFlow ? 'true' : 'false';
     $patch = '<script data-ipmi-proxy-kvm-autolaunch="1">'
         . '(function(){'
-        . 'var T=' . $typeJs . ';var P=' . $pxJs . ';var AUTO=' . $autoJs . ';'
+        . 'var FAMILY=' . $familyJs . ';var PLAN=' . $planJs . ';var P=' . $pxJs . ';var AUTO=' . $autoJs . ';'
         . 'var q=null;try{q=new URLSearchParams(location.search||"");}catch(e){q=null;}'
         . 'var queryAuto=(q&&q.get("ipmi_kvm_auto")==="1");'
         . 'try{if(queryAuto&&window.sessionStorage){sessionStorage.setItem("_ipmi_kvm_auto_flow","1");sessionStorage.removeItem("_ipmi_kvm_autolaunch_done");sessionStorage.removeItem("_ipmi_kvm_app_redirected");}}catch(_e0){}'
@@ -655,7 +679,7 @@ function ipmiProxyInjectKvmAutoLaunchPatch(string $html, string $token, string $
         . 'if(!ok0){try{if(window.sessionStorage){sessionStorage.removeItem("_ipmi_kvm_autolaunch_done");}}catch(_e2b){} launchDone=false;}'
         . 'if(launchDone){return;}'
         . '}'
-        . 'if(T==="ilo4"){'
+        . 'if(FAMILY==="ilo"){'
         . 'var pl=pathLower();'
         . 'if(pl.indexOf("/html/rc_info.html")!==-1&&!hasIloRendererHost(window)&&(!window.parent||window.parent===window)){go("/html/application.html?ipmi_kvm_auto=1");return;}'
         . 'var n=0,max=220;'
@@ -685,8 +709,53 @@ function ipmiProxyInjectKvmAutoLaunchPatch(string $html, string $token, string $
         . '})();'
         . 'return;'
         . '}'
-        . 'if(T==="idrac"){go("/viewer.html");return;}'
-        . 'if(T==="supermicro"){go("/cgi/url_redirect.cgi?url_name=ikvm&url_type=jwsk");return;}'
+        . 'if(FAMILY==="idrac"){'
+        . 'var wantDr=(PLAN&&PLAN.kvm_entry_path)?String(PLAN.kvm_entry_path):"/index.html";'
+        . 'try{'
+        . 'if(window.sessionStorage&&!sessionStorage.getItem("_ipmi_idrac_autonav")){'
+        . 'sessionStorage.setItem("_ipmi_idrac_autonav","1");'
+        . 'var cur=String(location.pathname||"").toLowerCase();'
+        . 'if(cur.indexOf("/viewer.html")<0&&cur.indexOf("/console.html")<0&&wantDr){'
+        . 'if(wantDr.charAt(0)!=="/")wantDr="/"+wantDr;'
+        . 'var curFullDr=location.pathname+(location.search||"");'
+        . 'if(wantDr!==curFullDr){go(wantDr);}'
+        . '}'
+        . '}'
+        . '}catch(_idr0){}'
+        . 'var _idrN=0;(function _idrTick(){_idrN++;'
+        . 'try{'
+        . 'var _L=document.querySelectorAll("a[href],button");'
+        . 'for(var _i=0;_i<_L.length;_i++){'
+        . 'var _e=_L[_i],_h=String(_e.getAttribute("href")||"").toLowerCase(),_x=String(_e.textContent||"").toLowerCase();'
+        . 'if(_h.indexOf("viewer")>=0||_h.indexOf("console")>=0||(_x.indexOf("virtual")>=0&&_x.indexOf("console")>=0)||(_x.indexOf("launch")>=0&&_x.indexOf("console")>=0)){_e.click();markDone();return;}'
+        . '}'
+        . '}catch(_idr1){}'
+        . 'if(_idrN<110){setTimeout(_idrTick,380);}'
+        . '})();'
+        . 'return;}'
+        . 'if(FAMILY==="supermicro"){'
+        . 'var wantSm=(PLAN&&PLAN.kvm_entry_path)?String(PLAN.kvm_entry_path):"/cgi/url_redirect.cgi?url_name=ikvm&url_type=html5";'
+        . 'try{'
+        . 'if(window.sessionStorage&&!sessionStorage.getItem("_ipmi_sm_autonav")){'
+        . 'sessionStorage.setItem("_ipmi_sm_autonav","1");'
+        . 'var _p=String(location.pathname||"").toLowerCase(),_q=String(location.search||"").toLowerCase();'
+        . 'if(_p.indexOf("ikvm")<0&&_q.indexOf("ikvm")<0&&wantSm){if(wantSm.charAt(0)!=="/")wantSm="/"+wantSm;'
+        . 'var curFullSm=location.pathname+(location.search||"");'
+        . 'if(wantSm!==curFullSm){go(wantSm);}'
+        . '}'
+        . '}'
+        . '}catch(_sm0){}'
+        . 'var _smN=0;(function _smTick(){_smN++;'
+        . 'try{'
+        . 'var _L2=document.querySelectorAll("a[href],button");'
+        . 'for(var _j=0;_j<_L2.length;_j++){'
+        . 'var _e2=_L2[_j],_h2=String(_e2.getAttribute("href")||"").toLowerCase(),_x2=String(_e2.textContent||"").toLowerCase();'
+        . 'if(_h2.indexOf("ikvm")>=0||_h2.indexOf("kvm")>=0||(_x2.indexOf("kvm")>=0&&_x2.indexOf("launch")>=0)){_e2.click();markDone();return;}'
+        . '}'
+        . '}catch(_sm1){}'
+        . 'if(_smN<100){setTimeout(_smTick,420);}'
+        . '})();'
+        . 'return;}'
         . '})();</script>';
 
     return ipmiProxyInjectIntoHtmlHeadOrBody($html, $patch);
@@ -829,8 +898,23 @@ function ipmiProxyRewriteIloSocketJs(string $body, string $bmcPath, string $toke
         $body,
         1
     );
+    if (is_string($updated)) {
+        $body = $updated;
+    }
 
-    return is_string($updated) ? $updated : $body;
+    $needleSq = "this.sessionKey = options.sessionKey, this.sockaddr = 'wss://' + options.host + '/wss/ircport',";
+    if (strpos($body, $needleSq) !== false) {
+        return str_replace($needleSq, $replacement, $body);
+    }
+
+    $updated2 = preg_replace(
+        '/this\.sessionKey\s*=\s*options\.sessionKey,\s*this\.sockaddr\s*=\s*[\'"]wss:\/\/[\'"]\s*\.\s*options\.host\s*\.\s*[\'"]\/wss\/ircport[\'"],/s',
+        $replacement,
+        $body,
+        1
+    );
+
+    return is_string($updated2) ? $updated2 : $body;
 }
 
 /**
@@ -2202,7 +2286,7 @@ $fwdHdr = ipmiProxyMergeClientBmcForwardHeaders(
 // Keep these defaults at the proxy edge so browser/runtime differences do not break auth.
 $bmcTypeNorm = ipmiWebNormalizeBmcType((string) ($session['bmc_type'] ?? 'generic'));
 $bmcPathOnlyLower = strtolower((string) parse_url($bmcPath, PHP_URL_PATH));
-if ($bmcTypeNorm === 'ilo4' && ($method === 'GET' || $method === 'POST')) {
+if (ipmiWebIsNormalizedIloType($bmcTypeNorm) && ($method === 'GET' || $method === 'POST')) {
     $isIloJsonLike = str_starts_with($bmcPathOnlyLower, '/json/')
         || str_starts_with($bmcPathOnlyLower, '/api/')
         || str_starts_with($bmcPathOnlyLower, '/rest/');
@@ -2296,7 +2380,7 @@ if ($method === 'GET' && ipmiProxyShouldStreamBmcRequest($method, $bmcPath)) {
 
 if (
     $method === 'GET'
-    && $typeNorm === 'ilo4'
+    && ipmiWebIsNormalizedIloType($typeNorm)
     && in_array(strtolower((string) parse_url($bmcPath, PHP_URL_PATH)), ['/html/application.html', '/html/rc_info.html'], true)
     && (string) ($_GET['ipmi_kvm_auto'] ?? '') === '1'
     && (string) ($_GET['ipmi_kvm_legacy'] ?? '') !== '1'
@@ -2398,7 +2482,7 @@ if ($method === 'GET' && ($httpCode === 404 || $httpCode === 400) && ipmiProxyIs
 
     // iLO login shells may incorrectly reference /html/css|js|images paths.
     // If those 404, retry same asset from root to keep UI from breaking to white screen.
-    if ($typeNormAsset === 'ilo4' && preg_match('#^/html/(.+)$#i', $pathOnly, $mHtmlAsset)) {
+    if (ipmiWebIsNormalizedIloType($typeNormAsset) && preg_match('#^/html/(.+)$#i', $pathOnly, $mHtmlAsset)) {
         $altPath = '/' . ltrim((string) ($mHtmlAsset[1] ?? ''), '/');
         if (
             $altPath !== '/'
@@ -2508,7 +2592,7 @@ if (
     $method === 'GET'
     && $httpCode === 200
     && $isHtml
-    && ipmiWebNormalizeBmcType((string) ($session['bmc_type'] ?? 'generic')) === 'ilo4'
+    && ipmiWebIsNormalizedIloType(ipmiWebNormalizeBmcType((string) ($session['bmc_type'] ?? 'generic')))
     && strtolower((string) parse_url($bmcPath, PHP_URL_PATH)) === '/html/java_irc.html'
     && ipmiProxyBodyLooksLikeJavaOnlyIloConsole($responseBody)
 ) {
@@ -2525,7 +2609,7 @@ if (
     $method === 'GET'
     && $httpCode === 200
     && $isHtml
-    && ipmiWebNormalizeBmcType((string) ($session['bmc_type'] ?? 'generic')) === 'ilo4'
+    && ipmiWebIsNormalizedIloType(ipmiWebNormalizeBmcType((string) ($session['bmc_type'] ?? 'generic')))
     && strtolower((string) parse_url($bmcPath, PHP_URL_PATH)) === '/html/jnlp_template.html'
 ) {
     if (ipmiProxyDebugEnabled()) {
@@ -2599,7 +2683,7 @@ if ($method === 'GET' && $httpCode === 200) {
             }
         }
     }
-    if ($typeNorm === 'ilo4' && $isHtml) {
+    if (ipmiWebIsNormalizedIloType($typeNorm) && $isHtml) {
         if (ipmiProxyDebugEnabled()) {
             ipmiProxyDebugLog('ilo_verify_start', [
                 'trace'   => $ipmiTraceId,
@@ -2958,7 +3042,7 @@ if ($method === 'GET' && $httpCode === 200 && $isHtml && !$isAssetPath
 if (
     ($httpCode === 401 || $httpCode === 403)
     && $method === 'GET'
-    && ipmiWebNormalizeBmcType((string) ($session['bmc_type'] ?? 'generic')) === 'ilo4'
+    && ipmiWebIsNormalizedIloType(ipmiWebNormalizeBmcType((string) ($session['bmc_type'] ?? 'generic')))
     && ipmiProxyIsIloRuntimeApiPath($bmcPath)
 ) {
     if (ipmiProxyDebugEnabled()) {
@@ -3208,7 +3292,7 @@ http_response_code($httpCode ?: 502);
 // iLO4 can also return 404 for /html/application.html on top-level open links on certain builds.
 // For iLO, only fallback for top-level document navigations (not iframe sub-loads).
 $typeNormFor404 = ipmiWebNormalizeBmcType((string)($session['bmc_type'] ?? 'generic'));
-if ($isHtml && ($typeNormFor404 === 'ami' || $typeNormFor404 === 'ilo4')) {
+if ($isHtml && ($typeNormFor404 === 'ami' || ipmiWebIsNormalizedIloType($typeNormFor404))) {
     $pathLower = strtolower((string) parse_url($bmcPath, PHP_URL_PATH));
     if ($httpCode === 404 && ($pathLower === '/html/application.html' || $pathLower === '/html/application.html/')) {
         if ($typeNormFor404 === 'ami') {
@@ -3258,7 +3342,7 @@ if ($rewriteBody) {
     if ($isCss) {
         $responseBody = ipmiProxyRewriteCssResponseBody($responseBody, $bmcPath, $tokenPrefix, $bmcIp);
     }
-    if ($isJs && ipmiWebNormalizeBmcType($bmcTypeStr) === 'ilo4') {
+    if ($isJs && ipmiWebIsNormalizedIloType(ipmiWebNormalizeBmcType($bmcTypeStr))) {
         $responseBody = ipmiProxyRewriteIloSocketJs($responseBody, $bmcPath, $token, $bmcIp, $bmcScheme);
     }
     if ($isHtml) {
@@ -3314,16 +3398,32 @@ if ($rewriteBody) {
         }
         $kvmAutoPath = strtolower((string) parse_url($bmcPath, PHP_URL_PATH));
         $kvmAutoFlow = ipmiProxyIsKvmAutoFlowRequest();
-        $shouldInjectKvmAutoPatch = ($httpCode >= 200 && $httpCode < 400)
-            && ipmiWebNormalizeBmcType($bmcTypeStr) === 'ilo4'
-            && in_array($kvmAutoPath, ['/', '/index.html', '/html/application.html', '/html/summary.html', '/html/rc_info.html'], true);
+        $kvmFam = ipmiWebBmcFamily($bmcTypeStr);
+        $injectKvmPathOk = false;
+        if ($kvmFam === 'ilo' && in_array($kvmAutoPath, ['/', '/index.html', '/html/application.html', '/html/summary.html', '/html/rc_info.html'], true)) {
+            $injectKvmPathOk = true;
+        }
+        if ($kvmFam === 'idrac' && in_array($kvmAutoPath, ['/', '/index.html', '/start.html', '/login.html', '/viewer.html', '/console.html', '/restgui/start.html', '/restgui/launch'], true)) {
+            $injectKvmPathOk = true;
+        }
+        if ($kvmFam === 'supermicro' && ($kvmAutoPath === '/cgi/url_redirect.cgi' || str_contains(strtolower($bmcPath), 'url_name=topmenu'))) {
+            $injectKvmPathOk = true;
+        }
+        $shouldInjectKvmAutoPatch = ($httpCode >= 200 && $httpCode < 400) && $injectKvmPathOk;
         if ($shouldInjectKvmAutoPatch) {
-            $responseBody = ipmiProxyInjectKvmAutoLaunchPatch($responseBody, $token, $bmcTypeStr, $kvmAutoFlow);
+            $launchPlanForPatch = ipmiWebResolveKvmLaunchPlan($session);
+            $responseBody = ipmiProxyInjectKvmAutoLaunchPatch($responseBody, $token, $session, $kvmAutoFlow, $launchPlanForPatch);
             if (ipmiProxyDebugEnabled()) {
+                ipmiProxyDebugLog('kvm_launch_plan_selected', array_merge(
+                    ['trace' => $ipmiTraceId, 'bmcPath' => $bmcPath],
+                    ipmiWebKvmPlanLogSummary($launchPlanForPatch)
+                ));
                 ipmiProxyDebugLog('kvm_autolaunch_patch_injected', [
                     'trace' => $ipmiTraceId,
                     'bmcPath' => $bmcPath,
                     'bmcType' => $bmcTypeStr,
+                    'vendor_family' => $launchPlanForPatch['vendor_family'] ?? '',
+                    'kvm_entry_path' => $launchPlanForPatch['kvm_entry_path'] ?? '',
                     'kvmAutoFlow' => $kvmAutoFlow ? 1 : 0,
                 ]);
             }
@@ -3333,7 +3433,7 @@ if ($rewriteBody) {
         // and also removes stale banners left by in-page route changes.
         $kvmHintPath = strtolower((string) parse_url($bmcPath, PHP_URL_PATH));
         $shouldInjectKvmUnavailableHint = ($httpCode >= 200 && $httpCode < 400)
-            && ipmiWebNormalizeBmcType($bmcTypeStr) === 'ilo4'
+            && ipmiWebBmcFamily($bmcTypeStr) === 'ilo'
             && in_array($kvmHintPath, ['/', '/index.html', '/html/application.html', '/html/summary.html'], true);
         if ($shouldInjectKvmUnavailableHint) {
             $responseBody = ipmiProxyInjectKvmUnavailableHint($responseBody);

@@ -296,9 +296,7 @@ function ipmiWebSyncIloSessionAndSessionKeyCookies(array &$cookies): void
 
 function ipmiWebIsIloFamilyType(string $bmcType): bool
 {
-    $t = strtolower(trim($bmcType));
-
-    return $t === 'ilo4' || str_starts_with($t, 'ilo') || str_contains($t, 'ilo');
+    return ipmiWebBmcFamily($bmcType) === 'ilo';
 }
 
 function ipmiWebApplyJsonAuthHints(array $json, array &$cookieJar, array &$forwardHeaders, int $depth = 0): void
@@ -670,7 +668,7 @@ function ipmiWebLoginResponseFailureReason(string $raw, int $httpCode, string $b
     }
 
     if ($httpCode === 401 || $httpCode === 403) {
-        if ($typeNorm === 'ilo4' || $typeNorm === 'idrac' || $typeNorm === 'ami' || $typeNorm === 'supermicro') {
+        if (ipmiWebIsNormalizedIloType($typeNorm) || $typeNorm === 'idrac' || $typeNorm === 'ami' || $typeNorm === 'supermicro') {
             return 'invalid_credentials';
         }
         return 'auth_rejected';
@@ -1572,11 +1570,12 @@ function ipmiWebStoredSessionAuthStillValid(array $session): bool
     $bases[] = $altScheme . '://' . $ip;
 
     $verifyByType = static function (string $type, string $baseUrl) use ($ip, $cookies, $forwardHeaders): bool {
+        if (ipmiWebIsNormalizedIloType($type)) {
+            return ipmiWebIloVerifyAuthed($baseUrl, $ip, $cookies, $forwardHeaders);
+        }
         switch ($type) {
             case 'supermicro':
                 return ipmiWebSupermicroVerifyAuthed($baseUrl, $ip, $cookies);
-            case 'ilo4':
-                return ipmiWebIloVerifyAuthed($baseUrl, $ip, $cookies, $forwardHeaders);
             case 'idrac':
                 return ipmiWebIdracVerifyAuthed($baseUrl, $ip, $cookies);
             case 'ami':
@@ -1624,6 +1623,57 @@ function ipmiWebStoredSessionAuthStillValid(array $session): bool
     }
 
     return false;
+}
+
+/**
+ * Keep up to $maxKeep newest active web sessions per user+server; revoke older rows.
+ * Avoids invalidating other browser tabs while still bounding session table growth.
+ */
+function ipmiWebPruneExcessWebSessions(mysqli $mysqli, int $serverId, int $userId, string $keepToken, int $maxKeep = 8): void
+{
+    if ($maxKeep < 2) {
+        $maxKeep = 2;
+    }
+    $stmt = $mysqli->prepare(
+        'SELECT token FROM ipmi_web_sessions WHERE server_id = ? AND user_id = ? AND revoked_at IS NULL AND expires_at > NOW() ORDER BY id DESC'
+    );
+    if (!$stmt) {
+        return;
+    }
+    $stmt->bind_param('ii', $serverId, $userId);
+    $stmt->execute();
+    $res = $stmt->get_result();
+    $tokens = [];
+    if ($res) {
+        while ($row = $res->fetch_assoc()) {
+            $t = (string)($row['token'] ?? '');
+            if ($t !== '') {
+                $tokens[] = $t;
+            }
+        }
+    }
+    $stmt->close();
+    if (count($tokens) <= $maxKeep) {
+        return;
+    }
+    $keep = array_slice($tokens, 0, $maxKeep);
+    if (!in_array($keepToken, $keep, true)) {
+        array_pop($keep);
+        $keep[] = $keepToken;
+    }
+    $keepFlip = array_fill_keys($keep, true);
+    $rev = $mysqli->prepare('UPDATE ipmi_web_sessions SET revoked_at = NOW() WHERE server_id = ? AND user_id = ? AND token = ? AND revoked_at IS NULL LIMIT 1');
+    if (!$rev) {
+        return;
+    }
+    foreach ($tokens as $t) {
+        if (isset($keepFlip[$t])) {
+            continue;
+        }
+        $rev->bind_param('iis', $serverId, $userId, $t);
+        $rev->execute();
+    }
+    $rev->close();
 }
 
 function ipmiWebCreateSession(mysqli $mysqli, int $serverId, int $userId, string $role, int $ttlSeconds = 7200): array
@@ -1719,17 +1769,6 @@ function ipmiWebCreateSession(mysqli $mysqli, int $serverId, int $userId, string
             }
         }
     }
-    $revoke = $mysqli->prepare("
-        UPDATE ipmi_web_sessions
-        SET revoked_at = NOW()
-        WHERE server_id = ? AND user_id = ? AND revoked_at IS NULL AND expires_at > NOW()
-    ");
-    if ($revoke) {
-        $revoke->bind_param("ii", $serverId, $userId);
-        $revoke->execute();
-        $revoke->close();
-    }
-
     $token = bin2hex(random_bytes(32));
     $expiresAt = date('Y-m-d H:i:s', time() + max(300, $ttlSeconds));
     $bmcType = strtolower(trim((string)($server['bmc_type'] ?? 'generic')));
@@ -1856,6 +1895,8 @@ function ipmiWebCreateSession(mysqli $mysqli, int $serverId, int $userId, string
     // If server row is still generic but runtime detection identified a concrete vendor,
     // persist it so next sessions/probes follow vendor-specific paths from the start.
     ipmiWebPersistDetectedServerType($mysqli, $serverId, $bmcType, $finalType);
+
+    ipmiWebPruneExcessWebSessions($mysqli, $serverId, $userId, $token, 8);
 
     return $session;
 }
@@ -2967,7 +3008,7 @@ function ipmiWebAttemptAutoLogin(array &$session, ?mysqli $mysqli = null): bool
                     $session['bmc_type'] = $effectiveType;
                 }
 
-                $needIloBridge = ($effectiveType === 'ilo4')
+                $needIloBridge = ipmiWebIsNormalizedIloType($effectiveType)
                     || ($effectiveType === 'generic'
                         && ($pathUsed === '/json/login_session' || str_contains($pathUsed, 'SessionService/Sessions')));
                 if ($needIloBridge) {
@@ -2976,7 +3017,7 @@ function ipmiWebAttemptAutoLogin(array &$session, ?mysqli $mysqli = null): bool
                 if (!ipmiWebHasUsableBmcAuth($cookieJar, $forwardHeaders)) {
                     continue;
                 }
-                if ($effectiveType === 'ilo4') {
+                if (ipmiWebIsNormalizedIloType($effectiveType)) {
                     ipmiWebSyncIloSessionAndSessionKeyCookies($cookieJar);
                 }
                 if ($effectiveType === 'supermicro' && !ipmiWebSupermicroVerifyAuthed($baseUrl, $ip, $cookieJar)) {
@@ -3009,7 +3050,7 @@ function ipmiWebAttemptAutoLogin(array &$session, ?mysqli $mysqli = null): bool
                     ]);
                     continue;
                 }
-                if ($effectiveType === 'ilo4' && !ipmiWebIloVerifyAuthed($baseUrl, $ip, $cookieJar, $forwardHeaders)) {
+                if (ipmiWebIsNormalizedIloType($effectiveType) && !ipmiWebIloVerifyAuthed($baseUrl, $ip, $cookieJar, $forwardHeaders)) {
                     ipmiWebDebugLog('autologin_attempt', [
                         'path' => (string) ($endpoint['path'] ?? ''),
                         'http' => $code,
@@ -3069,6 +3110,28 @@ function ipmiWebLoginEndpoints(string $bmcType, string $user, string $pass): arr
 {
     $type = ipmiWebNormalizeBmcType($bmcType);
 
+    if (ipmiWebIsNormalizedIloType($type)) {
+        $redfishBody = json_encode(['UserName' => $user, 'Password' => $pass], JSON_UNESCAPED_SLASHES);
+        $redfishBodyHpe = json_encode([
+            'UserName' => $user,
+            'Password' => $pass,
+            'Oem'      => ['Hpe' => ['LoginName' => $user]],
+        ], JSON_UNESCAPED_SLASHES);
+        $iloJsonLogin = [
+            'path'   => '/json/login_session',
+            'post'   => json_encode(['method' => 'login', 'user_login' => $user, 'password' => $pass]),
+            'accept' => 'application/json, text/javascript, */*',
+            'xhr'    => true,
+        ];
+
+        return [
+            $iloJsonLogin,
+            ['path' => '/redfish/v1/SessionService/Sessions', 'post' => $redfishBody, 'accept' => 'application/json', 'redfish' => true],
+            ['path' => '/redfish/v1/SessionService/Sessions/', 'post' => $redfishBody, 'accept' => 'application/json', 'redfish' => true],
+            ['path' => '/redfish/v1/SessionService/Sessions', 'post' => $redfishBodyHpe, 'accept' => 'application/json', 'redfish' => true],
+        ];
+    }
+
     switch ($type) {
         case 'supermicro':
             $smUser = base64_encode($user);
@@ -3077,26 +3140,6 @@ function ipmiWebLoginEndpoints(string $bmcType, string $user, string $pass): arr
                 ['path' => '/cgi/login.cgi', 'post' => ['name' => $smUser, 'pwd' => $smPass, 'check' => '00']],
                 ['path' => '/cgi/login.cgi', 'post' => ['name' => $user, 'pwd' => $pass]],
                 ['path' => '/cgi/login.cgi', 'post' => ['username' => $user, 'password' => $pass]],
-            ];
-        case 'ilo4':
-            $redfishBody = json_encode(['UserName' => $user, 'Password' => $pass], JSON_UNESCAPED_SLASHES);
-            $redfishBodyHpe = json_encode([
-                'UserName' => $user,
-                'Password' => $pass,
-                'Oem'      => ['Hpe' => ['LoginName' => $user]],
-            ], JSON_UNESCAPED_SLASHES);
-            $iloJsonLogin = [
-                'path'   => '/json/login_session',
-                'post'   => json_encode(['method' => 'login', 'user_login' => $user, 'password' => $pass]),
-                'accept' => 'application/json, text/javascript, */*',
-                'xhr'    => true,
-            ];
-            // iLO 4.x: try classic JSON-RPC first (many builds have no usable Redfish). iLO 5/6: Redfish then falls back.
-            return [
-                $iloJsonLogin,
-                ['path' => '/redfish/v1/SessionService/Sessions', 'post' => $redfishBody, 'accept' => 'application/json', 'redfish' => true],
-                ['path' => '/redfish/v1/SessionService/Sessions/', 'post' => $redfishBody, 'accept' => 'application/json', 'redfish' => true],
-                ['path' => '/redfish/v1/SessionService/Sessions', 'post' => $redfishBodyHpe, 'accept' => 'application/json', 'redfish' => true],
             ];
         case 'idrac':
             $redfishBody = json_encode(['UserName' => $user, 'Password' => $pass], JSON_UNESCAPED_SLASHES);
@@ -3142,29 +3185,114 @@ function ipmiWebLoginEndpoints(string $bmcType, string $user, string $pass): arr
     }
 }
 
+/**
+ * True when normalized type is a numbered iLO generation (ilo4, ilo5, ilo6, …).
+ * Used instead of hardcoding === 'ilo4' across proxy/KVM paths.
+ */
+function ipmiWebIsNormalizedIloType(string $norm): bool
+{
+    return (bool) preg_match('/^ilo[0-9]+$/i', trim($norm));
+}
+
+/**
+ * High-level vendor bucket for shared login/KVM logic (ilo, idrac, supermicro, ami, generic).
+ * Prefer this over comparing a single flattened normalize() label for iLO generations.
+ */
+function ipmiWebBmcFamily(string $bmcType): string
+{
+    $raw = strtolower(trim(preg_replace('/\s+/', ' ', $bmcType)));
+    if ($raw === '' || $raw === 'generic') {
+        return 'generic';
+    }
+    $norm = ipmiWebNormalizeBmcType($bmcType);
+    if (ipmiWebIsNormalizedIloType($norm) || $raw === 'ilo' || $raw === 'hpe' || $raw === 'hp' || str_contains($raw, 'integrated lights-out')) {
+        return 'ilo';
+    }
+    if ($norm === 'idrac' || str_contains($raw, 'idrac') || $raw === 'dell' || str_contains($raw, 'poweredge')) {
+        return 'idrac';
+    }
+    if ($norm === 'supermicro' || str_contains($raw, 'supermicro') || str_contains($raw, 'super micro') || str_contains($raw, 'supermiscro')) {
+        return 'supermicro';
+    }
+    if ($norm === 'ami' || str_contains($raw, 'asrock') || str_contains($raw, 'ami-bmc') || $raw === 'ami') {
+        return 'ami';
+    }
+
+    return 'generic';
+}
+
+/**
+ * Best-effort firmware line (ilo5, ilo6, idrac9, …) for planner/debug; not always known from DB alone.
+ */
+function ipmiWebBmcVariant(string $bmcType): string
+{
+    $raw = strtolower(trim(preg_replace('/\s+/', ' ', $bmcType)));
+    $norm = ipmiWebNormalizeBmcType($bmcType);
+    if (ipmiWebIsNormalizedIloType($norm)) {
+        return strtolower($norm);
+    }
+    if (preg_match('/ilo\s*([0-9]{1,2})\b/i', $raw, $m)) {
+        return 'ilo' . (int) $m[1];
+    }
+    if (preg_match('/\bilo([0-9]{1,2})\b/i', $raw, $m)) {
+        return 'ilo' . (int) $m[1];
+    }
+    if ($raw === 'ilo' || $raw === 'hpe' || $raw === 'hp') {
+        return 'ilo4';
+    }
+    if (preg_match('/idrac\s*([0-9]{1,2})\b/i', $raw, $m)) {
+        return 'idrac' . (int) $m[1];
+    }
+    if (str_contains($raw, 'idrac')) {
+        return 'idrac';
+    }
+    if ($norm === 'idrac') {
+        return 'idrac';
+    }
+    if ($norm === 'supermicro') {
+        return 'supermicro';
+    }
+    if ($norm === 'ami') {
+        return 'ami';
+    }
+
+    return $norm !== '' && $norm !== 'generic' ? $norm : 'generic';
+}
+
+/**
+ * Normalize BMC type for DB/session compatibility.
+ * iLO generations are preserved (ilo5 ≠ ilo4). iDRAC stays a single normalized idrac; use ipmiWebBmcVariant() for idrac8/9 hints.
+ */
 function ipmiWebNormalizeBmcType(string $bmcType): string
 {
-    $type = strtolower(trim($bmcType));
+    $type = strtolower(trim(preg_replace('/\s+/', ' ', str_replace('_', '-', $bmcType))));
     $aliases = [
-        'supermiscro'  => 'supermicro',
-        'super micro'  => 'supermicro',
-        'asrockrack'   => 'ami',
-        'asrock'       => 'ami',
-        'ami'          => 'ami',
-        'ami-bmc'      => 'ami',
-        'ilo'          => 'ilo4',
-        'hpe'          => 'ilo4',
-        'hp'           => 'ilo4',
-        'dell'         => 'idrac',
+        'supermiscro' => 'supermicro',
+        'super micro' => 'supermicro',
+        'asrockrack'  => 'ami',
+        'asrock'      => 'ami',
+        'ami'         => 'ami',
+        'ami-bmc'     => 'ami',
+        'dell'        => 'idrac',
+        'idrac'       => 'idrac',
     ];
     if (isset($aliases[$type])) {
         return $aliases[$type];
     }
-    if (in_array($type, ['supermicro', 'ilo4', 'idrac', 'ami'], true)) {
+    if (in_array($type, ['supermicro', 'idrac', 'ami'], true)) {
         return $type;
     }
-    // HPE iLO 5/6 (and labels like ilo5-gen2) use the same login paths as iLO 4.
-    if (preg_match('/^ilo\d/i', $type)) {
+    // Numbered iLO: ilo5, ilo 5, ilo5-gen10, hpe-ilo6, …
+    if (preg_match('/(?:^|[^a-z0-9])ilo\s*([0-9]{1,2})\b/i', $type, $m)) {
+        return 'ilo' . (int) $m[1];
+    }
+    if (preg_match('/^ilo([0-9]{1,2})\b/i', $type, $m)) {
+        return 'ilo' . (int) $m[1];
+    }
+    if ($type === 'ilo' || $type === 'hpe' || $type === 'hp') {
+        return 'ilo4';
+    }
+    if (str_contains($type, 'ilo')) {
         return 'ilo4';
     }
 
@@ -3179,7 +3307,8 @@ function ipmiWebCanPersistDetectedType(string $currentType, string $detectedType
         return false;
     }
 
-    return in_array($detected, ['supermicro', 'ilo4', 'idrac', 'ami'], true);
+    return in_array($detected, ['supermicro', 'idrac', 'ami'], true)
+        || ipmiWebIsNormalizedIloType($detected);
 }
 
 function ipmiWebPersistDetectedServerType(mysqli $mysqli, int $serverId, string $currentType, string $detectedType): void
@@ -3199,66 +3328,295 @@ function ipmiWebPersistDetectedServerType(mysqli $mysqli, int $serverId, string 
 
 function ipmiWebPostLoginLandingPath(string $bmcType): string
 {
-    $type = ipmiWebNormalizeBmcType($bmcType);
-    if ($type === 'supermicro') {
+    $fam = ipmiWebBmcFamily($bmcType);
+    if ($fam === 'supermicro') {
         // Supermicro post-login container route.
         // Inner content is loaded from this shell; direct dashboard route can render as a broken subframe.
         return '/cgi/url_redirect.cgi?url_name=topmenu';
     }
-    if ($type === 'ilo4') {
-        // Some iLO4 builds return 404 on /html/application.html for top-level navigation.
+    if ($fam === 'ilo') {
+        // Some iLO builds return 404 on /html/application.html for top-level navigation.
         // /index.html is a safer authenticated entry and still loads the full UI shell.
         return '/index.html';
     }
-    if ($type === 'idrac') {
+    if ($fam === 'idrac') {
         // /start.html is often a pre-login launcher and can bounce to /login.html.
         // Use authenticated app entry to avoid login/start loops in proxy mode.
         return '/index.html';
     }
-    if ($type === 'ami') {
+    if ($fam === 'ami') {
         return '/';
     }
 
     return '/';
 }
 
+/**
+ * Structured vendor identity for KVM launch planning (family vs variant).
+ *
+ * @return array{raw_bmc_type: string, normalized_type: string, vendor_family: string, vendor_variant: string}
+ */
+function ipmiWebVendorProfile(array $session): array
+{
+    $raw = trim((string) ($session['bmc_type'] ?? 'generic'));
+
+    return [
+        'raw_bmc_type' => $raw,
+        'normalized_type' => ipmiWebNormalizeBmcType($raw),
+        'vendor_family'   => ipmiWebBmcFamily($raw),
+        'vendor_variant'  => ipmiWebBmcVariant($raw),
+    ];
+}
+
+/**
+ * Rank candidate KVM paths using ipmiWebProbeKvmPath (for diagnostics / planner debug).
+ *
+ * @param list<string> $candidatePaths
+ * @return array{ranked: list<array{path: string, probe: array<string, mixed>}>, best: ?array{path: string, probe: array<string, mixed>}}
+ */
+function ipmiWebProbeVendorNativeKvm(array $session, array $candidatePaths, array $options = []): array
+{
+    unset($options);
+    $ranked = [];
+    foreach ($candidatePaths as $p) {
+        $p = (string) $p;
+        if ($p === '') {
+            continue;
+        }
+        $probe = ipmiWebProbeKvmPath($session, $p);
+        $ranked[] = ['path' => $p, 'probe' => $probe];
+    }
+    usort($ranked, static function (array $a, array $b): int {
+        $sa = (int) ($a['probe']['score'] ?? -999999);
+        $sb = (int) ($b['probe']['score'] ?? -999999);
+
+        return $sb <=> $sa;
+    });
+    $best = $ranked[0] ?? null;
+
+    return ['ranked' => $ranked, 'best' => $best];
+}
+
+/**
+ * Vendor-native KVM launch plan: entry path, delivery mode, proxy patch/WS/cookie hints, debug trace.
+ *
+ * @return array{
+ *   raw_bmc_type: string,
+ *   vendor_family: string,
+ *   vendor_variant: string,
+ *   post_login_path: string,
+ *   kvm_entry_path: string,
+ *   mode: string,
+ *   needs_ws_relay: bool,
+ *   needs_cookie_mirror: bool,
+ *   needs_runtime_patch: bool,
+ *   fallback_path: string,
+ *   debug: array<string, mixed>
+ * }
+ */
+function ipmiWebResolveKvmLaunchPlan(array $session): array
+{
+    $profile = ipmiWebVendorProfile($session);
+    $family = $profile['vendor_family'];
+    $variant = $profile['vendor_variant'];
+    $postLogin = ipmiWebPostLoginLandingPath((string) ($session['bmc_type'] ?? 'generic'));
+    $debug = [
+        'profile'        => $profile,
+        'candidates'     => [],
+        'selection_note' => '',
+    ];
+    $plan = [
+        'raw_bmc_type'        => $profile['raw_bmc_type'],
+        'vendor_family'       => $family,
+        'vendor_variant'      => $variant,
+        'post_login_path'     => $postLogin,
+        'kvm_entry_path'      => '/',
+        'mode'                => 'fallback',
+        'needs_ws_relay'      => false,
+        'needs_cookie_mirror' => true,
+        'needs_runtime_patch' => false,
+        'fallback_path'       => '/',
+        'debug'               => $debug,
+    ];
+
+    if ($family === 'ilo') {
+        $candidates = [
+            '/html/application.html?ipmi_kvm_auto=1',
+            '/html/application.html?ipmi_kvm_auto=1&ipmi_kvm_force_html5=1',
+            '/html/rc_info.html',
+            '/html/irc.html',
+            '/index.html?ipmi_kvm_auto=1',
+        ];
+        $ranked = ipmiWebProbeVendorNativeKvm($session, $candidates);
+        $plan['debug']['ranked'] = $ranked['ranked'];
+        $iloHtml5 = ipmiWebIloSupportsStandaloneHtml5Kvm($session);
+        $kvmPath = $iloHtml5
+            ? '/html/application.html?ipmi_kvm_auto=1&ipmi_kvm_force_html5=1'
+            : '/html/application.html?ipmi_kvm_auto=1';
+        $plan['kvm_entry_path'] = $kvmPath;
+        $plan['mode'] = 'proxy_autolaunch';
+        $plan['needs_runtime_patch'] = true;
+        $plan['needs_ws_relay'] = true;
+        $plan['fallback_path'] = '/html/application.html';
+        $plan['debug']['selection_note'] = $iloHtml5
+            ? 'iLO: HTML5 irc markers detected; autolaunch with force_html5.'
+            : 'iLO: autolaunch via application shell (runtime startHtml5Irc / rc_info).';
+        $plan['debug']['ilo_html5_probe'] = $iloHtml5 ? 1 : 0;
+
+        return $plan;
+    }
+
+    if ($family === 'idrac') {
+        $candidates = [
+            '/index.html',
+            '/restgui/start.html',
+            '/viewer.html',
+            '/console.html',
+            '/restgui/launch',
+            '/start.html',
+        ];
+        $rankedIdrac = ipmiWebProbeVendorNativeKvm($session, $candidates);
+        $plan['debug']['ranked'] = $rankedIdrac['ranked'];
+        $picked = ipmiWebPickReachablePath($session, $candidates, '/index.html', true);
+        $pr = null;
+        foreach ($rankedIdrac['ranked'] as $row) {
+            if (($row['path'] ?? '') === $picked && isset($row['probe'])) {
+                $pr = $row['probe'];
+                break;
+            }
+        }
+        if (!is_array($pr)) {
+            $pr = ipmiWebProbeKvmPath($session, $picked);
+        }
+        $plan['debug']['picked'] = ['path' => $picked, 'probe' => $pr];
+        $plan['kvm_entry_path'] = $picked;
+        if (!empty($pr['browser_native_like'])) {
+            $plan['mode'] = 'browser_html5';
+            $plan['debug']['selection_note'] = 'iDRAC: browser-native markers on picked path.';
+        } elseif (!empty($pr['vendor_shell_like']) && empty($pr['login_like'])) {
+            $plan['mode'] = 'proxy_autolaunch';
+            $plan['needs_runtime_patch'] = true;
+            $plan['debug']['selection_note'] = 'iDRAC: authenticated launcher/shell; client navigation may be required.';
+        } else {
+            $plan['mode'] = 'proxy_autolaunch';
+            $plan['needs_runtime_patch'] = true;
+            $plan['debug']['selection_note'] = 'iDRAC: default autolaunch path (probe ambiguous or shell pending).';
+        }
+        $plan['needs_ws_relay'] = !empty($pr['ws_like']);
+        $plan['fallback_path'] = '/index.html?ipmi_kvm_unavailable=1';
+
+        return $plan;
+    }
+
+    if ($family === 'supermicro') {
+        $candidates = [
+            '/cgi/url_redirect.cgi?url_name=ikvm&url_type=html5',
+            '/cgi/url_redirect.cgi?url_name=ikvm&url_type=jwsk',
+            '/cgi/url_redirect.cgi?url_name=ikvm',
+        ];
+        $rankedSm = ipmiWebProbeVendorNativeKvm($session, $candidates);
+        $plan['debug']['ranked'] = $rankedSm['ranked'];
+        $picked = ipmiWebPickReachablePath($session, $candidates, '/cgi/url_redirect.cgi?url_name=topmenu&ipmi_kvm_unavailable=1', true);
+        $pr = null;
+        foreach ($rankedSm['ranked'] as $row) {
+            if (($row['path'] ?? '') === $picked && isset($row['probe'])) {
+                $pr = $row['probe'];
+                break;
+            }
+        }
+        if (!is_array($pr)) {
+            $pr = ipmiWebProbeKvmPath($session, $picked);
+        }
+        $plan['debug']['picked'] = ['path' => $picked, 'probe' => $pr];
+        $plan['kvm_entry_path'] = $picked;
+        if (!empty($pr['browser_native_like'])) {
+            $plan['mode'] = 'browser_html5';
+        } else {
+            $plan['mode'] = 'proxy_autolaunch';
+        }
+        $plan['needs_runtime_patch'] = !empty($pr['vendor_shell_like']) && empty($pr['browser_native_like']);
+        $plan['fallback_path'] = '/cgi/url_redirect.cgi?url_name=topmenu&ipmi_kvm_unavailable=1';
+        $plan['debug']['selection_note'] = 'Supermicro: prefer html5 IKVM redirect when reachable.';
+
+        return $plan;
+    }
+
+    if ($family === 'ami') {
+        $plan['kvm_entry_path'] = '/';
+        $plan['mode'] = 'browser_html5';
+        $plan['needs_runtime_patch'] = true;
+        $plan['debug']['selection_note'] = 'AMI/ASRock: SPA entry at /.';
+
+        return $plan;
+    }
+
+    $plan['kvm_entry_path'] = '/';
+    $plan['debug']['selection_note'] = 'generic: no vendor-specific KVM plan.';
+
+    return $plan;
+}
+
+/**
+ * Compact plan summary for debug logs (no cookies, tokens, or full HTML).
+ *
+ * @return array<string, mixed>
+ */
+function ipmiWebKvmPlanLogSummary(array $plan): array
+{
+    $dbg = $plan['debug'] ?? [];
+    $ranked = $dbg['ranked'] ?? [];
+    if (!is_array($ranked)) {
+        $ranked = [];
+    }
+    $rows = [];
+    foreach (array_slice($ranked, 0, 8) as $entry) {
+        $p = (string) ($entry['path'] ?? '');
+        $pr = $entry['probe'] ?? [];
+        if (!is_array($pr)) {
+            $pr = [];
+        }
+        $rows[] = [
+            'path'   => $p,
+            'score'  => $pr['score'] ?? null,
+            'http'   => $pr['code'] ?? null,
+            'login'  => !empty($pr['login'] ?? $pr['login_like'] ?? false),
+            'native' => !empty($pr['browser_native_like'] ?? false),
+            'shell'  => !empty($pr['vendor_shell_like'] ?? false),
+            'markers'=> array_slice($pr['markers'] ?? [], 0, 5),
+        ];
+    }
+    $picked = $dbg['picked'] ?? null;
+    $pickedRow = null;
+    if (is_array($picked)) {
+        $ppr = $picked['probe'] ?? [];
+        $pickedRow = [
+            'path' => (string) ($picked['path'] ?? ''),
+            'score' => is_array($ppr) ? ($ppr['score'] ?? null) : null,
+        ];
+    }
+
+    return [
+        'vendor_family'  => (string) ($plan['vendor_family'] ?? ''),
+        'vendor_variant' => (string) ($plan['vendor_variant'] ?? ''),
+        'kvm_entry_path' => (string) ($plan['kvm_entry_path'] ?? ''),
+        'mode'           => (string) ($plan['mode'] ?? ''),
+        'note'           => (string) ($dbg['selection_note'] ?? ''),
+        'ranked'         => $rows,
+        'picked'         => $pickedRow,
+    ];
+}
+
 function ipmiWebKvmConsolePath(array $session): string
 {
-    $type = ipmiWebNormalizeBmcType((string)($session['bmc_type'] ?? 'generic'));
+    $plan = ipmiWebResolveKvmLaunchPlan($session);
 
-    switch ($type) {
-        case 'supermicro':
-            return ipmiWebPickReachablePath($session, [
-                '/cgi/url_redirect.cgi?url_name=ikvm&url_type=jwsk',
-                '/cgi/url_redirect.cgi?url_name=ikvm&url_type=html5',
-                '/cgi/url_redirect.cgi?url_name=ikvm',
-            ], '/cgi/url_redirect.cgi?url_name=topmenu&ipmi_kvm_unavailable=1', true);
-        case 'ilo4':
-            $iloStandaloneHtml5 = ipmiWebIloSupportsStandaloneHtml5Kvm($session);
-            $iloAutoPath = $iloStandaloneHtml5
-                ? '/html/application.html?ipmi_kvm_auto=1&ipmi_kvm_force_html5=1'
-                : '/html/application.html?ipmi_kvm_auto=1';
-            // Browser-native iLO4 KVM is a runtime-driven flow rooted at application.html.
-            // Server-side path probes can misclassify this route because the real browser
-            // establishes additional client-side state before the inner pages load.
-            return $iloAutoPath;
-        case 'idrac':
-            return ipmiWebPickReachablePath($session, [
-                '/viewer.html',
-                '/console.html',
-                '/start.html',
-                '/index.html',
-                '/restgui/start.html',
-                '/restgui/launch',
-            ], '/index.html?ipmi_kvm_unavailable=1', true);
-        default:
-            return '/';
-    }
+    return (string) ($plan['kvm_entry_path'] ?? '/');
 }
 
 function ipmiWebKvmConsoleUrl(array $session): string
 {
     $path = ipmiWebKvmConsolePath($session);
+
     return ipmiWebBuildProxyUrl($session['token'], $path);
 }
 
@@ -3320,15 +3678,24 @@ function ipmiWebKvmDeliveryMode(string $path, string $contentType, string $body)
 
 function ipmiWebIloSupportsStandaloneHtml5Kvm(array $session): bool
 {
-    // iLO4 true browser-native KVM is provided via /html/irc.html on supported firmware.
-    // If missing/unavailable, compatibility mode should allow legacy launcher fallback.
-    $probe = ipmiWebProbeKvmPath($session, '/html/irc.html');
-    $code = (int) ($probe['code'] ?? 0);
+    // Prefer content-aware probes: some builds return 200 on /html/irc.html with a shell or
+    // redirect to HTML5 paths; others expose markers only on application.html.
+    $paths = ['/html/irc.html', '/html/application.html', '/index.html'];
+    foreach ($paths as $p) {
+        $probe = ipmiWebProbeKvmPath($session, $p);
+        if (!empty($probe['browser_native_like']) && empty($probe['login_like']) && empty($probe['unavailable'])) {
+            return true;
+        }
+        $code = (int) ($probe['code'] ?? 0);
+        if ($code >= 200 && $code < 400 && empty($probe['login_like']) && empty($probe['unavailable']) && empty($probe['unavailable_like'])) {
+            $markers = $probe['markers'] ?? [];
+            if (is_array($markers) && (in_array('ilo_html5_markers', $markers, true) || in_array('ilo_renderer', $markers, true))) {
+                return true;
+            }
+        }
+    }
 
-    return !empty($probe['ok'])
-        && $code >= 200
-        && $code < 300
-        && empty($probe['unavailable']);
+    return false;
 }
 
 function ipmiWebKvmPathLooksUnavailable(string $body): bool
@@ -3379,15 +3746,26 @@ function ipmiWebKvmBodyHasTimeoutText(string $body): bool
 /**
  * Lightweight KVM path probe against current authenticated BMC session.
  *
- * @return array{ok: bool, score: int, code: int, login: bool, timeout: bool, unavailable: bool, mode: string}
+ * @return array<string, mixed>
  */
 function ipmiWebProbeKvmPath(array $session, string $path): array
 {
     $ip = trim((string) ($session['ipmi_ip'] ?? ''));
     if ($ip === '') {
-        return ['ok' => false, 'score' => -1000, 'code' => 0, 'login' => false, 'timeout' => false, 'unavailable' => false, 'mode' => 'other'];
+        return [
+            'ok' => false, 'score' => -1000, 'code' => 0, 'http_code' => 0,
+            'login' => false, 'login_like' => false,
+            'timeout' => false, 'timeout_like' => false,
+            'unavailable' => false, 'unavailable_like' => false,
+            'mode' => 'other', 'delivery_mode' => 'other',
+            'final_url' => '', 'content_type' => '',
+            'vendor_shell_like' => false, 'console_like' => false,
+            'browser_native_like' => false, 'ws_like' => false,
+            'markers' => [],
+        ];
     }
 
+    $vendorFamily = ipmiWebBmcFamily((string) ($session['bmc_type'] ?? 'generic'));
     $scheme = (($session['bmc_scheme'] ?? 'https') === 'http') ? 'http' : 'https';
     $url = $scheme . '://' . $ip . '/' . ltrim($path, '/');
     $cookieHeader = ipmiWebBuildCookieString($session);
@@ -3422,6 +3800,7 @@ function ipmiWebProbeKvmPath(array $session, string $path): array
     }
     $raw = curl_exec($ch);
     $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $finalUrl = (string) curl_getinfo($ch, CURLINFO_EFFECTIVE_URL);
     curl_close($ch);
 
     if (($raw === false || $code === 0) && $appliedResolve) {
@@ -3444,6 +3823,7 @@ function ipmiWebProbeKvmPath(array $session, string $path): array
         }
         $raw = curl_exec($ch);
         $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $finalUrl = (string) curl_getinfo($ch, CURLINFO_EFFECTIVE_URL);
         curl_close($ch);
     }
 
@@ -3457,49 +3837,200 @@ function ipmiWebProbeKvmPath(array $session, string $path): array
         }
     }
 
-    $login = ipmiWebResponseLooksLikeBmcLoginPage($body, $contentType);
-    $timeout = ipmiWebKvmBodyHasTimeoutText($body);
-    $unavailable = ipmiWebKvmPathLooksUnavailable($body);
-    $mode = ipmiWebKvmDeliveryMode($path, $contentType, $body);
+    $deliveryMode = ipmiWebKvmDeliveryMode($path, $contentType, $body);
+
+    $sample = strtolower(substr((string) $body, 0, 200000));
+    $pathLower = strtolower($path);
+    $markers = [];
+    $loginLike = ipmiWebResponseLooksLikeBmcLoginPage($body, $contentType);
+    $timeoutLike = ipmiWebKvmBodyHasTimeoutText($body);
+    $unavailableLike = ipmiWebKvmPathLooksUnavailable($body);
+    $vendorShell = false;
+    $browserNative = false;
+    $wsLike = (bool) preg_match('/\bws[s]?:\/\//i', $body)
+        || str_contains($sample, 'new websocket(')
+        || str_contains($sample, 'new websocket (')
+        || str_contains($sample, '.websocket');
+    if (!$loginLike && $sample !== '') {
+        if (
+            str_contains($sample, 'iloglobal')
+            || str_contains($sample, 'framecontent')
+            || str_contains($sample, 'framedirectory')
+            || str_contains($sample, 'html/application')
+            || str_contains($sample, 'ilo.start')
+        ) {
+            $vendorShell = true;
+            $markers[] = 'ilo_shell';
+        }
+        if (
+            str_contains($sample, 'idrac')
+            || str_contains($sample, 'restgui')
+            || str_contains($sample, '/restgui/')
+            || str_contains($sample, 'oem/inventory')
+            || (str_contains($sample, 'angular.min.js') && str_contains($sample, 'dell'))
+        ) {
+            $vendorShell = true;
+            $markers[] = 'idrac_shell';
+        }
+        if (
+            str_contains($sample, 'supermicro')
+            || str_contains($sample, 'url_redirect.cgi')
+            || str_contains($sample, 'smc')
+            || str_contains($sample, 'ikvm')
+        ) {
+            $vendorShell = true;
+            $markers[] = 'supermicro_shell';
+        }
+        if (str_contains($sample, 'asrock') || (str_contains($sample, 'csrftoken') && str_contains($sample, 'bmc'))) {
+            $vendorShell = true;
+            $markers[] = 'ami_shell';
+        }
+    }
+    if ($sample !== '' && !$unavailableLike) {
+        if (
+            str_contains($sample, 'starthtml5irc')
+            || str_contains($sample, 'start_html5_irc')
+            || (str_contains($sample, 'html5') && str_contains($sample, 'integrated remote console'))
+            || str_contains($sample, 'html5 irc')
+            || str_contains($sample, 'ircwindow')
+            || str_contains($sample, 'html/irc')
+            || (str_contains($sample, 'renderer') && str_contains($sample, 'irc'))
+        ) {
+            $browserNative = true;
+            $markers[] = 'ilo_html5_markers';
+        }
+        if (str_contains($sample, 'new renderer') || str_contains($sample, 'htmlircwindowmode')) {
+            $browserNative = true;
+            $markers[] = 'ilo_renderer';
+        }
+        if (
+            str_contains($sample, 'virtual console')
+            || str_contains($sample, 'html5 console')
+            || str_contains($sample, 'vmrc')
+            || str_contains($sample, 'avctkvm')
+            || str_contains($sample, 'viewer.html')
+            || str_contains($sample, 'console.html')
+            || str_contains($pathLower, 'viewer.html')
+            || str_contains($pathLower, 'console.html')
+        ) {
+            $browserNative = true;
+            $markers[] = 'idrac_viewer_markers';
+        }
+        if (
+            str_contains($pathLower, 'url_type=html5')
+            || (str_contains($pathLower, 'ikvm') && str_contains($sample, 'html5'))
+            || (str_contains($sample, 'ikvm') && str_contains($sample, 'websocket'))
+        ) {
+            $browserNative = true;
+            $markers[] = 'supermicro_html5';
+        }
+    }
+    if ($vendorFamily === 'idrac' && !$loginLike && str_contains($sample, 'launch') && str_contains($sample, 'console')) {
+        $vendorShell = true;
+        $markers[] = 'idrac_launcher';
+    }
+    $consoleLike = ipmiWebKvmPathLooksConsoleLike($path, $body);
+    if ($consoleLike) {
+        $markers[] = 'console_route_or_copy';
+    }
+    $markers = array_values(array_unique($markers));
+    $cls = [
+        'markers'             => $markers,
+        'login_like'          => $loginLike,
+        'timeout_like'        => $timeoutLike,
+        'unavailable_like'    => $unavailableLike,
+        'vendor_shell_like'   => $vendorShell,
+        'console_like'        => $consoleLike,
+        'browser_native_like' => $browserNative,
+        'ws_like'             => $wsLike,
+    ];
+    $login = $loginLike;
+    $timeout = $timeoutLike;
+    $unavailable = $unavailableLike;
+
     $ok = ($code >= 200 && $code < 400) && !$login && !$timeout;
 
     $score = 0;
     if ($ok) {
         $score += 20;
     }
-    if (ipmiWebKvmPathLooksConsoleLike($path, $body)) {
+    if (!empty($cls['vendor_shell_like'])) {
         $score += 30;
     }
-    if ($mode === 'proxy_autolaunch') {
-        // Best UX for browsers: we stay in authenticated shell and trigger vendor JS launch.
-        $score += 60;
+    if (!empty($cls['console_like'])) {
+        $score += 24;
     }
-    if ($mode === 'html') {
-        $score += 5;
+    if (!empty($cls['browser_native_like'])) {
+        $score += 65;
     }
-    if ($mode === 'clickonce' || $mode === 'jnlp' || $mode === 'java_applet') {
-        // Valid legacy delivery, but weak for modern browser-only workflows.
-        $score -= 90;
+    if (!empty($cls['ws_like'])) {
+        $score += 14;
+    }
+    if ($deliveryMode === 'proxy_autolaunch') {
+        $score += 52;
+    }
+    if ($deliveryMode === 'html') {
+        $score += 8;
+    }
+    if ($deliveryMode === 'clickonce' || $deliveryMode === 'jnlp' || $deliveryMode === 'java_applet') {
+        $score -= 68;
     }
     if ($unavailable) {
-        $score -= 140;
+        $score -= 145;
     }
     if ($code >= 400 || $code === 0) {
-        $score -= 80;
+        $score -= 82;
     }
-    if ($login || $timeout) {
-        $score -= 50;
+    if ($login) {
+        $score -= 48;
+    }
+    if ($timeout) {
+        $score -= 48;
+    }
+    if (!empty($cls['vendor_shell_like']) && !$login && $deliveryMode === 'html' && !$unavailable) {
+        $score += 12;
     }
 
     return [
-        'ok' => $ok,
-        'score' => $score,
-        'code' => $code,
-        'login' => $login,
-        'timeout' => $timeout,
-        'unavailable' => $unavailable,
-        'mode' => $mode,
+        'ok'                  => $ok,
+        'score'               => $score,
+        'code'                => $code,
+        'http_code'           => $code,
+        'login'               => $login,
+        'login_like'          => $login,
+        'timeout'             => $timeout,
+        'timeout_like'        => $timeout,
+        'unavailable'         => $unavailable,
+        'unavailable_like'    => $unavailable,
+        'mode'                => $deliveryMode,
+        'delivery_mode'       => $deliveryMode,
+        'final_url'           => $finalUrl,
+        'content_type'        => $contentType,
+        'vendor_shell_like'   => $cls['vendor_shell_like'],
+        'console_like'        => $cls['console_like'],
+        'browser_native_like' => $cls['browser_native_like'],
+        'ws_like'             => $cls['ws_like'],
+        'markers'             => $cls['markers'],
     ];
+}
+
+/**
+ * True when probe result is suitable for browser-first KVM (HTML5 shell, SPA entry, or autolaunch URL).
+ */
+function ipmiWebKvmProbeIsBrowserOriented(array $probe): bool
+{
+    $mode = (string) ($probe['delivery_mode'] ?? $probe['mode'] ?? 'other');
+    if (in_array($mode, ['proxy_autolaunch', 'html'], true)) {
+        return true;
+    }
+    if (!empty($probe['browser_native_like'])) {
+        return true;
+    }
+    if (!empty($probe['vendor_shell_like']) && $mode === 'html' && empty($probe['login_like']) && empty($probe['login'])) {
+        return true;
+    }
+
+    return false;
 }
 
 function ipmiWebKvmModeIsBrowserNative(string $mode): bool
@@ -3509,40 +4040,32 @@ function ipmiWebKvmModeIsBrowserNative(string $mode): bool
 
 function ipmiWebPickReachablePath(array $session, array $candidates, string $fallback, bool $browserOnly = false): string
 {
-    $bestPath = $fallback;
-    $bestScore = -100000;
-    $bestBrowserPath = '';
-    $bestBrowserScore = -100000;
+    $bestAny = ['path' => $fallback, 'score' => -100000];
+    $bestBrowser = ['path' => '', 'score' => -100000];
+
     foreach ($candidates as $path) {
         $probe = ipmiWebProbeKvmPath($session, $path);
         $score = (int) ($probe['score'] ?? -1000);
-        if ($score > $bestScore) {
-            $bestScore = $score;
-            $bestPath = $path;
+        if ($score > $bestAny['score']) {
+            $bestAny = ['path' => $path, 'score' => $score];
         }
-        $isBrowserMode = ipmiWebKvmModeIsBrowserNative((string) ($probe['mode'] ?? 'other'));
-        if ($browserOnly && !empty($probe['ok']) && empty($probe['unavailable']) && $isBrowserMode && $score >= 35) {
-            if ($score > $bestBrowserScore) {
-                $bestBrowserScore = $score;
-                $bestBrowserPath = $path;
-            }
-            // Good browser-native console hit; no need to keep probing.
-            return $path;
+        $bad = !empty($probe['unavailable']) || !empty($probe['unavailable_like']);
+        if (!$bad && ipmiWebKvmProbeIsBrowserOriented($probe) && $score > $bestBrowser['score']) {
+            $bestBrowser = ['path' => $path, 'score' => $score];
         }
-        if (!$browserOnly && !empty($probe['ok']) && empty($probe['unavailable']) && $score >= 35) {
-            // Good console-like hit; no need to keep probing.
+        if (!$browserOnly && !empty($probe['ok']) && !$bad && $score >= 32) {
             return $path;
         }
     }
 
-    if ($browserOnly && $bestBrowserPath !== '') {
-        return $bestBrowserPath;
+    if ($browserOnly && $bestBrowser['path'] !== '') {
+        return $bestBrowser['path'];
     }
     if ($browserOnly) {
         return $fallback;
     }
 
-    return $bestPath;
+    return $bestAny['path'];
 }
 
 function ipmiWebBuildCookieString(array $session): string
@@ -3582,9 +4105,12 @@ function ipmiWebEmitMirroredBmcCookiesForProxy(string $token, array $cookies): v
         'httponly' => false,
         'samesite' => 'Lax',
     ];
+    $maxCookies = 48;
+    $maxTotalBytes = 24576;
+    $totalBytes = 0;
     $n = 0;
     foreach ($cookies as $name => $value) {
-        if ($n >= 16) {
+        if ($n >= $maxCookies) {
             break;
         }
         if (!ipmiWebIsAuthValueUsable($value)) {
@@ -3601,11 +4127,16 @@ function ipmiWebEmitMirroredBmcCookiesForProxy(string $token, array $cookies): v
         if (strlen($val) > 3800) {
             continue;
         }
+        $pairBytes = strlen($name) + strlen($val) + 8;
+        if ($totalBytes + $pairBytes > $maxTotalBytes) {
+            continue;
+        }
         if (PHP_VERSION_ID >= 70300) {
             setcookie($name, $val, $opts);
         } else {
             setcookie($name, $val, $expires, $path, '', $secure, false);
         }
+        $totalBytes += $pairBytes;
         ++$n;
     }
 }

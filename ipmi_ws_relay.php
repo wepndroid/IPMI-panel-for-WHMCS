@@ -16,6 +16,7 @@ session_start();
 
 require_once __DIR__ . '/config.php';
 require_once __DIR__ . '/lib/ipmi_web_session.php';
+require_once __DIR__ . '/lib/ipmi_proxy_debug.php';
 
 $token = strtolower(trim((string)($_GET['token'] ?? '')));
 
@@ -116,6 +117,14 @@ $connectSpec = $useTls
     ? 'ssl://' . $bmcIp . ':' . $bmcPort
     : 'tcp://' . $bmcIp . ':' . $bmcPort;
 
+if (function_exists('ipmiProxyDebugEnabled') && ipmiProxyDebugEnabled()) {
+    $cookiePresent = $cookieHeader !== '' ? 1 : 0;
+    $extraHdrLines = $extraHeaders !== '' ? substr_count(trim($extraHeaders), "\n") : 0;
+    error_log('ipmi_ws_relay: pre_connect scheme=' . $tScheme . ' port=' . $bmcPort
+        . ' pathLen=' . strlen($wsPath) . ' cookieHeader=' . $cookiePresent
+        . ' forwardHdrLines=' . $extraHdrLines);
+}
+
 $remote = @stream_socket_client(
     $connectSpec,
     $errno,
@@ -126,6 +135,9 @@ $remote = @stream_socket_client(
 );
 
 if (!$remote) {
+    if (function_exists('ipmiProxyDebugEnabled') && ipmiProxyDebugEnabled()) {
+        error_log('ipmi_ws_relay: tcp_connect_failed errno=' . (string) $errno . ' err=' . substr((string) $errstr, 0, 200));
+    }
     http_response_code(502);
     echo 'Cannot connect to BMC WebSocket: ' . $errstr;
     exit;
@@ -146,10 +158,18 @@ while (!feof($remote)) {
 }
 
 if (stripos($responseHeader, '101') === false) {
+    if (function_exists('ipmiProxyDebugEnabled') && ipmiProxyDebugEnabled()) {
+        $first = strtok($responseHeader, "\n");
+        error_log('ipmi_ws_relay: handshake_no_101 firstLine=' . trim((string) $first));
+    }
     fclose($remote);
     http_response_code(502);
     echo 'BMC WebSocket handshake failed';
     exit;
+}
+
+if (function_exists('ipmiProxyDebugEnabled') && ipmiProxyDebugEnabled()) {
+    error_log('ipmi_ws_relay: handshake_ok scheme=' . $tScheme);
 }
 
 $expectedAccept = base64_encode(sha1($wsKey . '258EAFA5-E914-47DA-95CA-5AB5DC11653B', true));
