@@ -183,7 +183,7 @@ class IPMIService
       ];
     }
 
-    if ($type === 'ilo4') {
+    if (preg_match('/^ilo[0-9]+$/', $type)) {
       return [
         ['interface' => 'lanplus', 'cipher' => 3],
         ['interface' => 'lanplus', 'cipher' => null],
@@ -234,7 +234,7 @@ class IPMIService
     $ciphers = [8, 7, 1, 0];
 
     // Useful on many "generic" and ASRockRack/Supermicro-like targets.
-    if (in_array($type, ['generic', 'supermicro', 'idrac', 'ilo4'], true)) {
+    if (in_array($type, ['generic', 'supermicro', 'idrac', 'ilo4'], true) || preg_match('/^ilo[0-9]+$/', $type)) {
       $out = [];
       foreach ($ciphers as $c) {
         $out[] = ['interface' => 'lanplus', 'cipher' => $c];
@@ -319,6 +319,9 @@ class IPMIService
     ];
     if (isset($aliases[$type])) {
       $type = $aliases[$type];
+    }
+    if (preg_match('/^ilo[0-9]+$/', $type)) {
+      return $type;
     }
     if (in_array($type, ['supermicro', 'ilo4', 'idrac', 'ami', 'generic'], true)) {
       return $type;

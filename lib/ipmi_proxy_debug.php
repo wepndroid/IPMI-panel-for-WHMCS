@@ -11,6 +11,10 @@
  * Logs to PHP error_log; sends X-IPMI-Proxy-Trace for correlation.
  * Browser: console.group on HTML pages; X-IPMI-Proxy-Debug-Log (base64 JSON) on all responses where headers are still mutable.
  * Does not log cookie values or full proxy tokens.
+ *
+ * KVM / WebSocket oriented events include: kvm_plan_cache_hit, kvm_plan_cache_miss,
+ * kvm_plan_recomputed, kvm_launch_plan_selected, bmc_response_host_rewrite, and
+ * ipmi_ws_relay handshake lines in error_log when relay debug is on.
  */
 
 /** @var list<array{ts: float, event: string, context: array<string, mixed>}>|null */

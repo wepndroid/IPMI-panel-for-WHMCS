@@ -13,16 +13,17 @@ function csvCell(string $value): string
 function kvmCandidates(string $bmcType): array
 {
     $type = ipmiWebNormalizeBmcType($bmcType);
+    if (ipmiWebIsNormalizedIloType($type)) {
+        return [
+            '/html/application.html?ipmi_kvm_auto=1',
+            '/html/rc_info.html?ipmi_kvm_auto=1',
+            '/html/irc.html',
+            '/html/jnlp_template.html',
+            '/html/java_irc.html',
+            '/html/IRC.application?cofc_goback=false',
+        ];
+    }
     switch ($type) {
-        case 'ilo4':
-            return [
-                '/html/application.html?ipmi_kvm_auto=1',
-                '/html/rc_info.html?ipmi_kvm_auto=1',
-                '/html/irc.html',
-                '/html/jnlp_template.html',
-                '/html/java_irc.html',
-                '/html/IRC.application?cofc_goback=false',
-            ];
         case 'idrac':
             return [
                 '/viewer.html',

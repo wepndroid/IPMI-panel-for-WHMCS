@@ -93,14 +93,21 @@ $wsKey = base64_encode(random_bytes(16));
 $cookieHeader = ipmiWsBuildCookieHeader($session);
 $extraHeaders = ipmiWsBuildForwardHeaderLines($session);
 
+$preferredHost = ipmiBmcPreferredOriginHost($bmcIp);
+$defaultPort = $useTls ? 443 : 80;
+$hostLine = $preferredHost . (($bmcPort !== $defaultPort) ? (':' . $bmcPort) : '');
 $originScheme = $useTls ? 'https' : 'http';
+$originLine = $originScheme . '://' . $preferredHost;
+if ($bmcPort !== $defaultPort) {
+    $originLine .= ':' . $bmcPort;
+}
 $handshake = "GET {$wsPath} HTTP/1.1\r\n"
-    . "Host: {$bmcIp}\r\n"
+    . "Host: {$hostLine}\r\n"
     . "Upgrade: websocket\r\n"
     . "Connection: Upgrade\r\n"
     . "Sec-WebSocket-Key: {$wsKey}\r\n"
     . "Sec-WebSocket-Version: 13\r\n"
-    . "Origin: {$originScheme}://{$bmcIp}\r\n"
+    . "Origin: {$originLine}\r\n"
     . $cookieHeader
     . $extraHeaders
     . "\r\n";
@@ -120,9 +127,13 @@ $connectSpec = $useTls
 if (function_exists('ipmiProxyDebugEnabled') && ipmiProxyDebugEnabled()) {
     $cookiePresent = $cookieHeader !== '' ? 1 : 0;
     $extraHdrLines = $extraHeaders !== '' ? substr_count(trim($extraHeaders), "\n") : 0;
+    $pathHasWs = (stripos($wsPath, 'ws') !== false || stripos($wsPath, 'irc') !== false || stripos($wsPath, 'kvm') !== false) ? 1 : 0;
     error_log('ipmi_ws_relay: pre_connect scheme=' . $tScheme . ' port=' . $bmcPort
-        . ' pathLen=' . strlen($wsPath) . ' cookieHeader=' . $cookiePresent
-        . ' forwardHdrLines=' . $extraHdrLines);
+        . ' pathLen=' . strlen($wsPath) . ' path_ws_hint=' . $pathHasWs
+        . ' cookieHeader=' . $cookiePresent
+        . ' forwardHdrLines=' . $extraHdrLines
+        . ' tls_to_bmc=' . ($useTls ? '1' : '0')
+        . ' host_fwd=1 origin_fwd=1 host_kind=' . (filter_var($preferredHost, FILTER_VALIDATE_IP) ? 'ip' : 'name'));
 }
 
 $remote = @stream_socket_client(
@@ -160,7 +171,12 @@ while (!feof($remote)) {
 if (stripos($responseHeader, '101') === false) {
     if (function_exists('ipmiProxyDebugEnabled') && ipmiProxyDebugEnabled()) {
         $first = strtok($responseHeader, "\n");
-        error_log('ipmi_ws_relay: handshake_no_101 firstLine=' . trim((string) $first));
+        $hl = strtolower($responseHeader);
+        error_log('ipmi_ws_relay: handshake_no_101 firstLine=' . trim((string) $first)
+            . ' hdrBytes=' . strlen($responseHeader)
+            . ' www_authenticate=' . (str_contains($hl, 'www-authenticate') ? '1' : '0')
+            . ' has_location=' . (preg_match('/^location:\s/im', $responseHeader) ? '1' : '0')
+            . ' has_set_cookie=' . (preg_match('/^set-cookie:\s/im', $responseHeader) ? '1' : '0'));
     }
     fclose($remote);
     http_response_code(502);
@@ -169,7 +185,10 @@ if (stripos($responseHeader, '101') === false) {
 }
 
 if (function_exists('ipmiProxyDebugEnabled') && ipmiProxyDebugEnabled()) {
-    error_log('ipmi_ws_relay: handshake_ok scheme=' . $tScheme);
+    error_log('ipmi_ws_relay: handshake_ok scheme=' . $tScheme
+        . ' host_kind=' . (filter_var($preferredHost, FILTER_VALIDATE_IP) ? 'ip' : 'name')
+        . ' pathLen=' . strlen($wsPath)
+        . ' cookie_fwd=' . ($cookieHeader !== '' ? '1' : '0'));
 }
 
 $expectedAccept = base64_encode(sha1($wsKey . '258EAFA5-E914-47DA-95CA-5AB5DC11653B', true));

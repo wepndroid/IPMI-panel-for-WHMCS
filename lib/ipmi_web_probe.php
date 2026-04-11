@@ -236,11 +236,12 @@ function ipmiWebProbeFetchUiPath(array $session, string $path): array
 function ipmiWebProbeUiPathsForType(string $bmcType): array
 {
     $type = ipmiWebNormalizeBmcType($bmcType);
+    if (ipmiWebIsNormalizedIloType($type)) {
+        return ['/', '/index.html'];
+    }
     switch ($type) {
         case 'supermicro':
             return ['/', '/cgi/url_redirect.cgi?url_name=topmenu', '/cgi/url_redirect.cgi?url_name=dashboard'];
-        case 'ilo4':
-            return ['/', '/index.html'];
         case 'idrac':
             return ['/', '/start.html', '/index.html', '/restgui/start.html'];
         case 'ami':
@@ -258,11 +259,12 @@ function ipmiWebProbeUiPathsForType(string $bmcType): array
 function ipmiWebProbeProxyUiPathsForType(string $bmcType): array
 {
     $type = ipmiWebNormalizeBmcType($bmcType);
+    if (ipmiWebIsNormalizedIloType($type)) {
+        return ['/', '/index.html'];
+    }
     switch ($type) {
         case 'supermicro':
             return ['/', '/cgi/url_redirect.cgi?url_name=topmenu', '/cgi/url_redirect.cgi?url_name=dashboard'];
-        case 'ilo4':
-            return ['/', '/index.html'];
         case 'idrac':
             return ['/', '/start.html'];
         case 'ami':
@@ -857,7 +859,7 @@ function ipmiWebProbeProxyFlowValidation(mysqli $mysqli, int $serverId, bool $e2
                 'loop_hint' => !empty($res['loop_hint']),
             ];
 
-            if (ipmiWebNormalizeBmcType($bmcType) === 'ilo4' && $path === '/') {
+            if (ipmiWebIsNormalizedIloType(ipmiWebNormalizeBmcType($bmcType)) && $path === '/') {
                 $final = strtolower((string) ($res['final_url'] ?? ''));
                 $iloLandingOk = str_contains($final, '/index.html') || str_contains($final, '/html/application.html');
                 if ($final !== '' && str_contains($final, '/ipmi_proxy.php/') && !$iloLandingOk) {
@@ -881,7 +883,7 @@ function ipmiWebProbeProxyFlowValidation(mysqli $mysqli, int $serverId, bool $e2
             if (!empty($res['logout_redirect']) && !empty($res['topmenu_redirect']) && !empty($res['loop_hint'])) {
                 return ['ok' => false, 'error' => 'proxy_logout_topmenu_loop:' . $path, 'checks' => $checks];
             }
-            $ignoreIloLoginMarker = (ipmiWebNormalizeBmcType($bmcType) === 'ilo4'
+            $ignoreIloLoginMarker = (ipmiWebIsNormalizedIloType(ipmiWebNormalizeBmcType($bmcType))
                 && ($path === '/html/application.html' || $path === '/index.html'));
             if (!empty($res['login_page']) && !$ignoreIloLoginMarker) {
                 return ['ok' => false, 'error' => 'proxy_login_page:' . $path, 'checks' => $checks];
@@ -996,7 +998,7 @@ function ipmiWebProbeProxyFlowValidation(mysqli $mysqli, int $serverId, bool $e2
                 return ['ok' => false, 'error' => 'proxy_supermicro_logout_instability', 'checks' => $checks];
             }
         }
-        if ($e2e && ipmiWebNormalizeBmcType($bmcType) === 'ilo4') {
+        if ($e2e && ipmiWebIsNormalizedIloType(ipmiWebNormalizeBmcType($bmcType))) {
             // iLO white-screen regressions often come from runtime auth drift:
             // shell HTML is 200 but /json/session_info flips to 401/403.
             $iloApiPath = '/json/session_info';
@@ -1233,7 +1235,10 @@ function ipmiWebProbeDeepUiValidation(array $session): array
         return ['ok' => false, 'error' => 'ui_http_' . $rootHttp . ':/', 'checks' => $checks];
     }
     $isSupermicro = ($type === 'supermicro');
-    if (!empty($root['login_page']) && !$isSupermicro) {
+    $iloRootShellOk = ipmiWebIsNormalizedIloType($type)
+        && !empty($root['body'])
+        && ipmiWebResponseLooksLikeIloAuthedShell((string) ($root['body'] ?? ''));
+    if (!empty($root['login_page']) && !$isSupermicro && !$iloRootShellOk) {
         return ['ok' => false, 'error' => 'ui_login_page:/', 'checks' => $checks];
     }
 
@@ -1296,7 +1301,7 @@ function ipmiWebProbeDeepUiValidation(array $session): array
         return ['ok' => true, 'checks' => $checks];
     }
 
-    if ($type === 'ilo4') {
+    if (ipmiWebIsNormalizedIloType($type)) {
         $app = ipmiWebProbeFetchUiPath($session, '/html/application.html');
         $checks[] = [
             'path' => '/html/application.html',

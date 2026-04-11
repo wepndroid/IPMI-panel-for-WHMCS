@@ -9,6 +9,7 @@ session_start();
 require_once __DIR__ . '/config.php';
 require_once __DIR__ . '/lib/login_redirect.php';
 require_once __DIR__ . '/lib/ipmi_web_session.php';
+require_once __DIR__ . '/lib/ipmi_proxy_debug.php';
 
 if (!isset($_SESSION['user_id'])) {
     ipmiRedirectUnauthenticatedToLogin();
@@ -46,7 +47,9 @@ try {
     $launchUrl = ipmiWebBuildProxyUrl((string) $sessionData['token'], $launchPath);
     if ($debugProxy) {
       $launchUrl .= (str_contains($launchUrl, '?') ? '&' : '?') . 'ipmi_proxy_debug=1';
-      error_log('ipmi_kvm kvm_launch_plan_selected ' . json_encode(ipmiWebKvmPlanLogSummary($launchPlan), JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE));
+      $summary = ipmiWebKvmPlanLogSummary($launchPlan);
+      error_log('ipmi_kvm kvm_launch_plan_selected ' . json_encode($summary, JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE));
+      ipmiProxyDebugLog('kvm_launch_plan_selected', $summary);
     }
     if (!$debugProxy) {
       header('Location: ' . $launchUrl, true, 302);
@@ -82,7 +85,17 @@ $title = 'KVM Console';
       <p style="margin:0 0 8px;font-size:13px;opacity:.75;">Direct debug URL:</p>
       <input type="text" readonly style="width:100%;padding:8px;border-radius:8px;border:1px solid #1f3550;background:#0f1b2b;color:#cfe6ff;" value="<?= htmlspecialchars((string) $launchUrl, ENT_QUOTES, 'UTF-8') ?>">
       <?php if (is_array($launchPlan)): ?>
-      <p style="margin:16px 0 8px;font-size:13px;opacity:.75;">Launch plan (vendor_family / mode / flags):</p>
+      <?php $planSum = ipmiWebKvmPlanLogSummary($launchPlan); ?>
+      <p style="margin:16px 0 8px;font-size:13px;opacity:.75;">Launch decision (summary):</p>
+      <dl style="font-size:13px;line-height:1.5;margin:0 0 14px;padding:12px;border-radius:8px;border:1px solid #1f3550;background:#0a1522;color:#cfe6ff;">
+        <dt style="opacity:.75;margin:0;">Raw BMC type</dt><dd style="margin:0 0 8px 0;"><?= htmlspecialchars((string) ($planSum['raw_bmc_type'] ?? ''), ENT_QUOTES, 'UTF-8') ?></dd>
+        <dt style="opacity:.75;margin:0;">Vendor family / variant</dt><dd style="margin:0 0 8px 0;"><?= htmlspecialchars((string) ($planSum['vendor_family'] ?? '') . ' / ' . (string) ($planSum['vendor_variant'] ?? ''), ENT_QUOTES, 'UTF-8') ?></dd>
+        <dt style="opacity:.75;margin:0;">Plan source</dt><dd style="margin:0 0 8px 0;"><?= htmlspecialchars((string) ($planSum['plan_source'] ?? '') . (isset($planSum['plan_cache_age_sec']) ? ' (cache age ' . (int) $planSum['plan_cache_age_sec'] . 's)' : ''), ENT_QUOTES, 'UTF-8') ?></dd>
+        <dt style="opacity:.75;margin:0;">Strategy / mode</dt><dd style="margin:0 0 8px 0;"><?= htmlspecialchars((string) ($planSum['launch_strategy'] ?? '') . ' — ' . (string) ($planSum['mode'] ?? ''), ENT_QUOTES, 'UTF-8') ?></dd>
+        <dt style="opacity:.75;margin:0;">Entry / shell / bootstrap paths</dt><dd style="margin:0 0 8px 0;word-break:break-all;"><?= htmlspecialchars((string) ($planSum['kvm_entry_path'] ?? '') . ' | shell: ' . (string) ($planSum['shell_entry'] ?? '') . ' | boot: ' . (string) ($planSum['console_boot'] ?? ''), ENT_QUOTES, 'UTF-8') ?></dd>
+        <dt style="opacity:.75;margin:0;">Selection note</dt><dd style="margin:0 0 0 0;word-break:break-word;"><?= htmlspecialchars((string) ($planSum['note'] ?? ''), ENT_QUOTES, 'UTF-8') ?></dd>
+      </dl>
+      <p style="margin:16px 0 8px;font-size:13px;opacity:.75;">Full launch plan JSON:</p>
       <pre style="white-space:pre-wrap;word-break:break-word;font-size:12px;line-height:1.45;padding:12px;border-radius:8px;border:1px solid #1f3550;background:#0a1522;color:#cfe6ff;max-height:420px;overflow:auto;"><?= htmlspecialchars(json_encode($launchPlan, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES), ENT_QUOTES, 'UTF-8') ?></pre>
       <?php endif; ?>
       <?php else: ?>
