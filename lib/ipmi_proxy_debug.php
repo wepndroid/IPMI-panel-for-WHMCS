@@ -17,6 +17,12 @@
  * kvm_plan_recomputed_after_auth_drift, kvm_plan_reused_after_shell_success,
  * kvm_launch_plan_selected, bmc_response_host_rewrite, ilo_/idrac_/supermicro_ console
  * progression events, ipmi_ws_relay_client_open / ipmi_ws_relay:* error_log lines when relay debug is on.
+ * iLO SPA/runtime continuity: ilo_runtime_preflight_*, ilo_runtime_sse_precheck, ilo_runtime_path_classified,
+ * ilo_runtime_auth_refresh_*, ilo_runtime_request_retry, ilo_runtime_fragment_recovered, ilo_runtime_sse_retry,
+ * ilo_runtime_final_failure.
+ * Blank-SPA diagnosis: many events carry blank_ui_cause or precheck_blank_ui with one of:
+ * auth_drift | sse_failure | fragment_bootstrap | upstream_transport | unknown
+ * (see ipmiProxyIloBlankUiCause in ipmi_proxy.php).
  */
 
 /** @var list<array{ts: float, event: string, context: array<string, mixed>}>|null */

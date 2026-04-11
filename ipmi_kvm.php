@@ -105,7 +105,7 @@ $title = 'KVM Console';
           'transport' => $planSum['transport_markers'] ?? [],
           'interactive' => $planSum['interactive_success_markers'] ?? [],
         ], JSON_UNESCAPED_SLASHES), ENT_QUOTES, 'UTF-8') ?></dd>
-        <dt style="opacity:.75;margin:0;">Runtime debug</dt><dd style="margin:0 0 8px 0;font-size:12px;">Open the KVM link with <code>?ipmi_proxy_debug=1</code> (or <code>?debug=1</code>). In the browser console, watch for <code>[ipmi-kvm]</code> events: shell → bootstrap → transport → interactive; <code>ilo_console_stalled</code> / <code>idrac_console_stalled</code> / <code>supermicro_console_stalled</code> show where progression stopped.</dd>
+        <dt style="opacity:.75;margin:0;">Runtime debug</dt><dd style="margin:0 0 8px 0;font-size:12px;">Open the KVM link with <code>?ipmi_proxy_debug=1</code> (or <code>?debug=1</code>). Browser console: <code>[ipmi-kvm]</code> vendor progression. Server <code>error_log</code>: iLO blank-SPA diagnosis via <code>ilo_runtime_preflight_*</code>, <code>ilo_runtime_auth_refresh_*</code>, <code>ilo_runtime_request_retry</code>, <code>ilo_runtime_sse_retry</code>, <code>ilo_runtime_final_failure</code> (no secrets).</dd>
         <dt style="opacity:.75;margin:0;">Selection note</dt><dd style="margin:0 0 0 0;word-break:break-word;"><?= htmlspecialchars((string) ($planSum['note'] ?? ''), ENT_QUOTES, 'UTF-8') ?></dd>
       </dl>
       <p style="margin:16px 0 8px;font-size:13px;opacity:.75;">Full launch plan JSON:</p>

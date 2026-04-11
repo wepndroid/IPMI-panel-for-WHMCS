@@ -2059,6 +2059,23 @@ function ipmiWebCleanupExpiredSessions(mysqli $mysqli): void
     $mysqli->query("DELETE FROM ipmi_web_sessions WHERE expires_at < NOW()");
 }
 
+/**
+ * Persist BMC cookie jar + forward headers after a runtime auth refresh (iLO/iDRAC JSON, SSE, etc.).
+ */
+function ipmiWebPersistRefreshedRuntimeAuth(mysqli $mysqli, string $token, array $session): void
+{
+    if (!preg_match('/^[a-f0-9]{64}$/', $token)) {
+        return;
+    }
+    $cookies = is_array($session['cookies'] ?? null) ? $session['cookies'] : [];
+    $forwardHeaders = is_array($session['forward_headers'] ?? null) ? $session['forward_headers'] : [];
+    $bmcScheme = (string) ($session['bmc_scheme'] ?? 'https');
+    ipmiWebSaveSessionCookies($mysqli, $token, $cookies, $forwardHeaders, $bmcScheme);
+    if (ipmiWebHasUsableBmcAuth($cookies, $forwardHeaders)) {
+        ipmiWebEmitMirroredBmcCookiesForProxy($token, $cookies);
+    }
+}
+
 function ipmiWebSaveSessionCookies(mysqli $mysqli, string $token, array $cookies, array $forwardHeaders = [], string $bmcScheme = 'https'): void
 {
     if (!preg_match('/^[a-f0-9]{64}$/', $token)) {
