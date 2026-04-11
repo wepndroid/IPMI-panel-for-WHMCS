@@ -101,6 +101,15 @@ $originLine = $originScheme . '://' . $preferredHost;
 if ($bmcPort !== $defaultPort) {
     $originLine .= ':' . $bmcPort;
 }
+$clientProto = trim((string) ($_SERVER['HTTP_SEC_WEBSOCKET_PROTOCOL'] ?? ''));
+$protoLine = '';
+if ($clientProto !== '' && strlen($clientProto) <= 512 && preg_match('/^[A-Za-z0-9\\s,;\\.\\-_]+$/', $clientProto)) {
+    $protoLine = 'Sec-WebSocket-Protocol: ' . $clientProto . "\r\n";
+    if (function_exists('ipmiProxyDebugEnabled') && ipmiProxyDebugEnabled()) {
+        error_log('ipmi_ws_relay: client_protocol_fwd=1');
+    }
+}
+
 $handshake = "GET {$wsPath} HTTP/1.1\r\n"
     . "Host: {$hostLine}\r\n"
     . "Upgrade: websocket\r\n"
@@ -108,6 +117,7 @@ $handshake = "GET {$wsPath} HTTP/1.1\r\n"
     . "Sec-WebSocket-Key: {$wsKey}\r\n"
     . "Sec-WebSocket-Version: 13\r\n"
     . "Origin: {$originLine}\r\n"
+    . $protoLine
     . $cookieHeader
     . $extraHeaders
     . "\r\n";
@@ -128,10 +138,14 @@ if (function_exists('ipmiProxyDebugEnabled') && ipmiProxyDebugEnabled()) {
     $cookiePresent = $cookieHeader !== '' ? 1 : 0;
     $extraHdrLines = $extraHeaders !== '' ? substr_count(trim($extraHeaders), "\n") : 0;
     $pathHasWs = (stripos($wsPath, 'ws') !== false || stripos($wsPath, 'irc') !== false || stripos($wsPath, 'kvm') !== false) ? 1 : 0;
+    $protoFwd = ($protoLine !== '') ? 1 : 0;
+    $pathFp = substr(hash('sha256', $wsPath), 0, 16);
     error_log('ipmi_ws_relay: pre_connect scheme=' . $tScheme . ' port=' . $bmcPort
         . ' pathLen=' . strlen($wsPath) . ' path_ws_hint=' . $pathHasWs
+        . ' path_fp=' . $pathFp
         . ' cookieHeader=' . $cookiePresent
         . ' forwardHdrLines=' . $extraHdrLines
+        . ' sec_ws_proto_fwd=' . $protoFwd
         . ' tls_to_bmc=' . ($useTls ? '1' : '0')
         . ' host_fwd=1 origin_fwd=1 host_kind=' . (filter_var($preferredHost, FILTER_VALIDATE_IP) ? 'ip' : 'name'));
 }
@@ -172,8 +186,14 @@ if (stripos($responseHeader, '101') === false) {
     if (function_exists('ipmiProxyDebugEnabled') && ipmiProxyDebugEnabled()) {
         $first = strtok($responseHeader, "\n");
         $hl = strtolower($responseHeader);
+        $upHttp = 0;
+        if (preg_match('/HTTP\/\S+\s+(\d{3})\b/', (string) $responseHeader, $hm)) {
+            $upHttp = (int) $hm[1];
+        }
         error_log('ipmi_ws_relay: handshake_no_101 firstLine=' . trim((string) $first)
+            . ' upstream_http=' . (string) $upHttp
             . ' hdrBytes=' . strlen($responseHeader)
+            . ' path_fp=' . substr(hash('sha256', $wsPath), 0, 16)
             . ' www_authenticate=' . (str_contains($hl, 'www-authenticate') ? '1' : '0')
             . ' has_location=' . (preg_match('/^location:\s/im', $responseHeader) ? '1' : '0')
             . ' has_set_cookie=' . (preg_match('/^set-cookie:\s/im', $responseHeader) ? '1' : '0'));

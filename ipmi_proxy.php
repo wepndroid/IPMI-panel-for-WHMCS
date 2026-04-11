@@ -94,6 +94,32 @@ function ipmiProxyRewriteWebSocketUrls(string $body, string $bmcHost, string $to
             $out = $tmp;
         }
     }
+    // Template literals: `wss://${host}/path` — rewrite when host token matches BMC (minified bundles).
+    $tplCb = static function (array $m) use ($bmcHost, $token): string {
+        $scheme = strtolower($m[1]);
+        $rest = (string) ($m[2] ?? '');
+        $fullTarget = $scheme . '://' . $bmcHost . ($rest !== '' ? $rest : '/');
+
+        return '`' . '/ipmi_ws_relay.php?token=' . rawurlencode($token) . '&target=' . rawurlencode($fullTarget) . '`';
+    };
+    $tplRe = '#`(wss|ws)\s*:\s*/\s*/\s*' . $q . '(?::\d+)?(/[^`$]*)?`#i';
+    $tmpTpl = preg_replace_callback($tplRe, $tplCb, $out);
+    if (is_string($tmpTpl)) {
+        $out = $tmpTpl;
+    }
+    // String concat: "wss://"+host+"/path" (common in obfuscated viewers)
+    $concatRe = '#(["\'])(wss|ws)\1\s*\+\s*["\']' . $q . '(?::\d+)?["\']\s*\+\s*(["\'])(/[^"\']*)?\3#i';
+    $tmpCo = preg_replace_callback($concatRe, static function (array $m) use ($bmcHost, $token): string {
+        $scheme = strtolower($m[2]);
+        $path = isset($m[4]) && $m[4] !== '' ? $m[4] : '/';
+        $fullTarget = $scheme . '://' . $bmcHost . $path;
+        $relay = '/ipmi_ws_relay.php?token=' . rawurlencode($token) . '&target=' . rawurlencode($fullTarget);
+
+        return json_encode($relay, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT);
+    }, $out);
+    if (is_string($tmpCo)) {
+        $out = $tmpCo;
+    }
 
     return $out;
 }
@@ -692,35 +718,86 @@ function ipmiProxyBuildKvmAutoLaunchLaunchGateJs(): string
 
 }
 
+/**
+ * Shared runtime signals: WebSocket relay usage, canvas-like nodes, stall bookkeeping (vendor ticks use this).
+ */
+function ipmiProxyBuildKvmRuntimeProgressHelpersJs(): string
+{
+    return ''
+        . 'var KVM_TMO=45000;try{KVM_TMO=parseInt(String((PLAN&&PLAN.console_ready_timeout_ms)||45000),10)||45000;}catch(_kt){KVM_TMO=45000;}'
+        . 'function kvmNow(){try{return Date.now();}catch(e){return 0;}}'
+        . 'function kvmTouchProgress(st){try{st.lastProgress=kvmNow();}catch(e){}}'
+        . 'function kvmWsRelaySeen(){try{var e=performance.getEntriesByType("resource"),i;for(i=0;i<e.length;i++){var n=String(e[i].name||"");if(n.indexOf("ipmi_ws_relay.php")>=0)return true;}}catch(e0){}'
+        . 'try{if(window.__ipmi_kvm_ws_relay_ts&&(kvmNow()-window.__ipmi_kvm_ws_relay_ts)<180000)return true;}catch(e1){}return false;}'
+        . 'function kvmVisibleCanvasLike(doc){try{'
+        . 'if(!doc||!doc.querySelectorAll)return false;'
+        . 'var C=doc.querySelectorAll("canvas");for(var i=0;i<C.length&&i<24;i++){var c=C[i];if(c&&c.width>80&&c.height>60)return true;}'
+        . 'var V=doc.querySelectorAll("video");if(V&&V.length)return true;'
+        . '}catch(e){}return false;}'
+        . 'function kvmAnyFrameCanvas(ctx){try{'
+        . 'var L=collectContexts();for(var i=0;i<L.length;i++){try{var d=L[i].document;if(d&&kvmVisibleCanvasLike(d))return true;}catch(e2){}}'
+        . '}catch(e3){}return false;}'
+        . 'function kvmIloRendererDetected(ctx){try{return !!(consoleVisible(ctx)||(ctx&&ctx.renderer&&ctx.renderer.connected));}catch(e){return false;}}'
+        . 'function kvmIloTransportDetected(){return kvmWsRelaySeen()||kvmIloRendererDetected(window);}'
+        . 'function kvmIloInteractiveLikely(ctx){'
+        . 'if(kvmIloRendererDetected(ctx))return true;'
+        . 'try{if(rcWindowVisible(ctx))return true;}catch(e0){}'
+        . 'return kvmAnyFrameCanvas(ctx);'
+        . '}'
+        . 'function kvmHookWsRelayProbe(){try{'
+        . 'if(!window.WebSocket||window.__ipmi_kvm_ws_progress_hook)return;'
+        . 'window.__ipmi_kvm_ws_progress_hook=true;var W0=window.WebSocket;'
+        . 'window.WebSocket=function(u,p){try{if(typeof u==="string"&&u.indexOf("ipmi_ws_relay.php")>=0){window.__ipmi_kvm_ws_relay_ts=kvmNow();try{_kvmDbg("ipmi_ws_relay_client_open",String(u).substring(0,96));}catch(e1){}}}catch(e2){}'
+        . 'return new W0(u,p);};window.WebSocket.prototype=W0.prototype;'
+        . '}catch(e3){}}'
+        . 'kvmHookWsRelayProbe();'
+        . 'function kvmIdracViewerBootstrap(){try{'
+        . 'var p=pathLower();if(p.indexOf("viewer")>=0||p.indexOf("console")>=0)return true;'
+        . 'var b=String(document.body&&document.body.innerHTML||"").toLowerCase();'
+        . 'return b.indexOf("avct")>=0||b.indexOf("vmrc")>=0||b.indexOf("websocket")>=0;'
+        . '}catch(e){return false;}}'
+        . 'function kvmIdracTransportLikely(){return kvmWsRelaySeen()||kvmIdracViewerBootstrap();}'
+        . 'function kvmIdracInteractiveLikely(){try{return kvmVisibleCanvasLike(document)||kvmAnyFrameCanvas(window);}catch(e){return false;}}'
+        . 'function kvmSupermicroInteractiveLikely(){try{'
+        . 'if(kvmVisibleCanvasLike(document))return true;'
+        . 'var b=String(document.body&&document.body.innerHTML||"").toLowerCase();'
+        . 'return b.indexOf("ikvm")>=0&&b.indexOf("canvas")>=0;'
+        . '}catch(e){return false;}}';
+}
+
 function ipmiProxyBuildIloKvmScript(): string
 {
     return 'if(FAMILY==="ilo"){'
         . 'var pl=pathLower();'
         . 'if(pl.indexOf("/html/rc_info.html")!==-1&&!hasIloRendererHost(window)&&(!window.parent||window.parent===window)){go("/html/application.html?ipmi_kvm_auto=1");return;}'
-        . 'var n=0,max=220;'
+        . 'var n=0,max=Math.max(220,Math.ceil(KVM_TMO/220));'
+        . 'var iloSt={phase:0,lastProgress:kvmNow(),clicks:0,navAttempts:0,reported:{boot:false,launch:false,trans:false,inter:false},stall:false};'
         . '(function tick(){'
         . 'n++;'
         . 'var ctx=collectContexts();'
         . 'var shell=getIloShellHost(window);'
         . 'var rootCtx=null;'
         . 'try{rootCtx=(window.top&&window.top.document&&window.top.document.getElementById&&window.top.document.getElementById("appFrame"))?window.top:window;}catch(_eroot){rootCtx=window;}'
-        . 'if(rootCtx){ensureIloIndexAppLoaded(rootCtx);}'
-        . 'if(shell){if(!shell.__ipmi_dbg_shell){try{shell.__ipmi_dbg_shell=1;_kvmDbg("ilo_shell_detected",1);}catch(ds){}}forceSameTabOpen(shell);ensureIloFrameResizeShim(shell);ensureIloStartPatched(shell);ensureIloGlobalStartPatched(shell);wireIloAppFrame(shell);ensureIloShellLoaded(shell);ensureIloRcPageLoaded(shell);if((n%8)===0){clearIloStaleRenderer(shell);}}'
-        . 'for(var i=0;i<ctx.length;i++){forceSameTabOpen(ctx[i]);ensureIloFrameResizeShim(ctx[i]);ensureIloStartPatched(ctx[i]);ensureIloGlobalStartPatched(ctx[i]);wireIloAppFrame(ctx[i]);ensureIloRcButtonPatched(ctx[i]);if((n%8)===0){clearIloStaleRenderer(ctx[i]);}if(consoleVisible(ctx[i])){_kvmDbg("ilo_native_launch_success_guess",1);markDone();return;}}'
-        . 'if(n===1||(n%3===0)){'
-        . 'var started=false,rcReady=false;'
-        . 'if(shell){ensureIloShellLoaded(shell);ensureIloRcPageLoaded(shell);}'
-        . 'for(var r=0;r<ctx.length;r++){if(hasIloRcPage(ctx[r])||findIloHtml5Button(ctx[r])){rcReady=true;}}'
-        . 'if(rcReady){_kvmDbg("ilo_html5_markers_found",rcReady);'
-        . 'var directTop=getIloDirectTopRenderer(window);'
-        . 'if(directTop){_kvmDbg("ilo_direct_renderer_attempt",1);started=callStart(directTop);}'
-        . 'for(var b=0;b<ctx.length;b++){if(callStart(ctx[b])){started=true;break;}}'
-        . 'if(!started){for(var h=0;h<ctx.length;h++){if(callIloStart(ctx[h])){started=true;break;}}}'
-        . 'if(!started){for(var k=0;k<ctx.length;k++){if(clickHtml5Anchor(ctx[k])){started=true;break;}}}'
-        . '}'
-        . '}'
-        . 'for(var m=0;m<ctx.length;m++){if(consoleVisible(ctx[m])){_kvmDbg("ilo_native_launch_success_guess",1);markDone();return;}}'
-        . 'if(n>=max){_kvmDbg("ilo_native_launch_stalled",n);return;}'
+        . 'if(rootCtx){if(ensureIloIndexAppLoaded(rootCtx)){kvmTouchProgress(iloSt);}}'
+        . 'if(shell){if(!shell.__ipmi_dbg_shell){try{shell.__ipmi_dbg_shell=1;kvmTouchProgress(iloSt);_kvmDbg("ilo_shell_detected",1);}catch(ds){}}forceSameTabOpen(shell);ensureIloFrameResizeShim(shell);ensureIloStartPatched(shell);ensureIloGlobalStartPatched(shell);wireIloAppFrame(shell);ensureIloShellLoaded(shell);ensureIloRcPageLoaded(shell);if((n%8)===0){clearIloStaleRenderer(shell);}}'
+        . 'var rcPage=false,btnFound=false;'
+        . 'for(var ri=0;ri<ctx.length;ri++){if(hasIloRcPage(ctx[ri])){rcPage=true;}if(findIloHtml5Button(ctx[ri])){btnFound=true;}}'
+        . 'if(rcPage&&!iloSt.reported.boot){iloSt.reported.boot=true;kvmTouchProgress(iloSt);try{_kvmDbg("ilo_bootstrap_route_ready",1);}catch(eb){}}'
+        . 'if(btnFound&&!iloSt.reported.launch){iloSt.reported.launch=true;kvmTouchProgress(iloSt);try{_kvmDbg("ilo_launch_control_found",1);}catch(el){}}'
+        . 'for(var i=0;i<ctx.length;i++){forceSameTabOpen(ctx[i]);ensureIloFrameResizeShim(ctx[i]);ensureIloStartPatched(ctx[i]);ensureIloGlobalStartPatched(ctx[i]);wireIloAppFrame(ctx[i]);ensureIloRcButtonPatched(ctx[i]);if((n%8)===0){clearIloStaleRenderer(ctx[i]);}'
+        . 'if(kvmIloInteractiveLikely(ctx[i])){if(!iloSt.reported.inter){iloSt.reported.inter=true;try{_kvmDbg("ilo_console_interactive_likely",1);}catch(ei){}}kvmTouchProgress(iloSt);_kvmDbg("ilo_renderer_detected",1);markDone();return;}}'
+        . 'if(kvmIloTransportDetected()&&!iloSt.reported.trans){iloSt.reported.trans=true;kvmTouchProgress(iloSt);try{_kvmDbg("ilo_transport_detected",1);}catch(et){}}'
+        . 'var started=false,rcReady=rcPage||btnFound;'
+        . 'if(rcReady){'
+        . 'if(iloSt.phase===0){var directTop=getIloDirectTopRenderer(window);if(directTop){_kvmDbg("ilo_direct_renderer_attempt",1);if(callStart(directTop)){started=true;iloSt.phase=1;kvmTouchProgress(iloSt);try{_kvmDbg("ilo_launch_function_invoked","direct");}catch(e0){}}}}'
+        . 'if(!started&&iloSt.phase<=1){for(var b=0;b<ctx.length;b++){if(callStart(ctx[b])){started=true;iloSt.phase=2;kvmTouchProgress(iloSt);try{_kvmDbg("ilo_launch_function_invoked","renderer_ctx");}catch(e1){}break;}}}'
+        . 'if(!started&&iloSt.phase<=2){for(var h=0;h<ctx.length;h++){if(callIloStart(ctx[h])){started=true;iloSt.phase=3;kvmTouchProgress(iloSt);try{_kvmDbg("ilo_launch_function_invoked","ilo_start");}catch(e2){}break;}}}'
+        . 'if(!started&&iloSt.phase<=3&&(n%6===0)){iloSt.clicks++;if(iloSt.clicks<=8){for(var k=0;k<ctx.length;k++){if(clickHtml5Anchor(ctx[k],false)){started=true;kvmTouchProgress(iloSt);try{_kvmDbg("ilo_launch_function_invoked","click");}catch(e3){}break;}}}}'
+        . 'if(!started&&iloSt.phase<=4&&shell&&(n%10===0)&&iloSt.navAttempts<3){iloSt.navAttempts++;if(ensureIloRcPageLoaded(shell)){iloSt.phase=4;kvmTouchProgress(iloSt);try{_kvmDbg("ilo_rc_info_navigation","phase");}catch(e4){}}}}'
+        . 'if(!rcReady&&iloSt.phase===0&&n<=16){var dtEarly=getIloDirectTopRenderer(window);if(dtEarly){_kvmDbg("ilo_direct_renderer_attempt",1);if(callStart(dtEarly)){iloSt.phase=1;kvmTouchProgress(iloSt);try{_kvmDbg("ilo_launch_function_invoked","direct_early");}catch(e5){}}}}'
+        . 'if(!iloSt.stall&&(kvmNow()-iloSt.lastProgress)>KVM_TMO){iloSt.stall=true;try{_kvmDbg("ilo_console_stalled",{ticks:n,phase:iloSt.phase,clicks:iloSt.clicks,no_transport:!iloSt.reported.trans});}catch(es){}}'
+        . 'if(iloSt.stall){return;}'
+        . 'if(n>=max){try{_kvmDbg("ilo_console_stalled",{ticks:n,reason:"max_ticks"});}catch(em){}return;}'
         . 'setTimeout(tick,250);'
         . '})();'
         . 'return;'
@@ -733,7 +810,9 @@ function ipmiProxyBuildIdracKvmScript(): string
     return 'if(FAMILY==="idrac"){'
         . 'var wantDr=(PLAN&&PLAN.kvm_entry_path)?String(PLAN.kvm_entry_path):"/index.html";'
         . 'var bootDr=(PLAN&&PLAN.console_bootstrap_path)?String(PLAN.console_bootstrap_path):"/viewer.html";'
+        . 'var _idrN=0,_idrBooted=false,_idrSt={lastProgress:kvmNow(),clicks:0,navs:0,reported:{boot:false,launch:false,trans:false},stall:false};'
         . '_kvmDbg("idrac_shell_detected",pathLower());'
+        . 'kvmTouchProgress(_idrSt);'
         . 'try{'
         . 'if(window.sessionStorage&&!sessionStorage.getItem("_ipmi_idrac_autonav")){'
         . 'sessionStorage.setItem("_ipmi_idrac_autonav","1");'
@@ -745,18 +824,25 @@ function ipmiProxyBuildIdracKvmScript(): string
         . '}'
         . '}'
         . '}catch(_idr0){}'
-        . 'var _idrN=0,_idrBooted=false;(function _idrTick(){_idrN++;'
+        . '(function _idrTick(){_idrN++;'
         . 'try{'
         . 'var _b=String(document.body&&document.body.innerText||"").toLowerCase();'
-        . 'if(_b.indexOf("virtual")>=0&&_b.indexOf("console")>=0){_kvmDbg("idrac_viewer_markers_found",1);}'
+        . 'if(_b.indexOf("virtual")>=0&&_b.indexOf("console")>=0){kvmTouchProgress(_idrSt);if(!_idrSt.reported.boot){_idrSt.reported.boot=true;_kvmDbg("idrac_viewer_bootstrap_detected",1);}}'
+        . 'if(kvmIdracViewerBootstrap()){kvmTouchProgress(_idrSt);}'
+        . 'if(kvmIdracTransportLikely()&&!_idrSt.reported.trans){_idrSt.reported.trans=true;kvmTouchProgress(_idrSt);_kvmDbg("idrac_transport_detected",1);}'
+        . 'if(kvmIdracInteractiveLikely()){_kvmDbg("idrac_console_interactive_likely",1);markDone();return;}'
         . 'var _L=document.querySelectorAll("a[href],button,[role=button],input[type=button]");'
         . 'for(var _i=0;_i<_L.length;_i++){'
         . 'var _e=_L[_i],_h=String(_e.getAttribute("href")||"").toLowerCase(),_x=String(_e.textContent||"").toLowerCase();'
-        . 'if(_h.indexOf("viewer")>=0||_h.indexOf("console")>=0||(_x.indexOf("virtual")>=0&&_x.indexOf("console")>=0)||(_x.indexOf("launch")>=0&&_x.indexOf("console")>=0)||_x.indexOf("kvm")>=0&&_x.indexOf("launch")>=0){_kvmDbg("idrac_launch_candidate_found",_h||_x);try{_e.click();markDone();return;}catch(ec){}}'
+        . 'if(_h.indexOf("viewer")>=0||_h.indexOf("console")>=0||(_x.indexOf("virtual")>=0&&_x.indexOf("console")>=0)||(_x.indexOf("launch")>=0&&_x.indexOf("console")>=0)||(_x.indexOf("kvm")>=0&&_x.indexOf("launch")>=0)){'
+        . 'if(!_idrSt.reported.launch){_idrSt.reported.launch=true;_kvmDbg("idrac_launch_control_found",_h||_x);}'
+        . 'if(_idrN%4===0&&_idrSt.clicks<6){_idrSt.clicks++;kvmTouchProgress(_idrSt);try{_e.click();}catch(ec){}}'
+        . '}'
         . '}'
         . '}catch(_idr1){}'
-        . 'if(!_idrBooted&&_idrN>=22&&bootDr&&pathLower().indexOf("viewer")<0&&pathLower().indexOf("console")<0){_idrBooted=true;_kvmDbg("idrac_console_navigation",bootDr);try{go(bootDr);return;}catch(eb){}}'
-        . 'if(_idrN>=100){_kvmDbg("idrac_native_launch_stalled",_idrN);return;}'
+        . 'if(!_idrBooted&&_idrN>=26&&bootDr&&pathLower().indexOf("viewer")<0&&pathLower().indexOf("console")<0&&_idrN%12===0){_idrBooted=true;_idrSt.navs++;if(_idrSt.navs<=2){_kvmDbg("idrac_console_navigation",bootDr);try{go(bootDr);return;}catch(eb){}}}'
+        . 'if(!_idrSt.stall&&(kvmNow()-_idrSt.lastProgress)>KVM_TMO){_idrSt.stall=true;_kvmDbg("idrac_console_stalled",{ticks:_idrN,clicks:_idrSt.clicks,no_transport:!_idrSt.reported.trans});return;}'
+        . 'if(_idrN>=120){_kvmDbg("idrac_console_stalled",{ticks:_idrN,reason:"max_ticks"});return;}'
         . 'setTimeout(_idrTick,380);'
         . '})();'
         . 'return;}';
@@ -767,9 +853,12 @@ function ipmiProxyBuildSupermicroKvmScript(): string
 {
     return 'if(FAMILY==="supermicro"){'
         . 'var wantSm=(PLAN&&PLAN.kvm_entry_path)?String(PLAN.kvm_entry_path):"/cgi/url_redirect.cgi?url_name=ikvm&url_type=html5";'
+        . 'var _smN=0,_smSt={lastProgress:kvmNow(),clicks:0,reported:{boot:false,trans:false},stall:false};'
         . 'try{'
         . 'var _smBody=String(document.body&&document.body.innerText||"").toLowerCase();'
-        . 'if(_smBody.indexOf("supermicro")>=0||_smBody.indexOf("topmenu")>=0||location.href.indexOf("topmenu")>=0){_kvmDbg("supermicro_shell_detected",1);}'
+        . 'if(_smBody.indexOf("supermicro")>=0||_smBody.indexOf("topmenu")>=0||location.href.indexOf("topmenu")>=0){'
+        . 'if(!window.__ipmi_sm_shell_tp){window.__ipmi_sm_shell_tp=1;kvmTouchProgress(_smSt);}'
+        . '_kvmDbg("supermicro_shell_detected",1);}'
         . '_kvmDbg("supermicro_html5_route_selected",wantSm);'
         . 'if(window.sessionStorage&&!sessionStorage.getItem("_ipmi_sm_autonav")){'
         . 'sessionStorage.setItem("_ipmi_sm_autonav","1");'
@@ -780,15 +869,21 @@ function ipmiProxyBuildSupermicroKvmScript(): string
         . '}'
         . '}'
         . '}catch(_sm0){}'
-        . 'var _smN=0;(function _smTick(){_smN++;'
+        . '(function _smTick(){_smN++;'
         . 'try{'
+        . 'if(String(location.search||"").toLowerCase().indexOf("html5")>=0||String(location.pathname||"").toLowerCase().indexOf("ikvm")>=0){if(!_smSt.reported.boot){_smSt.reported.boot=true;kvmTouchProgress(_smSt);_kvmDbg("supermicro_bootstrap_detected",1);}}'
+        . 'if(kvmWsRelaySeen()&&!_smSt.reported.trans){_smSt.reported.trans=true;kvmTouchProgress(_smSt);_kvmDbg("supermicro_transport_detected",1);}'
+        . 'if(kvmSupermicroInteractiveLikely()){_kvmDbg("supermicro_console_interactive_likely",1);markDone();return;}'
         . 'var _L2=document.querySelectorAll("a[href],button,[role=button],input[type=button],area[href]");'
         . 'for(var _j=0;_j<_L2.length;_j++){'
         . 'var _e2=_L2[_j],_h2=String(_e2.getAttribute("href")||"").toLowerCase(),_x2=String(_e2.textContent||"").toLowerCase();'
-        . 'if(_h2.indexOf("ikvm")>=0||_h2.indexOf("kvm")>=0||_x2.indexOf("ikvm")>=0||(_x2.indexOf("kvm")>=0&&(_x2.indexOf("launch")>=0||_x2.indexOf("remote")>=0))){_kvmDbg("supermicro_click_candidate_found",_h2||_x2);try{_e2.click();markDone();return;}catch(ec2){}}'
+        . 'if(_h2.indexOf("ikvm")>=0||_h2.indexOf("kvm")>=0||_x2.indexOf("ikvm")>=0||(_x2.indexOf("kvm")>=0&&(_x2.indexOf("launch")>=0||_x2.indexOf("remote")>=0))){'
+        . 'if(_smN%5===0&&_smSt.clicks<7){_smSt.clicks++;kvmTouchProgress(_smSt);_kvmDbg("supermicro_click_candidate_found",_h2||_x2);try{_e2.click();}catch(ec2){}}'
+        . '}'
         . '}'
         . '}catch(_sm1){}'
-        . 'if(_smN>=95){_kvmDbg("supermicro_native_launch_stalled",_smN);return;}'
+        . 'if(!_smSt.stall&&(kvmNow()-_smSt.lastProgress)>KVM_TMO){_smSt.stall=true;_kvmDbg("supermicro_console_stalled",{ticks:_smN,clicks:_smSt.clicks});return;}'
+        . 'if(_smN>=110){_kvmDbg("supermicro_console_stalled",{ticks:_smN,reason:"max_ticks"});return;}'
         . 'setTimeout(_smTick,420);'
         . '})();'
         . 'return;}';
@@ -815,6 +910,12 @@ function ipmiProxyInjectKvmAutoLaunchPatch(string $html, string $token, $session
         $session = $sessionOrLegacyBmcType;
     }
     $plan = $launchPlan ?? ipmiWebResolveKvmLaunchPlan($session);
+    if (ipmiProxyDebugEnabled() && ($plan['debug']['plan_source'] ?? '') === 'cache_hit') {
+        ipmiProxyDebugLog('kvm_plan_reused_after_shell_success', [
+            'vendor_family'  => (string) ($plan['vendor_family'] ?? ''),
+            'launch_strategy'=> (string) ($plan['launch_strategy'] ?? ''),
+        ]);
+    }
     $planLite = [
         'kvm_entry_path' => (string) ($plan['kvm_entry_path'] ?? '/'),
         'fallback_path'  => (string) ($plan['fallback_path'] ?? '/'),
@@ -823,6 +924,10 @@ function ipmiProxyInjectKvmAutoLaunchPatch(string $html, string $token, $session
         'shell_entry_path' => (string) ($plan['shell_entry_path'] ?? ''),
         'console_bootstrap_path' => (string) ($plan['console_bootstrap_path'] ?? ''),
         'requires_client_bootstrap' => !empty($plan['requires_client_bootstrap']),
+        'console_ready_timeout_ms' => (int) ($plan['console_ready_timeout_ms'] ?? 45000),
+        'bootstrap_markers' => is_array($plan['bootstrap_markers'] ?? null) ? $plan['bootstrap_markers'] : [],
+        'transport_markers' => is_array($plan['transport_markers'] ?? null) ? $plan['transport_markers'] : [],
+        'interactive_success_markers' => is_array($plan['interactive_success_markers'] ?? null) ? $plan['interactive_success_markers'] : [],
     ];
     $familyJs = json_encode((string) ($plan['vendor_family'] ?? 'generic'), JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_SLASHES);
     $planJs = json_encode($planLite, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_SLASHES);
@@ -833,6 +938,7 @@ function ipmiProxyInjectKvmAutoLaunchPatch(string $html, string $token, $session
     $patch = '<script data-ipmi-proxy-kvm-autolaunch="1">'
         . ipmiProxyBuildKvmAutoLaunchPreambleJs($familyJs, $planJs, $pxJs, $autoJs, $dbgLit)
         . ipmiProxyBuildKvmAutoLaunchIloDomHelpersJs()
+        . ipmiProxyBuildKvmRuntimeProgressHelpersJs()
         . ipmiProxyBuildKvmAutoLaunchLaunchGateJs()
         . ipmiProxyBuildIloKvmScript()
         . ipmiProxyBuildIdracKvmScript()
@@ -1305,6 +1411,13 @@ if (session_status() === PHP_SESSION_ACTIVE) {
 $ipmiTraceId = '';
 if (ipmiProxyDebugEnabled()) {
     $ipmiTraceId = ipmiProxyDebugSendTraceHeaders();
+}
+
+if (isset($_GET['ipmi_kvm_replan']) && (string) $_GET['ipmi_kvm_replan'] === '1') {
+    $GLOBALS['__ipmi_kvm_force_replan_for_token'] = $token;
+    if (ipmiProxyDebugEnabled()) {
+        ipmiProxyDebugLog('kvm_plan_replan_query', ['trace' => $ipmiTraceId]);
+    }
 }
 
 $bmcIp = $session['ipmi_ip'];
@@ -3118,6 +3231,13 @@ if ($method === 'GET' && $httpCode === 200 && $isHtml && !$isAssetPath
                 'bmcPath' => $bmcPath,
                 'timeoutText' => $hasTimeoutText ? 1 : 0,
                 'smTimeoutShell' => $looksLikeSmTimeoutShell ? 1 : 0,
+            ]);
+        }
+        ipmiWebKvmLaunchPlanCacheInvalidate($token);
+        if (ipmiProxyDebugEnabled()) {
+            ipmiProxyDebugLog('kvm_plan_recomputed_after_auth_drift', [
+                'trace' => $ipmiTraceId,
+                'bmcPath' => $bmcPath,
             ]);
         }
         ipmiProxyEmitSessionExpiredPage('Your session has timed out. You will need to open a new session.');

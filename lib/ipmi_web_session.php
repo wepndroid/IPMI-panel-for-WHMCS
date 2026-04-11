@@ -1372,6 +1372,9 @@ function ipmiWebResponseLooksLikeBmcLoginPage(string $body, string $contentType)
     if (ipmiWebResponseLooksLikeIdracAuthedShell($body)) {
         return false;
     }
+    if (ipmiWebResponseLooksLikeAmiSpaLogin($body)) {
+        return false;
+    }
     $maybeHtml = strpos($ct, 'html') !== false
         || strpos($ct, 'text/plain') !== false
         || strpos($l, '<html') !== false
@@ -1383,6 +1386,13 @@ function ipmiWebResponseLooksLikeBmcLoginPage(string $body, string $contentType)
         return false;
     }
     if (strpos($l, 'session has timed out') !== false || strpos($l, 'session timed out') !== false) {
+        // Vendor shells ship timeout strings in JS/help text; do not treat as login if shell markers match full body.
+        if (ipmiWebResponseLooksLikeIloAuthedShell($body)
+            || ipmiWebResponseLooksLikeIdracAuthedShell($body)
+            || ipmiWebResponseLooksLikeSupermicroAuthedShell($body)) {
+            return false;
+        }
+
         return true;
     }
     $hasPw = strpos($l, 'type="password"') !== false
@@ -1494,6 +1504,15 @@ function ipmiWebResponseLooksLikeIloAuthedShell(string $body): bool
         $hits++;
     }
     if (str_contains($l, 'hpe') && str_contains($l, 'integrated remote console')) {
+        $hits++;
+    }
+    if (str_contains($l, '/js/ilo.js') || str_contains($l, 'ilo.js')) {
+        $hits++;
+    }
+    if (str_contains($l, 'id="ircwindow"') || str_contains($l, 'id=ircwindow')) {
+        $hits++;
+    }
+    if (str_contains($l, 'content.html') && str_contains($l, 'framecontent')) {
         $hits++;
     }
 
@@ -2555,7 +2574,7 @@ function ipmiWebInferBmcTypeFromAutologin(string $currentTypeNorm, string $pathU
 
     $path = strtolower(trim($pathUsed));
     if ($path === '/json/login_session') {
-        return 'ilo4';
+        return 'ilo5';
     }
     if ($path === '/data/login' || $path === '/login.html' || str_starts_with($path, '/restgui/')) {
         return 'idrac';
@@ -2572,13 +2591,30 @@ function ipmiWebInferBmcTypeFromAutologin(string $currentTypeNorm, string $pathU
     if (strpos($lb, 'supermicro') !== false || strpos($lb, 'asrockrack') !== false || strpos($lb, 'aten') !== false) {
         return 'supermicro';
     }
-    if (strpos($lb, 'integrated lights-out') !== false || strpos($lb, 'hewlett') !== false || strpos($lb, 'hpe') !== false || strpos($lb, ' ilo') !== false) {
+    // Classic iLO 4 HTML UI (no iLO 5/6 SPA shell markers).
+    if ((strpos($lb, 'login.htm') !== false || strpos($lb, 'cpqlogin') !== false || strpos($lb, 'javascript/cpq') !== false)
+        && strpos($lb, 'iloglobal') === false
+        && strpos($lb, '/html/application.html') === false
+        && strpos($lb, 'starthtml5irc') === false) {
         return 'ilo4';
+    }
+    if (strpos($lb, 'integrated lights-out') !== false || strpos($lb, 'hewlett') !== false || strpos($lb, 'hpe') !== false || strpos($lb, ' ilo') !== false) {
+        return 'ilo5';
     }
     if (strpos($lb, 'idrac') !== false || strpos($lb, 'dell') !== false || strpos($lb, '/restgui/') !== false) {
         return 'idrac';
     }
-    if (strpos($lb, 'commonutil.js') !== false || strpos($lb, 'source.min.js') !== false || strpos($lb, '/html/application.html') !== false) {
+    // iLO 5/6 SPA bundles (do not classify as AMI — ASRock uses different entry fingerprints).
+    if (strpos($lb, '/html/application.html') !== false
+        || strpos($lb, 'iloglobal') !== false
+        || strpos($lb, 'starthtml5irc') !== false
+        || strpos($lb, 'framecontent') !== false) {
+        return 'ilo5';
+    }
+    if (strpos($lb, 'commonutil.js') !== false || strpos($lb, 'source.min.js') !== false) {
+        return 'ilo5';
+    }
+    if (strpos($lb, 'id="ami_logo"') !== false || strpos($lb, "id='ami_logo'") !== false || strpos($lb, '/api/session') !== false) {
         return 'ami';
     }
 
@@ -3292,7 +3328,8 @@ function ipmiWebBmcVariant(string $bmcType): string
         return 'ilo' . (int) $m[1];
     }
     if ($raw === 'ilo' || $raw === 'hpe' || $raw === 'hp') {
-        return 'ilo4';
+        // Unknown generation: prefer ilo5 for HTML5/Redfish-first behavior; explicit ilo4/ilo6 still come from DB.
+        return 'ilo5';
     }
     if (preg_match('/idrac\s*([0-9]{1,2})\b/i', $raw, $m)) {
         return 'idrac' . (int) $m[1];
@@ -3344,10 +3381,11 @@ function ipmiWebNormalizeBmcType(string $bmcType): string
         return 'ilo' . (int) $m[1];
     }
     if ($type === 'ilo' || $type === 'hpe' || $type === 'hp') {
-        return 'ilo4';
+        return 'ilo5';
     }
+    // Unnumbered "ilo" substring in free-text labels (e.g. vendor strings): default to ilo5, not legacy ilo4.
     if (str_contains($type, 'ilo')) {
-        return 'ilo4';
+        return 'ilo5';
     }
 
     return 'generic';
@@ -3516,7 +3554,19 @@ function ipmiWebResolveKvmLaunchPlan(array $session): array
         $g = [];
     }
     $cacheKey = ipmiWebKvmLaunchPlanCacheKey($session);
-    if (isset($g[$cacheKey]) && is_array($g[$cacheKey])) {
+    $tok = (string) ($session['token'] ?? '');
+    $forceReplan = $tok !== ''
+        && isset($GLOBALS['__ipmi_kvm_force_replan_for_token'])
+        && is_string($GLOBALS['__ipmi_kvm_force_replan_for_token'])
+        && hash_equals($tok, $GLOBALS['__ipmi_kvm_force_replan_for_token']);
+    if ($forceReplan) {
+        unset($GLOBALS['__ipmi_kvm_force_replan_for_token']);
+        if (function_exists('ipmiProxyDebugLog') && function_exists('ipmiProxyDebugEnabled') && ipmiProxyDebugEnabled()) {
+            ipmiProxyDebugLog('kvm_plan_recomputed_after_stall', [
+                'vendor_family' => ipmiWebBmcFamily((string) ($session['bmc_type'] ?? 'generic')),
+            ]);
+        }
+    } elseif (isset($g[$cacheKey]) && is_array($g[$cacheKey])) {
         $age = time() - (int) ($g[$cacheKey]['t'] ?? 0);
         if ($age >= 0 && $age < 120 && is_array($g[$cacheKey]['plan'] ?? null)) {
             $cachedPlan = $g[$cacheKey]['plan'];
@@ -3540,7 +3590,9 @@ function ipmiWebResolveKvmLaunchPlan(array $session): array
             $reason = ($staleAge >= 120) ? 'expired' : 'invalid_shape';
         }
         $fam = ipmiWebBmcFamily((string) ($session['bmc_type'] ?? 'generic'));
-        if ($reason === 'expired') {
+        if ($forceReplan) {
+            // Already logged kvm_plan_recomputed_after_stall
+        } elseif ($reason === 'expired') {
             ipmiProxyDebugLog('kvm_plan_recomputed', ['reason' => $reason, 'vendor_family' => $fam]);
         } else {
             ipmiProxyDebugLog('kvm_plan_cache_miss', ['reason' => $reason, 'vendor_family' => $fam]);
@@ -3574,6 +3626,11 @@ function ipmiWebResolveKvmLaunchPlan(array $session): array
         'renderer_direct_possible' => false,
         'html5_markers'       => false,
         'requires_client_bootstrap' => false,
+        'console_ready_timeout_ms' => 45000,
+        'interactive_success_markers' => ['renderer_connected', 'visible_canvas', 'ws_relay_seen'],
+        'bootstrap_markers'   => [],
+        'transport_markers'   => ['ipmi_ws_relay', 'websocket'],
+        'stall_markers'       => ['no_transport', 'no_interactive', 'known_error_text'],
         'debug'               => $debug,
     ];
 
@@ -3630,6 +3687,10 @@ function ipmiWebResolveKvmLaunchPlan(array $session): array
         $plan['debug']['selection_note'] = 'iLO: strategy=' . $strategy . '; ranked_top=' . $bestPath
             . '; html5=' . ($iloHtml5 ? '1' : '0') . '; score=' . (int) ($bestProbe['score'] ?? 0);
         $plan['debug']['ilo_html5_probe'] = $iloHtml5 ? 1 : 0;
+        $plan['console_ready_timeout_ms'] = 52000;
+        $plan['bootstrap_markers'] = ['ilo_shell', 'ilo_rc_bootstrap', 'ilo_html5_markers'];
+        $plan['transport_markers'] = ['ipmi_ws_relay', 'websocket', 'renderer_connected'];
+        $plan['interactive_success_markers'] = ['console_visible', 'irc_window', 'canvas'];
 
         $g[$cacheKey] = ['t' => time(), 'plan' => $plan];
 
@@ -3679,6 +3740,10 @@ function ipmiWebResolveKvmLaunchPlan(array $session): array
         $plan['launch_strategy'] = 'idrac_' . preg_replace('#[^a-z0-9]+#i', '_', $picked);
         $plan['renderer_direct_possible'] = !empty($pr['browser_native_like']);
         $plan['requires_client_bootstrap'] = !empty($plan['needs_runtime_patch']);
+        $plan['console_ready_timeout_ms'] = 48000;
+        $plan['bootstrap_markers'] = ['idrac_shell', 'idrac_viewer_markers', 'idrac_launcher'];
+        $plan['transport_markers'] = ['ipmi_ws_relay', 'websocket', 'avct'];
+        $plan['interactive_success_markers'] = ['canvas', 'viewer_active'];
 
         $g[$cacheKey] = ['t' => time(), 'plan' => $plan];
 
@@ -3719,6 +3784,10 @@ function ipmiWebResolveKvmLaunchPlan(array $session): array
         $plan['launch_strategy'] = 'supermicro_ikvm';
         $plan['renderer_direct_possible'] = !empty($pr['browser_native_like']);
         $plan['requires_client_bootstrap'] = !empty($plan['needs_runtime_patch']);
+        $plan['console_ready_timeout_ms'] = 50000;
+        $plan['bootstrap_markers'] = ['supermicro_shell', 'supermicro_html5', 'ikvm_route'];
+        $plan['transport_markers'] = ['ipmi_ws_relay', 'websocket'];
+        $plan['interactive_success_markers'] = ['canvas', 'ikvm_active'];
 
         $g[$cacheKey] = ['t' => time(), 'plan' => $plan];
 
@@ -3799,6 +3868,10 @@ function ipmiWebKvmPlanLogSummary(array $plan): array
         'picked'         => $pickedRow,
         'shell_entry'    => (string) ($plan['shell_entry_path'] ?? ''),
         'console_boot'   => (string) ($plan['console_bootstrap_path'] ?? ''),
+        'console_ready_timeout_ms' => (int) ($plan['console_ready_timeout_ms'] ?? 45000),
+        'bootstrap_markers' => is_array($plan['bootstrap_markers'] ?? null) ? array_slice($plan['bootstrap_markers'], 0, 12) : [],
+        'transport_markers' => is_array($plan['transport_markers'] ?? null) ? array_slice($plan['transport_markers'], 0, 12) : [],
+        'interactive_success_markers' => is_array($plan['interactive_success_markers'] ?? null) ? array_slice($plan['interactive_success_markers'], 0, 12) : [],
     ];
 }
 
@@ -4131,6 +4204,9 @@ function ipmiWebProbeKvmPath(array $session, string $path): array
         $vendorShell = true;
         $markers[] = 'idrac_launcher';
     }
+    if ($vendorFamily === 'ilo' && str_contains($pathLower, 'rc_info') && $vendorShell) {
+        $markers[] = 'ilo_rc_bootstrap';
+    }
     $consoleLike = ipmiWebKvmPathLooksConsoleLike($path, $body);
     if ($consoleLike) {
         $markers[] = 'console_route_or_copy';
@@ -4191,6 +4267,15 @@ function ipmiWebProbeKvmPath(array $session, string $path): array
     }
     if (!empty($cls['vendor_shell_like']) && !$login && $deliveryMode === 'html' && !$unavailable) {
         $score += 12;
+    }
+    if (in_array('ilo_rc_bootstrap', $markers, true) && !$login) {
+        $score += 24;
+    }
+    if ($vendorFamily === 'idrac'
+        && !$login
+        && (str_contains($pathLower, 'viewer') || str_contains($pathLower, 'console'))
+        && !empty($cls['browser_native_like'])) {
+        $score += 20;
     }
 
     return [

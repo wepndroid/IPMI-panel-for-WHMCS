@@ -77,8 +77,14 @@ $title = 'KVM Console';
       <p class="ipmi-login-error" role="alert"><?= htmlspecialchars($error, ENT_QUOTES, 'UTF-8') ?></p>
       <?php elseif ($launchUrl): ?>
       <p style="margin:0 0 12px;">Debug mode is enabled. Open the KVM URL below.</p>
+      <?php
+        $launchUrlReplan = $launchUrl . (str_contains((string) $launchUrl, '?') ? '&' : '?') . 'ipmi_kvm_replan=1';
+      ?>
       <p style="margin:0 0 16px;">
         <a href="<?= htmlspecialchars((string) $launchUrl, ENT_QUOTES, 'UTF-8') ?>" class="ipmi-btn ipmi-btn-power" target="_blank" rel="noopener">Open KVM (Debug ON)</a>
+      </p>
+      <p style="margin:0 0 12px;font-size:13px;opacity:.85;">If native KVM stayed on the vendor shell or stalled, try recomputing the cached launch plan:
+        <a href="<?= htmlspecialchars((string) $launchUrlReplan, ENT_QUOTES, 'UTF-8') ?>" target="_blank" rel="noopener">Open with <code>ipmi_kvm_replan=1</code></a>
       </p>
       <p style="margin:0 0 8px;font-size:13px;opacity:.75;">Selected KVM path:</p>
       <input type="text" readonly style="width:100%;padding:8px;border-radius:8px;border:1px solid #1f3550;background:#0f1b2b;color:#cfe6ff;margin-bottom:10px;" value="<?= htmlspecialchars((string) $launchPath, ENT_QUOTES, 'UTF-8') ?>">
@@ -93,6 +99,13 @@ $title = 'KVM Console';
         <dt style="opacity:.75;margin:0;">Plan source</dt><dd style="margin:0 0 8px 0;"><?= htmlspecialchars((string) ($planSum['plan_source'] ?? '') . (isset($planSum['plan_cache_age_sec']) ? ' (cache age ' . (int) $planSum['plan_cache_age_sec'] . 's)' : ''), ENT_QUOTES, 'UTF-8') ?></dd>
         <dt style="opacity:.75;margin:0;">Strategy / mode</dt><dd style="margin:0 0 8px 0;"><?= htmlspecialchars((string) ($planSum['launch_strategy'] ?? '') . ' — ' . (string) ($planSum['mode'] ?? ''), ENT_QUOTES, 'UTF-8') ?></dd>
         <dt style="opacity:.75;margin:0;">Entry / shell / bootstrap paths</dt><dd style="margin:0 0 8px 0;word-break:break-all;"><?= htmlspecialchars((string) ($planSum['kvm_entry_path'] ?? '') . ' | shell: ' . (string) ($planSum['shell_entry'] ?? '') . ' | boot: ' . (string) ($planSum['console_boot'] ?? ''), ENT_QUOTES, 'UTF-8') ?></dd>
+        <dt style="opacity:.75;margin:0;">Console ready timeout (ms)</dt><dd style="margin:0 0 8px 0;"><?= (int) ($planSum['console_ready_timeout_ms'] ?? 0) ?></dd>
+        <dt style="opacity:.75;margin:0;">Plan markers (bootstrap / transport / interactive)</dt><dd style="margin:0 0 8px 0;word-break:break-word;font-size:12px;"><?= htmlspecialchars(json_encode([
+ 'bootstrap' => $planSum['bootstrap_markers'] ?? [],
+          'transport' => $planSum['transport_markers'] ?? [],
+          'interactive' => $planSum['interactive_success_markers'] ?? [],
+        ], JSON_UNESCAPED_SLASHES), ENT_QUOTES, 'UTF-8') ?></dd>
+        <dt style="opacity:.75;margin:0;">Runtime debug</dt><dd style="margin:0 0 8px 0;font-size:12px;">Open the KVM link with <code>?ipmi_proxy_debug=1</code> (or <code>?debug=1</code>). In the browser console, watch for <code>[ipmi-kvm]</code> events: shell → bootstrap → transport → interactive; <code>ilo_console_stalled</code> / <code>idrac_console_stalled</code> / <code>supermicro_console_stalled</code> show where progression stopped.</dd>
         <dt style="opacity:.75;margin:0;">Selection note</dt><dd style="margin:0 0 0 0;word-break:break-word;"><?= htmlspecialchars((string) ($planSum['note'] ?? ''), ENT_QUOTES, 'UTF-8') ?></dd>
       </dl>
       <p style="margin:16px 0 8px;font-size:13px;opacity:.75;">Full launch plan JSON:</p>

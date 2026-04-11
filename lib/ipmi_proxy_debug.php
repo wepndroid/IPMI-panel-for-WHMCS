@@ -13,8 +13,10 @@
  * Does not log cookie values or full proxy tokens.
  *
  * KVM / WebSocket oriented events include: kvm_plan_cache_hit, kvm_plan_cache_miss,
- * kvm_plan_recomputed, kvm_launch_plan_selected, bmc_response_host_rewrite, and
- * ipmi_ws_relay handshake lines in error_log when relay debug is on.
+ * kvm_plan_recomputed, kvm_plan_recomputed_after_stall (via ?ipmi_kvm_replan=1 on proxy URL),
+ * kvm_plan_recomputed_after_auth_drift, kvm_plan_reused_after_shell_success,
+ * kvm_launch_plan_selected, bmc_response_host_rewrite, ilo_/idrac_/supermicro_ console
+ * progression events, ipmi_ws_relay_client_open / ipmi_ws_relay:* error_log lines when relay debug is on.
  */
 
 /** @var list<array{ts: float, event: string, context: array<string, mixed>}>|null */
@@ -62,7 +64,8 @@ function ipmiProxyDebugStripFromQuery(string $queryString): string
         $params['ipmi_kvm_legacy'],
         $params['ipmi_kvm_force_html5'],
         $params['ipmi_kvm_stage'],
-        $params['ipmi_kvm_unavailable']
+        $params['ipmi_kvm_unavailable'],
+        $params['ipmi_kvm_replan']
     );
 
     return http_build_query($params);
