@@ -5,7 +5,8 @@
  *
  * DB table: ipmi_web_sessions
  *   id, token, user_id, server_id, ipmi_ip, ipmi_user, ipmi_pass,
- *   bmc_type, bmc_cookies (JSON: flat cookie map, or {"_c":{...},"_h":{"X-Auth-Token":"..."}}),
+ *   bmc_type, bmc_cookies (JSON: flat cookie map, or {"_c":{...},"_h":{...},"_s":"http","_m":{...}}),
+ *   _m holds small opaque session metadata (KVM plan cache, iLO preflight TTL) — not secrets.
  *   created_ip, user_agent,
  *   created_at, expires_at, last_access_at, revoked_at
  */
@@ -69,16 +70,42 @@ function ipmiWebCurlExecBmc(string $bmcIp, string $url, callable $configure): ar
 }
 
 /**
+ * Strip risky keys from session metadata before JSON persistence (defense in depth).
+ *
+ * @param array<string, mixed> $meta
+ * @return array<string, mixed>
+ */
+function ipmiWebSanitizeSessionMetaForStorage(array $meta): array
+{
+    $out = [];
+    foreach ($meta as $k => $v) {
+        if (!is_string($k) || $k === '' || str_starts_with($k, '_')) {
+            continue;
+        }
+        if (in_array(strtolower($k), ['password', 'ipmi_pass', 'token', 'csrf'], true)) {
+            continue;
+        }
+        $out[$k] = $v;
+    }
+
+    return $out;
+}
+
+/**
  * Persist cookie jar + optional BMC auth headers (e.g. Redfish X-Auth-Token) in bmc_cookies JSON.
  * Legacy rows are a flat object of name => value cookies only.
+ * Optional _m holds cross-request metadata (KVM plan cache, iLO preflight) — small TTL-bounded blobs only.
+ *
+ * @param array<string, mixed> $sessionMeta
  */
-function ipmiWebPackStoredAuth(array $cookies, array $forwardHeaders, string $bmcScheme = 'https'): string
+function ipmiWebPackStoredAuth(array $cookies, array $forwardHeaders, string $bmcScheme = 'https', array $sessionMeta = []): string
 {
     $forwardHeaders = array_filter($forwardHeaders, static function ($v) {
         return $v !== null && $v !== '';
     });
     $bmcScheme = ($bmcScheme === 'http') ? 'http' : 'https';
-    $needsWrapper = $forwardHeaders !== [] || $bmcScheme === 'http';
+    $sessionMeta = ipmiWebSanitizeSessionMetaForStorage($sessionMeta);
+    $needsWrapper = $forwardHeaders !== [] || $bmcScheme === 'http' || $sessionMeta !== [];
     if (!$needsWrapper) {
         return json_encode($cookies, JSON_UNESCAPED_SLASHES);
     }
@@ -87,27 +114,83 @@ function ipmiWebPackStoredAuth(array $cookies, array $forwardHeaders, string $bm
     if ($bmcScheme === 'http') {
         $payload['_s'] = 'http';
     }
+    if ($sessionMeta !== []) {
+        $payload['_m'] = $sessionMeta;
+    }
 
     return json_encode($payload, JSON_UNESCAPED_SLASHES);
 }
 
 /**
- * @return array{0: array<string, string>, 1: array<string, string>, 2: string}
+ * @return array{0: array<string, string>, 1: array<string, string>, 2: string, 3: array<string, mixed>}
  */
 function ipmiWebUnpackStoredAuth(string $raw): array
 {
     $d = json_decode($raw, true);
     if (!is_array($d)) {
-        return [[], [], 'https'];
+        return [[], [], 'https', []];
+    }
+    $meta = [];
+    if (isset($d['_m']) && is_array($d['_m'])) {
+        $meta = $d['_m'];
     }
     if (isset($d['_c']) && is_array($d['_c'])) {
         $h = $d['_h'] ?? [];
         $s = (isset($d['_s']) && $d['_s'] === 'http') ? 'http' : 'https';
 
-        return [$d['_c'], is_array($h) ? $h : [], $s];
+        return [$d['_c'], is_array($h) ? $h : [], $s, $meta];
     }
 
-    return [$d, [], 'https'];
+    return [$d, [], 'https', $meta];
+}
+
+/**
+ * Read current bmc_cookies JSON, let $mutator edit session meta only, write back preserving cookies/headers.
+ *
+ * @param callable(array<string, mixed>): void $mutator
+ */
+function ipmiWebSessionMetaMutate(mysqli $mysqli, string $token, callable $mutator): void
+{
+    if (!preg_match('/^[a-f0-9]{64}$/', $token)) {
+        return;
+    }
+    $stmt = $mysqli->prepare('SELECT bmc_cookies FROM ipmi_web_sessions WHERE token = ? LIMIT 1');
+    if (!$stmt) {
+        return;
+    }
+    $stmt->bind_param('s', $token);
+    $stmt->execute();
+    $res = $stmt->get_result();
+    $row = $res ? $res->fetch_assoc() : null;
+    $stmt->close();
+    $raw = trim((string) ($row['bmc_cookies'] ?? ''));
+    [$cookies, $fwd, $scheme, $meta] = $raw !== '' ? ipmiWebUnpackStoredAuth($raw) : [[], [], 'https', []];
+    if (!is_array($meta)) {
+        $meta = [];
+    }
+    $mutator($meta);
+    $meta = ipmiWebSanitizeSessionMetaForStorage($meta);
+    $json = ipmiWebPackStoredAuth($cookies, $fwd, $scheme, $meta);
+    $upd = $mysqli->prepare('UPDATE ipmi_web_sessions SET bmc_cookies = ? WHERE token = ? LIMIT 1');
+    if ($upd) {
+        $upd->bind_param('ss', $json, $token);
+        $upd->execute();
+        $upd->close();
+    }
+}
+
+/**
+ * @return array{kvm_plan?: array<string, mixed>, ilo_preflight?: array<string, mixed>}|array<string, mixed>
+ */
+function ipmiWebLoadSessionMetaFromRow(string $rawCookies): array
+{
+    $raw = trim($rawCookies);
+    if ($raw === '') {
+        return [];
+    }
+    [, , , $meta] = ipmiWebUnpackStoredAuth($raw);
+
+    return is_array($meta) ? $meta : [];
 }
 
 /**
@@ -2016,8 +2099,9 @@ function ipmiWebLoadSession(mysqli $mysqli, string $token): ?array
     $forwardHeaders = [];
     $bmcScheme = 'https';
     $rawCookies = trim((string)($row['bmc_cookies'] ?? ''));
+    $sessionMeta = [];
     if ($rawCookies !== '') {
-        [$cookies, $forwardHeaders, $bmcScheme] = ipmiWebUnpackStoredAuth($rawCookies);
+        [$cookies, $forwardHeaders, $bmcScheme, $sessionMeta] = ipmiWebUnpackStoredAuth($rawCookies);
     }
 
     $bmcType = strtolower(trim((string)($row['bmc_type'] ?? 'generic')));
@@ -2051,6 +2135,7 @@ function ipmiWebLoadSession(mysqli $mysqli, string $token): ?array
         'cookies'           => $cookies,
         'forward_headers'   => $forwardHeaders,
         'bmc_scheme'        => $bmcScheme,
+        'session_meta'      => is_array($sessionMeta) ? $sessionMeta : [],
     ];
 }
 
@@ -2071,6 +2156,15 @@ function ipmiWebPersistRefreshedRuntimeAuth(mysqli $mysqli, string $token, array
     $forwardHeaders = is_array($session['forward_headers'] ?? null) ? $session['forward_headers'] : [];
     $bmcScheme = (string) ($session['bmc_scheme'] ?? 'https');
     ipmiWebSaveSessionCookies($mysqli, $token, $cookies, $forwardHeaders, $bmcScheme);
+    if (function_exists('ipmiProxyDebugEnabled') && function_exists('ipmiProxyDebugLog') && ipmiProxyDebugEnabled()) {
+        $tokHint = strlen($token) >= 8 ? ('…' . substr($token, -8)) : '…';
+        $xAuth = trim((string) ($forwardHeaders['X-Auth-Token'] ?? ''));
+        ipmiProxyDebugLog('ilo_runtime_auth_persisted', [
+            'token'        => $tokHint,
+            'cookie_names' => array_slice(array_keys($cookies), 0, 12),
+            'has_x_auth'   => $xAuth !== '' ? 1 : 0,
+        ]);
+    }
     if (ipmiWebHasUsableBmcAuth($cookies, $forwardHeaders)) {
         ipmiWebEmitMirroredBmcCookiesForProxy($token, $cookies);
     }
@@ -2081,14 +2175,28 @@ function ipmiWebSaveSessionCookies(mysqli $mysqli, string $token, array $cookies
     if (!preg_match('/^[a-f0-9]{64}$/', $token)) {
         return;
     }
-    $json = ipmiWebPackStoredAuth($cookies, $forwardHeaders, $bmcScheme);
+    $meta = [];
+    $sel = $mysqli->prepare('SELECT bmc_cookies FROM ipmi_web_sessions WHERE token = ? LIMIT 1');
+    if ($sel) {
+        $sel->bind_param('s', $token);
+        $sel->execute();
+        $r = $sel->get_result();
+        $prev = $r ? $r->fetch_assoc() : null;
+        $sel->close();
+        if ($prev && trim((string) ($prev['bmc_cookies'] ?? '')) !== '') {
+            [, , , $meta] = ipmiWebUnpackStoredAuth((string) $prev['bmc_cookies']);
+        }
+    }
+    if (!is_array($meta)) {
+        $meta = [];
+    }
+    $json = ipmiWebPackStoredAuth($cookies, $forwardHeaders, $bmcScheme, $meta);
     $stmt = $mysqli->prepare("UPDATE ipmi_web_sessions SET bmc_cookies = ? WHERE token = ?");
     if ($stmt) {
         $stmt->bind_param("ss", $json, $token);
         $stmt->execute();
         $stmt->close();
     }
-    ipmiWebKvmLaunchPlanCacheInvalidate($token);
 }
 
 function ipmiWebBuildProxyUrl(string $token, string $bmcPath = '/'): string
@@ -2451,6 +2559,75 @@ function ipmiWebIloVerifyAuthed(string $baseUrl, string $bmcIp, array $cookieJar
     }
 
     return true;
+}
+
+/**
+ * True when iLO returns an authenticated SPA masthead fragment (not login shell).
+ */
+function ipmiWebIloBootstrapFragmentProbe(string $baseUrl, string $bmcIp, array $cookieJar, array $forwardHeaders): bool
+{
+    if (!ipmiWebHasUsableBmcAuth($cookieJar, $forwardHeaders)) {
+        return false;
+    }
+
+    ipmiWebSyncIloSessionAndSessionKeyCookies($cookieJar);
+    $baseUrl = rtrim($baseUrl, '/');
+    $originBase = ipmiWebBmcOriginBaseFromConnectUrl($baseUrl, $bmcIp);
+    $url = $baseUrl . '/html/masthead.html';
+    [$raw, $code] = ipmiWebCurlExecBmc($bmcIp, $url, static function ($ch) use ($originBase, $cookieJar, $forwardHeaders): void {
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 12);
+        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 6);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+        curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+        curl_setopt($ch, CURLOPT_HEADER, true);
+        curl_setopt($ch, CURLOPT_USERAGENT, ipmiWebCurlUserAgent());
+        curl_setopt($ch, CURLOPT_HTTPGET, true);
+        $headers = [
+            'Accept: text/html, */*;q=0.8',
+            'X-Requested-With: XMLHttpRequest',
+            'Origin: ' . $originBase,
+            'Referer: ' . $originBase . '/html/application.html',
+        ];
+        $tok = trim((string) ($forwardHeaders['X-Auth-Token'] ?? ''));
+        if ($tok !== '') {
+            $headers[] = 'X-Auth-Token: ' . $tok;
+        }
+        curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+        $parts = [];
+        foreach ($cookieJar as $k => $v) {
+            if ($v !== null && trim((string) $v) !== '') {
+                $parts[] = $k . '=' . $v;
+            }
+        }
+        if ($parts !== []) {
+            curl_setopt($ch, CURLOPT_COOKIE, implode('; ', $parts));
+        }
+    });
+
+    if ($raw === false || $code < 200 || $code >= 400) {
+        return false;
+    }
+
+    [, $body] = ipmiWebCurlExtractFinalHeadersAndBody($raw);
+    if (ipmiWebResponseLooksLikeBmcLoginPage($body, 'text/html')) {
+        return false;
+    }
+    $lb = strtolower(substr((string) $body, 0, 48000));
+    if ($lb === '') {
+        return false;
+    }
+    if (str_contains($lb, 'ipmi session expired')
+        || (str_contains($lb, 'session has timed out') && str_contains($lb, 'log in'))) {
+        return false;
+    }
+
+    return strlen($body) > 80
+        && (str_contains($lb, 'masthead')
+            || str_contains($lb, 'hp.common')
+            || str_contains($lb, 'ilo-navigation')
+            || str_contains($lb, 'fwk-masthead'));
 }
 
 function ipmiWebAmiVerifyAuthed(string $baseUrl, string $bmcIp, array $cookieJar, array $forwardHeaders): bool
@@ -3530,10 +3707,15 @@ function ipmiWebKvmLaunchPlanCacheKey(array $session): string
     return $tok . "\t" . $fam . "\t" . $ck;
 }
 
-function ipmiWebKvmLaunchPlanCacheInvalidate(string $token): void
+function ipmiWebKvmLaunchPlanCacheInvalidate(?mysqli $mysqli, string $token): void
 {
     if (!preg_match('/^[a-f0-9]{64}$/', $token)) {
         return;
+    }
+    if ($mysqli) {
+        ipmiWebSessionMetaMutate($mysqli, $token, static function (array &$meta): void {
+            unset($meta['kvm_plan']);
+        });
     }
     $g = &$GLOBALS['__ipmi_kvm_launch_plan_cache'];
     if (!is_array($g)) {
@@ -3544,6 +3726,23 @@ function ipmiWebKvmLaunchPlanCacheInvalidate(string $token): void
         if (is_string($k) && str_starts_with($k, $prefix)) {
             unset($g[$k]);
         }
+    }
+}
+
+/**
+ * @param array<string, array{t: int, plan: array<string, mixed>}> $g
+ */
+function ipmiWebKvmLaunchPlanCachePut(array &$g, string $cacheKey, array $plan, ?mysqli $mysqli, string $token): void
+{
+    $g[$cacheKey] = ['t' => time(), 'plan' => $plan];
+    if ($mysqli && preg_match('/^[a-f0-9]{64}$/', $token)) {
+        ipmiWebSessionMetaMutate($mysqli, $token, static function (array &$meta) use ($cacheKey, $plan): void {
+            $meta['kvm_plan'] = [
+                't'  => time(),
+                'ck' => $cacheKey,
+                'plan' => $plan,
+            ];
+        });
     }
 }
 
@@ -3564,7 +3763,7 @@ function ipmiWebKvmLaunchPlanCacheInvalidate(string $token): void
  *   debug: array<string, mixed>
  * }
  */
-function ipmiWebResolveKvmLaunchPlan(array $session): array
+function ipmiWebResolveKvmLaunchPlan(array $session, ?mysqli $persistMetaMysqli = null): array
 {
     $g = &$GLOBALS['__ipmi_kvm_launch_plan_cache'];
     if (!is_array($g)) {
@@ -3583,14 +3782,49 @@ function ipmiWebResolveKvmLaunchPlan(array $session): array
                 'vendor_family' => ipmiWebBmcFamily((string) ($session['bmc_type'] ?? 'generic')),
             ]);
         }
-    } elseif (isset($g[$cacheKey]) && is_array($g[$cacheKey])) {
+    } elseif (!$forceReplan) {
+        $meta = is_array($session['session_meta'] ?? null) ? $session['session_meta'] : [];
+        $kp = $meta['kvm_plan'] ?? null;
+        if (is_array($kp) && isset($kp['plan'], $kp['ck'], $kp['t']) && (string) $kp['ck'] === $cacheKey && is_array($kp['plan'])) {
+            $ageDb = time() - (int) $kp['t'];
+            if ($ageDb >= 0 && $ageDb < 120) {
+                $cachedPlan = $kp['plan'];
+                $cachedPlan['debug']['plan_source'] = 'cache_hit_db';
+                $cachedPlan['debug']['plan_cache_age_sec'] = $ageDb;
+                if (function_exists('ipmiProxyDebugLog') && function_exists('ipmiProxyDebugEnabled') && ipmiProxyDebugEnabled()) {
+                    ipmiProxyDebugLog('kvm_plan_cache_hit', [
+                        'scope'          => 'db',
+                        'age_sec'        => $ageDb,
+                        'vendor_family'  => (string) ($cachedPlan['vendor_family'] ?? ''),
+                        'vendor_variant' => (string) ($cachedPlan['vendor_variant'] ?? ''),
+                    ]);
+                }
+
+                return $cachedPlan;
+            }
+            if (function_exists('ipmiProxyDebugLog') && function_exists('ipmiProxyDebugEnabled') && ipmiProxyDebugEnabled() && $ageDb >= 120) {
+                ipmiProxyDebugLog('kvm_plan_cache_expired', [
+                    'scope'   => 'db',
+                    'age_sec' => $ageDb,
+                ]);
+            }
+        } elseif (function_exists('ipmiProxyDebugLog') && function_exists('ipmiProxyDebugEnabled') && ipmiProxyDebugEnabled()
+            && is_array($kp) && isset($kp['ck']) && (string) $kp['ck'] !== $cacheKey) {
+            ipmiProxyDebugLog('kvm_plan_cache_miss', [
+                'reason' => 'cookie_key_mismatch',
+                'scope'  => 'db',
+            ]);
+        }
+    }
+    if (!$forceReplan && isset($g[$cacheKey]) && is_array($g[$cacheKey])) {
         $age = time() - (int) ($g[$cacheKey]['t'] ?? 0);
         if ($age >= 0 && $age < 120 && is_array($g[$cacheKey]['plan'] ?? null)) {
             $cachedPlan = $g[$cacheKey]['plan'];
-            $cachedPlan['debug']['plan_source'] = 'cache_hit';
+            $cachedPlan['debug']['plan_source'] = 'request_memo_hit';
             $cachedPlan['debug']['plan_cache_age_sec'] = $age;
             if (function_exists('ipmiProxyDebugLog') && function_exists('ipmiProxyDebugEnabled') && ipmiProxyDebugEnabled()) {
                 ipmiProxyDebugLog('kvm_plan_cache_hit', [
+                    'scope'          => 'request',
                     'age_sec'        => $age,
                     'vendor_family'  => (string) ($cachedPlan['vendor_family'] ?? ''),
                     'vendor_variant' => (string) ($cachedPlan['vendor_variant'] ?? ''),
@@ -3612,7 +3846,7 @@ function ipmiWebResolveKvmLaunchPlan(array $session): array
         } elseif ($reason === 'expired') {
             ipmiProxyDebugLog('kvm_plan_recomputed', ['reason' => $reason, 'vendor_family' => $fam]);
         } else {
-            ipmiProxyDebugLog('kvm_plan_cache_miss', ['reason' => $reason, 'vendor_family' => $fam]);
+            ipmiProxyDebugLog('kvm_plan_cache_miss', ['reason' => $reason, 'vendor_family' => $fam, 'scope' => 'compute']);
         }
     }
 
@@ -3709,7 +3943,7 @@ function ipmiWebResolveKvmLaunchPlan(array $session): array
         $plan['transport_markers'] = ['ipmi_ws_relay', 'websocket', 'renderer_connected'];
         $plan['interactive_success_markers'] = ['console_visible', 'irc_window', 'canvas'];
 
-        $g[$cacheKey] = ['t' => time(), 'plan' => $plan];
+        ipmiWebKvmLaunchPlanCachePut($g, $cacheKey, $plan, $persistMetaMysqli, $tok);
 
         return $plan;
     }
@@ -3762,7 +3996,7 @@ function ipmiWebResolveKvmLaunchPlan(array $session): array
         $plan['transport_markers'] = ['ipmi_ws_relay', 'websocket', 'avct'];
         $plan['interactive_success_markers'] = ['canvas', 'viewer_active'];
 
-        $g[$cacheKey] = ['t' => time(), 'plan' => $plan];
+        ipmiWebKvmLaunchPlanCachePut($g, $cacheKey, $plan, $persistMetaMysqli, $tok);
 
         return $plan;
     }
@@ -3806,7 +4040,7 @@ function ipmiWebResolveKvmLaunchPlan(array $session): array
         $plan['transport_markers'] = ['ipmi_ws_relay', 'websocket'];
         $plan['interactive_success_markers'] = ['canvas', 'ikvm_active'];
 
-        $g[$cacheKey] = ['t' => time(), 'plan' => $plan];
+        ipmiWebKvmLaunchPlanCachePut($g, $cacheKey, $plan, $persistMetaMysqli, $tok);
 
         return $plan;
     }
@@ -3818,7 +4052,7 @@ function ipmiWebResolveKvmLaunchPlan(array $session): array
         $plan['debug']['selection_note'] = 'AMI/ASRock: SPA entry at /.';
         $plan['launch_strategy'] = 'ami_spa';
 
-        $g[$cacheKey] = ['t' => time(), 'plan' => $plan];
+        ipmiWebKvmLaunchPlanCachePut($g, $cacheKey, $plan, $persistMetaMysqli, $tok);
 
         return $plan;
     }
@@ -3827,7 +4061,7 @@ function ipmiWebResolveKvmLaunchPlan(array $session): array
     $plan['debug']['selection_note'] = 'generic: no vendor-specific KVM plan.';
     $plan['launch_strategy'] = 'generic';
 
-    $g[$cacheKey] = ['t' => time(), 'plan' => $plan];
+    ipmiWebKvmLaunchPlanCachePut($g, $cacheKey, $plan, $persistMetaMysqli, $tok);
 
     return $plan;
 }

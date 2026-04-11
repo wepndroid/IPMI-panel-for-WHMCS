@@ -42,7 +42,7 @@ try {
     ipmiWebCleanupExpiredSessions($mysqli);
     $sessionData = ipmiWebCreateSession($mysqli, $serverId, $userId, $role, 7200);
 
-    $launchPlan = ipmiWebResolveKvmLaunchPlan($sessionData);
+    $launchPlan = ipmiWebResolveKvmLaunchPlan($sessionData, $mysqli);
     $launchPath = (string) ($launchPlan['kvm_entry_path'] ?? '/');
     $launchUrl = ipmiWebBuildProxyUrl((string) $sessionData['token'], $launchPath);
     if ($debugProxy) {

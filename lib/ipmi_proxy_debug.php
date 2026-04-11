@@ -17,12 +17,16 @@
  * kvm_plan_recomputed_after_auth_drift, kvm_plan_reused_after_shell_success,
  * kvm_launch_plan_selected, bmc_response_host_rewrite, ilo_/idrac_/supermicro_ console
  * progression events, ipmi_ws_relay_client_open / ipmi_ws_relay:* error_log lines when relay debug is on.
- * iLO SPA/runtime continuity: ilo_runtime_preflight_*, ilo_runtime_sse_precheck, ilo_runtime_path_classified,
- * ilo_runtime_auth_refresh_*, ilo_runtime_request_retry, ilo_runtime_fragment_recovered, ilo_runtime_sse_retry,
- * ilo_runtime_final_failure.
- * Blank-SPA diagnosis: many events carry blank_ui_cause or precheck_blank_ui with one of:
- * auth_drift | sse_failure | fragment_bootstrap | upstream_transport | unknown
- * (see ipmiProxyIloBlankUiCause in ipmi_proxy.php).
+ * iLO SPA/runtime continuity: ilo_runtime_request_classified, ilo_runtime_recovery_decision,
+ * ilo_runtime_recovery_attempt, ilo_runtime_retry_executed, ilo_runtime_final_result,
+ * ilo_runtime_preflight_* (cache_hit / cache_miss / session_info_ok / bootstrap_ok / auth_refreshed),
+ * ilo_runtime_sse_precheck, ilo_runtime_auth_refresh_*, ilo_runtime_sse_retry, ilo_runtime_final_failure,
+ * ilo_retry_request_state_rebuilt, ilo_retry_using_fresh_forward_headers, ilo_retry_using_fresh_cookies,
+ * ilo_runtime_session_reloaded_after_refresh, ilo_runtime_auth_persisted, ilo_soft_auth_failure_detected.
+ * KVM plan: kvm_plan_cache_hit (scope db|request), kvm_plan_cache_miss, kvm_plan_cache_expired — DB-backed TTL cache in session _m metadata.
+ * Blank-SPA diagnosis: blank_ui_cause / precheck_blank_ui / still_soft_auth — see ipmiProxyIloBlankUiCause in ipmi_proxy.php.
+ * failure_axis (unified bucket): soft_auth | hard_http_auth | upstream_transport | auth_refresh_exhausted |
+ * fragment_bootstrap_soft | sse_auth_drift | sse_transport | hard_failure — plus mitigates_stale_retry_headers on rebuild logs.
  */
 
 /** @var list<array{ts: float, event: string, context: array<string, mixed>}>|null */

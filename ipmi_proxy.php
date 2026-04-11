@@ -893,7 +893,7 @@ function ipmiProxyBuildSupermicroKvmScript(): string
 /**
  * @param array<string, mixed>|string $sessionOrLegacyBmcType Full web session array, or legacy BMC type string (limited plan quality).
  */
-function ipmiProxyInjectKvmAutoLaunchPatch(string $html, string $token, $sessionOrLegacyBmcType, bool $kvmAutoFlow = false, ?array $launchPlan = null): string
+function ipmiProxyInjectKvmAutoLaunchPatch(string $html, string $token, $sessionOrLegacyBmcType, bool $kvmAutoFlow = false, ?array $launchPlan = null, ?mysqli $persistKvmPlanMysqli = null): string
 {
     if (stripos($html, 'data-ipmi-proxy-kvm-autolaunch') !== false) {
         return $html;
@@ -909,8 +909,10 @@ function ipmiProxyInjectKvmAutoLaunchPatch(string $html, string $token, $session
     } else {
         $session = $sessionOrLegacyBmcType;
     }
-    $plan = $launchPlan ?? ipmiWebResolveKvmLaunchPlan($session);
-    if (ipmiProxyDebugEnabled() && ($plan['debug']['plan_source'] ?? '') === 'cache_hit') {
+    $plan = $launchPlan ?? ipmiWebResolveKvmLaunchPlan($session, $persistKvmPlanMysqli);
+    $planSrc = (string) ($plan['debug']['plan_source'] ?? '');
+    if (ipmiProxyDebugEnabled()
+        && ($planSrc === 'cache_hit_db' || $planSrc === 'request_memo_hit' || str_starts_with($planSrc, 'cache_hit'))) {
         ipmiProxyDebugLog('kvm_plan_reused_after_shell_success', [
             'vendor_family'  => (string) ($plan['vendor_family'] ?? ''),
             'launch_strategy'=> (string) ($plan['launch_strategy'] ?? ''),
@@ -1799,42 +1801,510 @@ function ipmiProxyIloRuntimeAuthRefresh(mysqli $mysqli, string $token, array &$s
     return true;
 }
 
+/**
+ * Reload cookies, forward headers, scheme, and session_meta from DB after a refresh wrote them.
+ */
+function ipmiProxyReloadSessionRowInto(array &$session, mysqli $mysqli, string $token, string $traceId): bool
+{
+    $row = ipmiWebLoadSession($mysqli, $token);
+    if (!$row) {
+        return false;
+    }
+    $session['cookies'] = is_array($row['cookies'] ?? null) ? $row['cookies'] : [];
+    $session['forward_headers'] = is_array($row['forward_headers'] ?? null) ? $row['forward_headers'] : [];
+    $session['bmc_scheme'] = (string) ($row['bmc_scheme'] ?? 'https');
+    $session['session_meta'] = is_array($row['session_meta'] ?? null) ? $row['session_meta'] : [];
+    if (ipmiWebIsIloFamilyType((string) ($session['bmc_type'] ?? ''))) {
+        $session['cookies'] = ipmiProxyMergeClientBmcCookies($session['cookies'], (string) ($session['bmc_type'] ?? ''));
+        ipmiWebSyncIloSessionAndSessionKeyCookies($session['cookies']);
+    }
+    if (ipmiProxyDebugEnabled()) {
+        ipmiProxyDebugLog('ilo_runtime_session_reloaded_after_refresh', ['trace' => $traceId]);
+    }
+
+    return true;
+}
+
+function ipmiProxyRebuildIloForwardHeadersFromSession(array $session, string $bmcScheme, string $bmcIp, string $bmcPathOnlyLower): array
+{
+    $hdr = is_array($session['forward_headers'] ?? null) ? $session['forward_headers'] : [];
+    $hdr = ipmiProxyMergeClientBmcForwardHeaders(
+        $hdr,
+        $bmcScheme,
+        $bmcIp,
+        is_array($session['cookies'] ?? null) ? $session['cookies'] : []
+    );
+    if (str_starts_with($bmcPathOnlyLower, '/json/')
+        || str_starts_with($bmcPathOnlyLower, '/api/')
+        || str_starts_with($bmcPathOnlyLower, '/rest/')) {
+        if (!ipmiProxyForwardHeadersHasHeader($hdr, 'X-Requested-With')) {
+            $hdr['X-Requested-With'] = 'XMLHttpRequest';
+        }
+        if (!ipmiProxyForwardHeadersHasHeader($hdr, 'Accept')) {
+            $hdr['Accept'] = 'application/json, text/javascript, */*';
+        }
+    }
+
+    return $hdr;
+}
+
+/**
+ * @return array{fwdHdr: array<string, string>, cookies: array<string, string>}
+ */
+function ipmiProxyRebuildFreshIloRequestState(array &$session, string &$bmcScheme, string $bmcIp, string $bmcPathOnlyLower, string $traceId): array
+{
+    $bmcScheme = (($session['bmc_scheme'] ?? 'https') === 'http') ? 'http' : 'https';
+    $cookies = is_array($session['cookies'] ?? null) ? $session['cookies'] : [];
+    $fwdHdr = ipmiProxyRebuildIloForwardHeadersFromSession($session, $bmcScheme, $bmcIp, $bmcPathOnlyLower);
+    if (ipmiProxyDebugEnabled()) {
+        ipmiProxyDebugLog('ilo_retry_request_state_rebuilt', [
+            'trace'               => $traceId,
+            'bmcScheme'           => $bmcScheme,
+            'forward_header_keys' => array_slice(array_keys($fwdHdr), 0, 14),
+            'cookie_key_count'    => count($cookies),
+            'mitigates_stale_retry_headers' => 1,
+            'session_row_source'  => 'db_reload_before_rebuild',
+        ]);
+        ipmiProxyDebugLog('ilo_retry_using_fresh_forward_headers', [
+            'trace'      => $traceId,
+            'has_x_auth' => (trim((string) ($fwdHdr['X-Auth-Token'] ?? '')) !== '') ? 1 : 0,
+        ]);
+        ipmiProxyDebugLog('ilo_retry_using_fresh_cookies', [
+            'trace' => $traceId,
+            'names' => array_slice(array_keys($cookies), 0, 14),
+        ]);
+    }
+
+    return ['fwdHdr' => $fwdHdr, 'cookies' => $cookies];
+}
+
+/**
+ * After HTML/asset relogin mutates the session, iLO needs the same DB-reload + header merge as runtime recovery (avoids stale X-Auth-Token on immediate retry).
+ *
+ * @return array<string, string>|null Forward headers to use, or null if vendor is not normalized iLO
+ */
+function ipmiProxyIloFreshForwardHeadersAfterRelogin(
+    array &$session,
+    string &$bmcScheme,
+    string $bmcIp,
+    string $bmcPath,
+    mysqli $mysqli,
+    string $token,
+    string $traceId
+): ?array {
+    if (!ipmiWebIsNormalizedIloType(ipmiWebNormalizeBmcType((string) ($session['bmc_type'] ?? 'generic')))) {
+        return null;
+    }
+    ipmiProxyReloadSessionRowInto($session, $mysqli, $token, $traceId);
+    $pl = strtolower((string) parse_url($bmcPath, PHP_URL_PATH));
+    $st = ipmiProxyRebuildFreshIloRequestState($session, $bmcScheme, $bmcIp, $pl, $traceId);
+    if (ipmiProxyDebugEnabled()) {
+        ipmiProxyDebugLog('ilo_relogin_retry_fresh_headers', [
+            'trace'   => $traceId,
+            'bmcPath' => $bmcPath,
+            'mitigates_stale_retry_headers' => 1,
+        ]);
+    }
+
+    return $st['fwdHdr'];
+}
+
 function ipmiProxyMaybeIloRuntimePreflight(mysqli $mysqli, string $token, array &$session, string $bmcIp, string $traceId): void
 {
-    $g = &$GLOBALS['__ipmi_ilo_runtime_preflight_ts'];
-    if (!is_array($g)) {
-        $g = [];
-    }
     $now = time();
-    if (($g[$token] ?? 0) > $now - 25) {
+    $meta = is_array($session['session_meta'] ?? null) ? $session['session_meta'] : [];
+    $pf = $meta['ilo_preflight'] ?? null;
+    if (is_array($pf) && isset($pf['t']) && (int) $pf['t'] > $now - 25) {
+        if (ipmiProxyDebugEnabled()) {
+            ipmiProxyDebugLog('ilo_runtime_preflight_cache_hit', [
+                'trace'         => $traceId,
+                'age_sec'       => $now - (int) $pf['t'],
+                'session_ok'    => !empty($pf['session_ok']) ? 1 : 0,
+                'bootstrap_ok'  => !empty($pf['bootstrap_ok']) ? 1 : 0,
+            ]);
+        }
+
         return;
     }
-    $g[$token] = $now;
     if (ipmiProxyDebugEnabled()) {
+        ipmiProxyDebugLog('ilo_runtime_preflight_cache_miss', ['trace' => $traceId]);
         ipmiProxyDebugLog('ilo_runtime_preflight_started', ['trace' => $traceId]);
     }
     $scheme = (($session['bmc_scheme'] ?? 'https') === 'http') ? 'http' : 'https';
     $baseUrl = $scheme . '://' . $bmcIp;
-    $ok = ipmiWebIloVerifyAuthed(
-        $baseUrl,
-        $bmcIp,
-        is_array($session['cookies']) ? $session['cookies'] : [],
-        is_array($session['forward_headers']) ? $session['forward_headers'] : []
-    );
-    if ($ok) {
+    $cookies = is_array($session['cookies']) ? $session['cookies'] : [];
+    $fwd = is_array($session['forward_headers']) ? $session['forward_headers'] : [];
+    $sessionOk = ipmiWebIloVerifyAuthed($baseUrl, $bmcIp, $cookies, $fwd);
+    if (ipmiProxyDebugEnabled()) {
+        ipmiProxyDebugLog($sessionOk ? 'ilo_runtime_preflight_session_info_ok' : 'ilo_runtime_preflight_failed', [
+            'trace'  => $traceId,
+            'phase'  => 'session_info',
+        ]);
+    }
+    $bootstrapOk = $sessionOk && ipmiWebIloBootstrapFragmentProbe($baseUrl, $bmcIp, $cookies, $fwd);
+    if (ipmiProxyDebugEnabled() && $sessionOk) {
+        ipmiProxyDebugLog($bootstrapOk ? 'ilo_runtime_preflight_bootstrap_ok' : 'ilo_runtime_preflight_failed', [
+            'trace'  => $traceId,
+            'phase'  => 'masthead_fragment',
+        ]);
+    }
+    if ($sessionOk && $bootstrapOk) {
+        $payload = ['t' => $now, 'session_ok' => true, 'bootstrap_ok' => true];
+        ipmiWebSessionMetaMutate($mysqli, $token, static function (array &$meta) use ($payload): void {
+            $meta['ilo_preflight'] = $payload;
+        });
+        if (!isset($session['session_meta']) || !is_array($session['session_meta'])) {
+            $session['session_meta'] = [];
+        }
+        $session['session_meta']['ilo_preflight'] = $payload;
         if (ipmiProxyDebugEnabled()) {
             ipmiProxyDebugLog('ilo_runtime_preflight_passed', ['trace' => $traceId]);
         }
 
         return;
     }
-    if (ipmiProxyDebugEnabled()) {
-        ipmiProxyDebugLog('ilo_runtime_preflight_failed', ['trace' => $traceId]);
-    }
     if (ipmiProxyIloRuntimeAuthRefresh($mysqli, $token, $session, $bmcIp, $traceId, 'shell_preflight')) {
-        if (ipmiProxyDebugEnabled()) {
-            ipmiProxyDebugLog('ilo_runtime_preflight_refreshed_auth', ['trace' => $traceId]);
+        ipmiProxyReloadSessionRowInto($session, $mysqli, $token, $traceId);
+        $scheme = (($session['bmc_scheme'] ?? 'https') === 'http') ? 'http' : 'https';
+        $baseUrl = $scheme . '://' . $bmcIp;
+        $cookies = is_array($session['cookies']) ? $session['cookies'] : [];
+        $fwd = is_array($session['forward_headers']) ? $session['forward_headers'] : [];
+        $sessionOk2 = ipmiWebIloVerifyAuthed($baseUrl, $bmcIp, $cookies, $fwd);
+        $bootstrapOk2 = $sessionOk2 && ipmiWebIloBootstrapFragmentProbe($baseUrl, $bmcIp, $cookies, $fwd);
+        $payload = ['t' => time(), 'session_ok' => $sessionOk2, 'bootstrap_ok' => $bootstrapOk2];
+        ipmiWebSessionMetaMutate($mysqli, $token, static function (array &$meta) use ($payload): void {
+            $meta['ilo_preflight'] = $payload;
+        });
+        if (!isset($session['session_meta']) || !is_array($session['session_meta'])) {
+            $session['session_meta'] = [];
         }
+        $session['session_meta']['ilo_preflight'] = $payload;
+        if (ipmiProxyDebugEnabled()) {
+            ipmiProxyDebugLog('ilo_runtime_preflight_auth_refreshed', [
+                'trace'        => $traceId,
+                'session_ok'   => $sessionOk2 ? 1 : 0,
+                'bootstrap_ok' => $bootstrapOk2 ? 1 : 0,
+            ]);
+        }
+    } else {
+        $payload = ['t' => $now, 'session_ok' => false, 'bootstrap_ok' => false];
+        ipmiWebSessionMetaMutate($mysqli, $token, static function (array &$meta) use ($payload): void {
+            $meta['ilo_preflight'] = $payload;
+        });
+        if (!isset($session['session_meta']) || !is_array($session['session_meta'])) {
+            $session['session_meta'] = [];
+        }
+        $session['session_meta']['ilo_preflight'] = $payload;
+    }
+}
+
+/**
+ * Paths where HTTP 200 may still mean stale session (soft auth). Matches recoverable runtime set so any endpoint eligible for hard retry is also checked for soft 200 failures.
+ */
+function ipmiProxyIloBootstrapSensitivePath(string $bmcPath): bool
+{
+    return ipmiProxyIsIloRecoverableRuntimePath($bmcPath);
+}
+
+function ipmiProxyIloJsonLooksUnauthed(string $body): bool
+{
+    $t = trim($body);
+    if ($t === '' || ($t[0] !== '{' && $t[0] !== '[')) {
+        return false;
+    }
+    $j = json_decode($t, true);
+    if (!is_array($j)) {
+        return true;
+    }
+    $msg = strtolower((string) ($j['message'] ?? $j['error'] ?? ''));
+    if (is_string($j['error'] ?? null)) {
+        $msg .= ' ' . strtolower((string) $j['error']);
+    }
+    $details = strtolower((string) ($j['details'] ?? ''));
+    if (str_contains($msg, 'lost_session') || str_contains($details, 'invalid session')) {
+        return true;
+    }
+    if (str_contains($msg, 'unauthorized') || str_contains($msg, 'forbidden')) {
+        return true;
+    }
+    if (str_contains($msg, 'authentication') && (str_contains($msg, 'fail') || str_contains($msg, 'required'))) {
+        return true;
+    }
+    if (isset($j['code']) && (int) $j['code'] === 401) {
+        return true;
+    }
+    $ext = $j['error'] ?? null;
+    if (is_array($ext)) {
+        $ek = strtolower((string) ($ext['key'] ?? $ext['code'] ?? ''));
+
+        return str_contains($ek, 'session') || str_contains($ek, 'auth');
+    }
+
+    return false;
+}
+
+function ipmiProxyIloHtmlLooksUnauthed(string $body): bool
+{
+    if (ipmiWebResponseLooksLikeBmcLoginPage($body, 'text/html')) {
+        return true;
+    }
+    if (ipmiProxyBodyHasSessionTimeout($body)) {
+        return true;
+    }
+
+    return false;
+}
+
+function ipmiProxyIloBootstrapResponseLooksWrong(string $bmcPath, string $contentType, string $body): bool
+{
+    $p = strtolower((string) parse_url($bmcPath, PHP_URL_PATH));
+    $ct = strtolower(trim(explode(';', $contentType)[0] ?? ''));
+    if (ipmiProxyIsIloRuntimeFragmentPath($bmcPath)) {
+        if (str_contains($ct, 'json')) {
+            return true;
+        }
+        $lb = strtolower(substr($body, 0, 24000));
+        if (strlen($body) < 40) {
+            return true;
+        }
+        if ($lb !== '' && str_contains($lb, '<html') && !str_contains($lb, 'masthead')
+            && str_contains($lb, 'password') && str_contains($lb, 'login')) {
+            return true;
+        }
+    }
+    if (str_starts_with($p, '/json/') && (str_contains($ct, 'html') || ($ct === 'text/plain' && ipmiProxyIloHtmlLooksUnauthed($body)))) {
+        return ipmiProxyIloHtmlLooksUnauthed($body);
+    }
+
+    return false;
+}
+
+function ipmiProxyIloIsSoftAuthFailure(string $bmcPath, int $httpCode, string $contentType, string $body): bool
+{
+    if ($httpCode < 200 || $httpCode >= 400) {
+        return false;
+    }
+    if (!ipmiProxyIloBootstrapSensitivePath($bmcPath)) {
+        return false;
+    }
+    $p = strtolower((string) parse_url($bmcPath, PHP_URL_PATH));
+    $ct = strtolower(trim(explode(';', $contentType)[0] ?? ''));
+    $jsonish = str_starts_with($p, '/json/') || str_contains($ct, 'json');
+    if ($jsonish && ipmiProxyIloJsonLooksUnauthed($body)) {
+        return true;
+    }
+    if (str_contains($ct, 'html') && ipmiProxyIloHtmlLooksUnauthed($body)) {
+        return true;
+    }
+    if (ipmiProxyIloBootstrapResponseLooksWrong($bmcPath, $contentType, $body)) {
+        return true;
+    }
+
+    return false;
+}
+
+/**
+ * @return array{recover: bool, reason: string, kind: 'none'|'hard'|'soft', soft_detail?: string}
+ */
+function ipmiProxyIloClassifyBufferedRecovery(array $result, string $bmcPath, string $method): array
+{
+    if (!ipmiProxyIsIloRecoverableRuntimePath($bmcPath)) {
+        return ['recover' => false, 'reason' => 'not_recoverable_path', 'kind' => 'none'];
+    }
+    $http0 = (int) ($result['http_code'] ?? 0);
+    if (($result['raw'] ?? false) === false) {
+        return [
+            'recover' => true,
+            'reason'  => 'curl_failed:' . (int) ($result['curl_errno'] ?? 0),
+            'kind'    => 'hard',
+        ];
+    }
+    if (in_array($http0, [401, 403, 502, 503], true)) {
+        return ['recover' => true, 'reason' => 'http_' . $http0, 'kind' => 'hard'];
+    }
+    [, $body] = ipmiWebCurlExtractFinalHeadersAndBody((string) $result['raw']);
+    $ct = (string) ($result['content_type'] ?? '');
+    if (ipmiProxyIloIsSoftAuthFailure($bmcPath, $http0, $ct, $body)) {
+        $detail = 'json_unauth';
+        if (ipmiProxyIloBootstrapResponseLooksWrong($bmcPath, $ct, $body)) {
+            $detail = 'bootstrap_mismatch';
+        } elseif (str_contains(strtolower(trim(explode(';', $ct)[0] ?? '')), 'html') && ipmiProxyIloHtmlLooksUnauthed($body)) {
+            $detail = 'html_login_like';
+        }
+
+        return [
+            'recover'      => true,
+            'reason'       => 'soft_auth:' . $detail,
+            'kind'         => 'soft',
+            'soft_detail'  => $detail,
+        ];
+    }
+
+    return ['recover' => false, 'reason' => 'ok_or_not_actionable', 'kind' => 'none'];
+}
+
+/**
+ * Normalized debug bucket for blank-iLO triage (see ipmi_proxy_debug.php).
+ */
+function ipmiProxyIloDebugFailureAxisFromReason(string $kind, string $reason): string
+{
+    if ($kind === 'soft') {
+        return 'soft_auth';
+    }
+    if (str_starts_with($reason, 'curl_failed')) {
+        return 'upstream_transport';
+    }
+    if (preg_match('/^http_/', $reason)) {
+        return 'hard_http_auth';
+    }
+
+    return 'hard_failure';
+}
+
+/**
+ * Single authoritative iLO buffered (non-SSE) recovery: refresh → reload DB row → rebuild headers → one retry.
+ *
+ * @param array<string, mixed> $result
+ */
+function ipmiProxyIloMaybeRecoverBufferedRuntime(
+    mysqli $mysqli,
+    string $token,
+    array &$session,
+    string &$bmcScheme,
+    string $bmcIp,
+    string $bmcPath,
+    string $bmcPathOnlyLower,
+    string $method,
+    string $bmcUrl,
+    ?string $postBody,
+    string $fwdContentType,
+    array &$result,
+    string $ipmiTraceId
+): void {
+    if (!ipmiWebIsNormalizedIloType(ipmiWebNormalizeBmcType((string) ($session['bmc_type'] ?? 'generic')))) {
+        return;
+    }
+    if (!empty($GLOBALS['__ipmi_ilo_runtime_recover_attempted'])) {
+        return;
+    }
+    $class = ipmiProxyIloRuntimePathDebugClass($bmcPath);
+    $bootstrapCritical = ipmiProxyIloBootstrapSensitivePath($bmcPath) ? 1 : 0;
+    $decision = ipmiProxyIloClassifyBufferedRecovery($result, $bmcPath, $method);
+    if (ipmiProxyDebugEnabled()) {
+        ipmiProxyDebugLog('ilo_runtime_request_classified', [
+            'trace'              => $ipmiTraceId,
+            'bmcPath'            => $bmcPath,
+            'method'             => $method,
+            'path_class'         => $class,
+            'bootstrap_critical' => $bootstrapCritical,
+            'recover'            => $decision['recover'] ? 1 : 0,
+            'reason'             => $decision['reason'],
+            'kind'               => $decision['kind'],
+        ]);
+    }
+    if (!$decision['recover']) {
+        return;
+    }
+    if (ipmiProxyDebugEnabled()) {
+        ipmiProxyDebugLog('ilo_runtime_recovery_decision', [
+            'trace'          => $ipmiTraceId,
+            'will_recover'   => 1,
+            'reason'         => $decision['reason'],
+            'kind'           => $decision['kind'],
+            'failure_axis'   => ipmiProxyIloDebugFailureAxisFromReason((string) $decision['kind'], (string) $decision['reason']),
+        ]);
+        if ($decision['kind'] === 'soft') {
+            ipmiProxyDebugLog('ilo_soft_auth_failure_detected', [
+                'trace'        => $ipmiTraceId,
+                'bmcPath'      => $bmcPath,
+                'detail'       => (string) ($decision['soft_detail'] ?? ''),
+                'failure_axis' => 'soft_auth',
+            ]);
+        }
+    }
+    if (ipmiProxyDebugEnabled()) {
+        ipmiProxyDebugLog('ilo_runtime_recovery_attempt', ['trace' => $ipmiTraceId, 'reason' => $decision['reason']]);
+    }
+    if (!ipmiProxyIloRuntimeAuthRefresh($mysqli, $token, $session, $bmcIp, $ipmiTraceId, $decision['reason'])) {
+        if (ipmiProxyDebugEnabled()) {
+            ipmiProxyDebugLog('ilo_runtime_final_failure', [
+                'trace'          => $ipmiTraceId,
+                'bmcPath'        => $bmcPath,
+                'phase'          => 'auth_refresh_failed',
+                'reason'         => $decision['reason'],
+                'path_class'     => $class,
+                'failure_axis'   => 'auth_refresh_exhausted',
+                'blank_ui_cause' => ipmiProxyIloBlankUiCause($bmcPath, 'auth_refresh_failed'),
+            ]);
+            ipmiProxyDebugLog('ilo_runtime_final_result', [
+                'trace' => $ipmiTraceId,
+                'outcome'  => 'auth_refresh_failed',
+                'bmcPath'  => $bmcPath,
+            ]);
+        }
+
+        return;
+    }
+    ipmiProxyReloadSessionRowInto($session, $mysqli, $token, $ipmiTraceId);
+    $fresh = ipmiProxyRebuildFreshIloRequestState($session, $bmcScheme, $bmcIp, $bmcPathOnlyLower, $ipmiTraceId);
+    $GLOBALS['__ipmi_ilo_runtime_recover_attempted'] = true;
+    if (ipmiProxyDebugEnabled()) {
+        ipmiProxyDebugLog('ilo_runtime_retry_executed', [
+            'trace'   => $ipmiTraceId,
+            'bmcPath' => $bmcPath,
+            'method'  => $method,
+        ]);
+    }
+    $result = ipmiProxyExecute(
+        $bmcUrl,
+        $method,
+        $postBody,
+        $fwdContentType,
+        $fresh['cookies'],
+        $fresh['fwdHdr'],
+        $bmcIp
+    );
+    $http1 = (int) ($result['http_code'] ?? 0);
+    $okTransport = (($result['raw'] ?? false) !== false);
+    $body1 = '';
+    $ct1 = (string) ($result['content_type'] ?? '');
+    if ($okTransport) {
+        [, $body1] = ipmiWebCurlExtractFinalHeadersAndBody((string) $result['raw']);
+    }
+    $stillSoft = $okTransport && ipmiProxyIloIsSoftAuthFailure($bmcPath, $http1, $ct1, $body1);
+    $hardBad = $okTransport && in_array($http1, [401, 403, 502, 503], true);
+    if (ipmiProxyDebugEnabled()) {
+        ipmiProxyDebugLog('ilo_runtime_final_result', [
+            'trace'        => $ipmiTraceId,
+            'bmcPath'      => $bmcPath,
+            'http'         => $http1,
+            'transport_ok' => $okTransport ? 1 : 0,
+            'still_soft'   => $stillSoft ? 1 : 0,
+            'hard_bad'     => $hardBad ? 1 : 0,
+        ]);
+    }
+    if ($okTransport && $http1 >= 200 && $http1 < 400 && !$stillSoft && ipmiProxyDebugEnabled()) {
+        ipmiProxyDebugLog('ilo_runtime_fragment_recovered', [
+            'trace'   => $ipmiTraceId,
+            'bmcPath' => $bmcPath,
+        ]);
+    } elseif (ipmiProxyDebugEnabled() && $okTransport && ($hardBad || $stillSoft)) {
+        $axisPost = 'hard_http_auth';
+        if ($stillSoft) {
+            $axisPost = ($class === 'helper_fragment') ? 'fragment_bootstrap_soft' : 'soft_auth';
+        } elseif ($http1 >= 500) {
+            $axisPost = 'upstream_transport';
+        }
+        ipmiProxyDebugLog('ilo_runtime_final_failure', [
+            'trace'          => $ipmiTraceId,
+            'bmcPath'        => $bmcPath,
+            'phase'          => 'post_auth_retry_bad_http',
+            'http'           => $http1,
+            'path_class'     => $class,
+            'still_soft_auth'=> $stillSoft ? 1 : 0,
+            'failure_axis'   => $axisPost,
+            'blank_ui_cause' => $stillSoft ? 'soft_auth_failure' : ipmiProxyIloBlankUiCause($bmcPath, 'post_retry_http', ['http' => $http1]),
+        ]);
     }
 }
 
@@ -2835,17 +3305,13 @@ if ($method === 'GET' && ipmiProxyShouldStreamBmcRequest($method, $bmcPath)) {
                         'bmcPath' => $bmcPath,
                     ]);
                 }
-                $fwdHdr = $session['forward_headers'] ?? [];
-                $fwdHdr = ipmiProxyMergeClientBmcForwardHeaders(
-                    is_array($fwdHdr) ? $fwdHdr : [],
-                    $bmcScheme,
-                    $bmcIp,
-                    is_array($session['cookies'] ?? null) ? $session['cookies'] : []
-                );
+                ipmiProxyReloadSessionRowInto($session, $mysqli, $token, $ipmiTraceId);
+                $freshSse = ipmiProxyRebuildFreshIloRequestState($session, $bmcScheme, $bmcIp, $bmcPathOnlyLower, $ipmiTraceId);
+                $fwdHdr = $freshSse['fwdHdr'];
                 ipmiProxyRecoverBmcAuthBeforeSse($session, $mysqli, $token, $bmcIp, $bmcScheme, $fwdHdr, $ipmiTraceId);
                 $r = ipmiProxyStreamGetBmcResponse(
                     $streamUrl,
-                    $session['cookies'],
+                    $freshSse['cookies'],
                     is_array($fwdHdr) ? $fwdHdr : [],
                     $bmcIp,
                     false
@@ -2853,7 +3319,7 @@ if ($method === 'GET' && ipmiProxyShouldStreamBmcRequest($method, $bmcPath)) {
                 if (!$r['ok'] && !empty($r['applied_resolve'])) {
                     $r = ipmiProxyStreamGetBmcResponse(
                         $streamUrl,
-                        $session['cookies'],
+                        $freshSse['cookies'],
                         is_array($fwdHdr) ? $fwdHdr : [],
                         $bmcIp,
                         true
@@ -2864,6 +3330,13 @@ if ($method === 'GET' && ipmiProxyShouldStreamBmcRequest($method, $bmcPath)) {
         }
         if (!$r['ok']) {
             if (ipmiProxyDebugEnabled()) {
+                $sseAxis = 'sse_transport';
+                if (!empty($r['auth_rejected'])) {
+                    $sseAxis = 'sse_auth_drift';
+                } elseif (!empty($r['sse_recoverable_http'])
+                    || (isset($r['curl_errno']) && (int) $r['curl_errno'] !== 0)) {
+                    $sseAxis = 'upstream_transport';
+                }
                 ipmiProxyDebugLog('stream_sse_failed', [
                     'trace'           => $ipmiTraceId,
                     'bmcPath'         => $bmcPath,
@@ -2873,6 +3346,7 @@ if ($method === 'GET' && ipmiProxyShouldStreamBmcRequest($method, $bmcPath)) {
                     'curl_errno'      => $r['curl_errno'] ?? null,
                     'curl_error'      => isset($r['curl_error']) ? substr((string) $r['curl_error'], 0, 240) : null,
                     'ilo_sse_retried' => $iloSseRetried ? 1 : 0,
+                    'failure_axis'    => $sseAxis,
                     'blank_ui_cause'  => ipmiProxyIloBlankUiCause($bmcPath, 'sse_final', [
                         'auth_rejected'        => !empty($r['auth_rejected']),
                         'curl_errno'           => (int) ($r['curl_errno'] ?? 0),
@@ -2888,11 +3362,13 @@ if ($method === 'GET' && ipmiProxyShouldStreamBmcRequest($method, $bmcPath)) {
             if (ipmiProxyDebugEnabled()
                 && ipmiWebIsNormalizedIloType($bmcTypeNorm)
                 && ipmiProxyIsIloEventStreamPath($bmcPath)) {
+                $sseFinalAxis = !empty($r['auth_rejected']) ? 'sse_auth_drift' : 'upstream_transport';
                 ipmiProxyDebugLog('ilo_runtime_final_failure', [
                     'trace'          => $ipmiTraceId,
                     'bmcPath'        => $bmcPath,
                     'kind'           => 'sse',
                     'auth'           => !empty($r['auth_rejected']) ? 'rejected' : 'transport',
+                    'failure_axis'   => $sseFinalAxis,
                     'blank_ui_cause' => ipmiProxyIloBlankUiCause($bmcPath, 'sse_final', [
                         'auth_rejected'        => !empty($r['auth_rejected']),
                         'curl_errno'           => (int) ($r['curl_errno'] ?? 0),
@@ -2936,96 +3412,28 @@ if (
 
 $result = ipmiProxyExecute($bmcUrl, $method, $postBody, $fwdContentType, $session['cookies'], is_array($fwdHdr) ? $fwdHdr : [], $bmcIp);
 
-if (ipmiWebIsNormalizedIloType($bmcTypeNorm) && ipmiProxyIsIloRecoverableRuntimePath($bmcPath)) {
-    $http0 = (int) ($result['http_code'] ?? 0);
-    $needRecover = false;
-    $failReason = '';
-    if (($result['raw'] ?? false) === false) {
-        $needRecover = true;
-        $failReason = 'curl_failed:' . (int) ($result['curl_errno'] ?? 0);
-    } elseif (in_array($http0, [401, 403, 502, 503], true)) {
-        $needRecover = true;
-        $failReason = 'http_' . $http0;
-    }
-    if ($needRecover && empty($GLOBALS['__ipmi_ilo_runtime_recover_attempted'])) {
-        if (ipmiProxyDebugEnabled()) {
-            $precheckCause = 'unknown';
-            if (str_starts_with($failReason, 'curl_failed')) {
-                $precheckCause = 'upstream_transport';
-            } elseif (preg_match('/^http_(401|403)$/', $failReason)) {
-                $precheckCause = 'auth_drift';
-            } elseif (preg_match('/^http_502$|^http_503$/', $failReason)) {
-                $precheckCause = 'upstream_transport';
-            } elseif (ipmiProxyIloRuntimePathDebugClass($bmcPath) === 'helper_fragment') {
-                $precheckCause = 'fragment_bootstrap';
-            } elseif (ipmiProxyIloRuntimePathDebugClass($bmcPath) === 'event_stream') {
-                $precheckCause = 'sse_failure';
-            }
-            ipmiProxyDebugLog('ilo_runtime_path_classified', [
-                'trace'              => $ipmiTraceId,
-                'path'               => $bmcPath,
-                'class'              => ipmiProxyIloRuntimePathDebugClass($bmcPath),
-                'method'             => $method,
-                'failure'            => $failReason,
-                'precheck_blank_ui'  => $precheckCause,
-            ]);
-        }
-        if (ipmiProxyIloRuntimeAuthRefresh($mysqli, $token, $session, $bmcIp, $ipmiTraceId, $failReason)) {
-            $GLOBALS['__ipmi_ilo_runtime_recover_attempted'] = true;
-            $fwdHdr = $session['forward_headers'] ?? [];
-            $fwdHdr = ipmiProxyMergeClientBmcForwardHeaders(
-                is_array($fwdHdr) ? $fwdHdr : [],
-                $bmcScheme,
-                $bmcIp,
-                is_array($session['cookies'] ?? null) ? $session['cookies'] : []
-            );
-            if (str_starts_with($bmcPathOnlyLower, '/json/')
-                || str_starts_with($bmcPathOnlyLower, '/api/')
-                || str_starts_with($bmcPathOnlyLower, '/rest/')) {
-                if (!ipmiProxyForwardHeadersHasHeader((array) $fwdHdr, 'X-Requested-With')) {
-                    $fwdHdr['X-Requested-With'] = 'XMLHttpRequest';
-                }
-                if (!ipmiProxyForwardHeadersHasHeader((array) $fwdHdr, 'Accept')) {
-                    $fwdHdr['Accept'] = 'application/json, text/javascript, */*';
-                }
-            }
-            if (ipmiProxyDebugEnabled()) {
-                ipmiProxyDebugLog('ilo_runtime_request_retry', [
-                    'trace'   => $ipmiTraceId,
-                    'bmcPath' => $bmcPath,
-                    'method'  => $method,
-                ]);
-            }
-            $result = ipmiProxyExecute($bmcUrl, $method, $postBody, $fwdContentType, $session['cookies'], is_array($fwdHdr) ? $fwdHdr : [], $bmcIp);
-            $http1 = (int) ($result['http_code'] ?? 0);
-            if (($result['raw'] ?? false) !== false && $http1 >= 200 && $http1 < 400 && ipmiProxyDebugEnabled()) {
-                ipmiProxyDebugLog('ilo_runtime_fragment_recovered', [
-                    'trace'   => $ipmiTraceId,
-                    'bmcPath' => $bmcPath,
-                ]);
-            } elseif (ipmiProxyDebugEnabled()
-                && ($result['raw'] ?? false) !== false
-                && in_array($http1, [401, 403, 502, 503], true)) {
-                ipmiProxyDebugLog('ilo_runtime_final_failure', [
-                    'trace'          => $ipmiTraceId,
-                    'bmcPath'        => $bmcPath,
-                    'phase'          => 'post_auth_retry_bad_http',
-                    'http'           => $http1,
-                    'path_class'     => ipmiProxyIloRuntimePathDebugClass($bmcPath),
-                    'blank_ui_cause' => ipmiProxyIloBlankUiCause($bmcPath, 'post_retry_http', ['http' => $http1]),
-                ]);
-            }
-        } elseif (ipmiProxyDebugEnabled()) {
-            ipmiProxyDebugLog('ilo_runtime_final_failure', [
-                'trace'          => $ipmiTraceId,
-                'bmcPath'        => $bmcPath,
-                'phase'          => 'auth_refresh_failed',
-                'reason'         => $failReason,
-                'path_class'     => ipmiProxyIloRuntimePathDebugClass($bmcPath),
-                'blank_ui_cause' => ipmiProxyIloBlankUiCause($bmcPath, 'auth_refresh_failed'),
-            ]);
-        }
-    }
+ipmiProxyIloMaybeRecoverBufferedRuntime(
+    $mysqli,
+    $token,
+    $session,
+    $bmcScheme,
+    $bmcIp,
+    $bmcPath,
+    $bmcPathOnlyLower,
+    $method,
+    $bmcUrl,
+    $postBody,
+    $fwdContentType,
+    $result,
+    $ipmiTraceId
+);
+if (!empty($GLOBALS['__ipmi_ilo_runtime_recover_attempted'])) {
+    $fwdHdr = ipmiProxyRebuildIloForwardHeadersFromSession(
+        $session,
+        $bmcScheme,
+        $bmcIp,
+        $bmcPathOnlyLower
+    );
 }
 
 // Core JS/CSS/image assets must be resilient. If transport failed, retry once.
@@ -3085,6 +3493,7 @@ if ($result['raw'] === false) {
             'kind'           => 'upstream_transport',
             'method'         => $method,
             'path_class'     => ipmiProxyIloRuntimePathDebugClass($bmcPath),
+            'failure_axis'   => 'upstream_transport',
             'blank_ui_cause' => ipmiProxyIloBlankUiCause($bmcPath, 'curl_after_recover'),
             'curl_errno'     => (int) ($result['curl_errno'] ?? 0),
         ]);
@@ -3501,13 +3910,18 @@ if ($method === 'GET' && $httpCode === 200 && $isHtml && $isAssetPath
         if (ipmiWebHasUsableBmcAuth($session['cookies'], is_array($session['forward_headers'] ?? null) ? $session['forward_headers'] : [])) {
             ipmiWebEmitMirroredBmcCookiesForProxy($token, $session['cookies']);
         }
+        $retryHdrAsset = is_array($fwdHdr) ? $fwdHdr : [];
+        $iloAssetHdr = ipmiProxyIloFreshForwardHeadersAfterRelogin($session, $bmcScheme, $bmcIp, $bmcPath, $mysqli, $token, $ipmiTraceId);
+        if ($iloAssetHdr !== null) {
+            $retryHdrAsset = $iloAssetHdr;
+        }
         $retryAsset = ipmiProxyExecute(
             $bmcUrl,
             $method,
             $postBody,
             $fwdContentType,
             $session['cookies'],
-            is_array($fwdHdr) ? $fwdHdr : [],
+            $retryHdrAsset,
             $bmcIp,
             20
         );
@@ -3628,13 +4042,18 @@ if ($method === 'GET' && $httpCode === 200 && $isHtml && !$isAssetPath
             }
             // Same target (already on landing path): retry this request with fresh cookies instead
             // of emitting timeout page from stale response.
+            $retryHdrRelogin = is_array($fwdHdr) ? $fwdHdr : [];
+            $iloReloginHdr = ipmiProxyIloFreshForwardHeadersAfterRelogin($session, $bmcScheme, $bmcIp, $bmcPath, $mysqli, $token, $ipmiTraceId);
+            if ($iloReloginHdr !== null) {
+                $retryHdrRelogin = $iloReloginHdr;
+            }
             $retryAfterLogin = ipmiProxyExecute(
                 $bmcUrl,
                 $method,
                 $postBody,
                 $fwdContentType,
                 $session['cookies'],
-                is_array($fwdHdr) ? $fwdHdr : [],
+                $retryHdrRelogin,
                 $bmcIp,
                 20
             );
@@ -3676,7 +4095,7 @@ if ($method === 'GET' && $httpCode === 200 && $isHtml && !$isAssetPath
                 'smTimeoutShell' => $looksLikeSmTimeoutShell ? 1 : 0,
             ]);
         }
-        ipmiWebKvmLaunchPlanCacheInvalidate($token);
+        ipmiWebKvmLaunchPlanCacheInvalidate($mysqli, $token);
         if (ipmiProxyDebugEnabled()) {
             ipmiProxyDebugLog('kvm_plan_recomputed_after_auth_drift', [
                 'trace' => $ipmiTraceId,
@@ -3685,77 +4104,6 @@ if ($method === 'GET' && $httpCode === 200 && $isHtml && !$isAssetPath
         }
         ipmiProxyEmitSessionExpiredPage('Your session has timed out. You will need to open a new session.');
         exit;
-    }
-}
-
-// iLO runtime APIs can return 401/403 even while shell HTML is still cached/rendered.
-// Retry once after a fresh auto-login so UI does not fall into a white/login shell loop.
-// (Skip if unified recover+retry already ran for this request.)
-if (
-    ($httpCode === 401 || $httpCode === 403)
-    && ($method === 'GET' || $method === 'POST')
-    && empty($GLOBALS['__ipmi_ilo_runtime_recover_attempted'])
-    && ipmiWebIsNormalizedIloType(ipmiWebNormalizeBmcType((string) ($session['bmc_type'] ?? 'generic')))
-    && ipmiProxyIsIloRuntimeApiPath($bmcPath)
-) {
-    if (ipmiProxyDebugEnabled()) {
-        ipmiProxyDebugLog('ilo_runtime_auth_recover_start', [
-            'trace' => $ipmiTraceId,
-            'bmcPath' => $bmcPath,
-            'http' => $httpCode,
-        ]);
-    }
-    $session['cookies'] = [];
-    $session['forward_headers'] = [];
-    if (ipmiWebAttemptAutoLogin($session, $mysqli)) {
-        ipmiWebPersistRefreshedRuntimeAuth($mysqli, $token, $session);
-        $retryHdr = ipmiProxyMergeClientBmcForwardHeaders(
-            is_array($session['forward_headers'] ?? null) ? $session['forward_headers'] : [],
-            (string) ($session['bmc_scheme'] ?? 'https'),
-            $bmcIp,
-            is_array($session['cookies'] ?? null) ? $session['cookies'] : []
-        );
-        if (!ipmiProxyForwardHeadersHasHeader($retryHdr, 'X-Requested-With')) {
-            $retryHdr['X-Requested-With'] = 'XMLHttpRequest';
-        }
-        if (!ipmiProxyForwardHeadersHasHeader($retryHdr, 'Accept')) {
-            $retryHdr['Accept'] = 'application/json, text/javascript, */*';
-        }
-        $retryApi = ipmiProxyExecute(
-            $bmcUrl,
-            $method,
-            $postBody,
-            $fwdContentType,
-            is_array($session['cookies'] ?? null) ? $session['cookies'] : [],
-            $retryHdr,
-            $bmcIp,
-            20
-        );
-        if ($retryApi['raw'] !== false) {
-            $rawResponse = $retryApi['raw'];
-            $httpCode = (int) ($retryApi['http_code'] ?? 0);
-            $contentTypeResp = (string) ($retryApi['content_type'] ?? '');
-            [, $responseBody] = ipmiWebCurlExtractFinalHeadersAndBody($rawResponse);
-            $ct = strtolower(trim(explode(';', $contentTypeResp)[0] ?? ''));
-            $isHtml = ($ct === '' || $ct === 'text/html' || strpos($ct, 'html') !== false || strpos($ct, 'text/plain') !== false);
-            $isJs = in_array($ct, ['application/javascript', 'text/javascript', 'application/x-javascript'], true);
-            $isCss = ($ct === 'text/css');
-            $isJson = (strpos($ct, 'json') !== false);
-            if (ipmiProxyDebugEnabled()) {
-                ipmiProxyDebugLog('ilo_runtime_auth_recover_result', [
-                    'trace' => $ipmiTraceId,
-                    'bmcPath' => $bmcPath,
-                    'http' => $httpCode,
-                    'contentType' => $contentTypeResp,
-                ]);
-            }
-        }
-    } elseif (ipmiProxyDebugEnabled()) {
-        ipmiProxyDebugLog('ilo_runtime_auth_recover_failed', [
-            'trace' => $ipmiTraceId,
-            'bmcPath' => $bmcPath,
-            'error' => (string) ($session['auto_login_error'] ?? ''),
-        ]);
     }
 }
 
@@ -4055,8 +4403,8 @@ if ($rewriteBody) {
         }
         $shouldInjectKvmAutoPatch = ($httpCode >= 200 && $httpCode < 400) && $injectKvmPathOk;
         if ($shouldInjectKvmAutoPatch) {
-            $launchPlanForPatch = ipmiWebResolveKvmLaunchPlan($session);
-            $responseBody = ipmiProxyInjectKvmAutoLaunchPatch($responseBody, $token, $session, $kvmAutoFlow, $launchPlanForPatch);
+            $launchPlanForPatch = ipmiWebResolveKvmLaunchPlan($session, $mysqli);
+            $responseBody = ipmiProxyInjectKvmAutoLaunchPatch($responseBody, $token, $session, $kvmAutoFlow, $launchPlanForPatch, $mysqli);
             if (ipmiProxyDebugEnabled()) {
                 ipmiProxyDebugLog('kvm_launch_plan_selected', array_merge(
                     ['trace' => $ipmiTraceId, 'bmcPath' => $bmcPath],
