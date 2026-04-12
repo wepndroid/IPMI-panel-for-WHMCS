@@ -7,6 +7,9 @@
  *   id, token, user_id, server_id, ipmi_ip, ipmi_user, ipmi_pass,
  *   bmc_type, bmc_cookies (JSON: flat cookie map, or {"_c":{...},"_h":{...},"_s":"http","_m":{...}}),
  *   _m holds small opaque session metadata (KVM plan cache, iLO preflight TTL, iLO SPA bootstrap state) — not secrets.
+ *   _m.ilo_bootstrap (v1): phase, rolling event window, SSE health, refresh_ts budget, shell_ts (last successful shell_entry),
+ *   window.roles_ok (distinct critical roles that succeeded in the short window), and observed.paths — bounded per-session
+ *   hints (hit counts, promotion flags, ~600s TTL) for firmware-specific helper routes; no secrets.
  *   created_ip, user_agent,
  *   created_at, expires_at, last_access_at, revoked_at
  */

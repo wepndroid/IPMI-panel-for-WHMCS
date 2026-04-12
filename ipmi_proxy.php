@@ -1626,9 +1626,9 @@ function ipmiProxyIsIloEventStreamPath(string $bmcPath): bool
 }
 
 /**
- * Small HTML fragments the iLO SPA loads during bootstrap (not full application pages).
+ * Named HTML fragments (legacy allowlist — broader detection uses heuristics + context).
  */
-function ipmiProxyIsIloRuntimeFragmentPath(string $bmcPath): bool
+function ipmiProxyIloRuntimeFragmentPathNamed(string $bmcPath): bool
 {
     $p = strtolower((string) parse_url($bmcPath, PHP_URL_PATH));
     if ($p === '') {
@@ -1646,6 +1646,405 @@ function ipmiProxyIsIloRuntimeFragmentPath(string $bmcPath): bool
     }
 
     return str_contains($p, 'masthead') && str_ends_with($p, '.html');
+}
+
+/**
+ * Full application / heavy HTML pages — never treat as small bootstrap fragments.
+ */
+function ipmiProxyIloHtmlFragmentPathStrictExclude(string $pLower): bool
+{
+    if ($pLower === '' || !str_starts_with($pLower, '/html/') || !str_ends_with($pLower, '.html')) {
+        return true;
+    }
+    $bn = basename($pLower);
+    if (preg_match('/^(application|index|login|summary|redirect|health|kvm|console)\\b/i', $bn)) {
+        return true;
+    }
+    if (preg_match('/java_irc|jnlp|rc_info|remote_console|virtual_media|video|license|legal|help(_|\\.|$)|about\\./i', $pLower)) {
+        return true;
+    }
+
+    return false;
+}
+
+/**
+ * @param array<string, mixed> $context bootstrap_state?, observed?, shell_ts?, trace?
+ * @return array{score: int, reasons: list<string>}
+ */
+function ipmiProxyIloHtmlFragmentHeuristicScore(string $bmcPath, array $context): array
+{
+    $p = strtolower((string) parse_url($bmcPath, PHP_URL_PATH));
+    $reasons = [];
+    $score = 0;
+    if ($p === '' || ipmiProxyIloHtmlFragmentPathStrictExclude($p)) {
+        return ['score' => 0, 'reasons' => ['excluded_or_invalid']];
+    }
+    if (!str_starts_with($p, '/html/') || !str_ends_with($p, '.html')) {
+        return ['score' => 0, 'reasons' => ['not_html_fragment_path']];
+    }
+    $bn = basename($p, '.html');
+    $score += 22;
+    $reasons[] = 'under_html';
+    if (strlen($bn) <= 36 && preg_match('/(?:^|_)(?:nav|bar|head|pane|frag|partial|widget|menu|tile|card|drawer|panel|snippet|include|toolbar|breadcrumb|masthead|sidebar|footer|header)(?:_|$)/i', $bn)) {
+        $score += 28;
+        $reasons[] = 'fragment_like_name';
+    } elseif (preg_match('/(?:fragment|partial|widget|snippet|include|masthead|sidebar|navbar|statusbar)/i', $bn)) {
+        $score += 24;
+        $reasons[] = 'bootstrap_keyword';
+    } elseif (strlen($bn) <= 24 && !str_contains($bn, '_') && $bn !== 'page' && $bn !== 'main') {
+        $score += 8;
+        $reasons[] = 'short_basename';
+    }
+    $st = is_array($context['bootstrap_state'] ?? null) ? $context['bootstrap_state'] : [];
+    $shellTs = (int) ($st['shell_ts'] ?? $context['shell_ts'] ?? 0);
+    $now = time();
+    if ($shellTs > 0 && $now - $shellTs < 120) {
+        $score += 18;
+        $reasons[] = 'post_shell_window';
+    }
+    if (ipmiProxyIloIsWithinBootstrapWindow($st)) {
+        $score += 12;
+        $reasons[] = 'bootstrap_window';
+    }
+    $obs = is_array($st['observed'] ?? null) ? $st['observed'] : [];
+    $paths = is_array($obs['paths'] ?? null) ? $obs['paths'] : [];
+    if (!empty($paths[$p]['promoted'])) {
+        $score += 35;
+        $reasons[] = 'observed_promoted';
+    } elseif (isset($paths[$p]) && (int) ($paths[$p]['hits'] ?? 0) >= 2) {
+        $score += 15;
+        $reasons[] = 'observed_repeat';
+    }
+    $phase = (string) ($st['phase'] ?? '');
+    if (in_array($phase, ['bootstrapping', 'degraded', 'stalled'], true)) {
+        $score += 8;
+        $reasons[] = 'phase_not_healthy';
+    }
+
+    return ['score' => min(100, $score), 'reasons' => $reasons];
+}
+
+/**
+ * Reasons that indicate the path shape is fragment-like or session-learned, not merely "any /html/*.html soon after shell".
+ *
+ * @param list<string> $reasons
+ */
+function ipmiProxyIloHtmlFragmentHeuristicHasStructuralSignal(array $reasons): bool
+{
+    static $sig = [
+        'fragment_like_name',
+        'bootstrap_keyword',
+        'short_basename',
+        'observed_repeat',
+        'observed_promoted',
+    ];
+    foreach ($reasons as $r) {
+        if (in_array($r, $sig, true)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+function ipmiProxyIloShouldTreatHtmlFragmentAsBootstrapCritical(string $bmcPath, array $context): bool
+{
+    if (ipmiProxyIloRuntimeFragmentPathNamed($bmcPath)) {
+        return true;
+    }
+    $p = strtolower((string) parse_url($bmcPath, PHP_URL_PATH));
+    if (ipmiProxyIloHtmlFragmentPathStrictExclude($p)) {
+        return false;
+    }
+    $h = ipmiProxyIloHtmlFragmentHeuristicScore($bmcPath, $context);
+    if ($h['score'] < 52) {
+        return false;
+    }
+
+    return ipmiProxyIloHtmlFragmentHeuristicHasStructuralSignal($h['reasons']);
+}
+
+/**
+ * Path-only recoverability hint for /html/*.html (no session). Bounded; excludes heavy pages.
+ */
+function ipmiProxyIloHtmlFragmentRecoverableHeuristic(string $bmcPath): bool
+{
+    $p = strtolower((string) parse_url($bmcPath, PHP_URL_PATH));
+    if (ipmiProxyIloHtmlFragmentPathStrictExclude($p)) {
+        return false;
+    }
+    if (!str_starts_with($p, '/html/') || !str_ends_with($p, '.html')) {
+        return false;
+    }
+    $h = ipmiProxyIloHtmlFragmentHeuristicScore($bmcPath, []);
+
+    return $h['score'] >= 36;
+}
+
+function ipmiProxyIloLooksLikeBootstrapHtmlFragment(string $bmcPath, array $context = []): bool
+{
+    return ipmiProxyIloRuntimeFragmentPathNamed($bmcPath)
+        || ipmiProxyIloShouldTreatHtmlFragmentAsBootstrapCritical($bmcPath, $context);
+}
+
+function ipmiProxyIloLooksLikeBootstrapApi(string $bmcPath, array $context = []): bool
+{
+    unset($context);
+    $p = strtolower((string) parse_url($bmcPath, PHP_URL_PATH));
+    if ($p === '' || ipmiProxyIsHealthPollPath($bmcPath)) {
+        return false;
+    }
+
+    return str_starts_with($p, '/json/') || str_starts_with($p, '/api/') || str_starts_with($p, '/rest/');
+}
+
+function ipmiProxyIloIsWithinBootstrapWindow(array $state): bool
+{
+    $shellTs = (int) ($state['shell_ts'] ?? 0);
+    if ($shellTs <= 0) {
+        return false;
+    }
+    $age = time() - $shellTs;
+    if ($age < 120) {
+        return true;
+    }
+    $phase = (string) ($state['phase'] ?? '');
+
+    return $age < 300 && in_array($phase, ['bootstrapping', 'degraded', 'stalled'], true);
+}
+
+/** @param array<string, mixed> $session */
+function ipmiProxyIloPathContextFromSession(array $session): array
+{
+    $state = ipmiProxyIloBootstrapStateLoad($session);
+
+    return [
+        'bootstrap_state' => $state,
+        'shell_ts'        => (int) ($state['shell_ts'] ?? 0),
+    ];
+}
+
+/**
+ * @param array<string, mixed> $baseRole from ipmiProxyClassifyIloPathRole inner
+ * @param array<string, mixed> $state
+ * @param array<string, mixed> $requestContext path, heuristic breakdown, trace
+ * @return array<string, mixed>
+ */
+function ipmiProxyIloContextualizePathRole(array $baseRole, array $state, array $requestContext): array
+{
+    $out = $baseRole;
+    $out['base_role'] = (string) ($baseRole['role'] ?? '');
+    $out['flags'] = is_array($baseRole['flags'] ?? null) ? $baseRole['flags'] : [];
+    $out['flags']['context_elevated'] = false;
+    $bmcPath = (string) ($requestContext['bmcPath'] ?? '');
+    $p = strtolower((string) parse_url($bmcPath, PHP_URL_PATH));
+    $trace = (string) ($requestContext['trace'] ?? '');
+    if (($baseRole['role'] ?? '') !== 'transport_related' || !str_starts_with($p, '/html/') || !str_ends_with($p, '.html')) {
+        return $out;
+    }
+    $ctx = [
+        'bootstrap_state' => $state,
+        'shell_ts'        => (int) ($state['shell_ts'] ?? 0),
+    ];
+    $h = ipmiProxyIloHtmlFragmentHeuristicScore($bmcPath, $ctx);
+    $out['heuristic_score'] = $h['score'];
+    $out['heuristic_reasons'] = $h['reasons'];
+    $promoted = false;
+    $obs = is_array($state['observed'] ?? null) ? $state['observed'] : [];
+    $paths = is_array($obs['paths'] ?? null) ? $obs['paths'] : [];
+    if (!empty($paths[$p]['promoted'])) {
+        $promoted = true;
+    }
+    $structural = ipmiProxyIloHtmlFragmentHeuristicHasStructuralSignal($h['reasons']);
+    $elevate = $promoted
+        || ($structural && ($h['score'] >= 52 || ($h['score'] >= 44 && ipmiProxyIloIsWithinBootstrapWindow($state))));
+    if (!$elevate) {
+        if (ipmiProxyDebugEnabled() && $trace !== '') {
+            ipmiProxyDebugLog('ilo_html_fragment_heuristic_negative', [
+                'trace'   => $trace,
+                'bmcPath' => $bmcPath,
+                'score'   => $h['score'],
+            ]);
+            ipmiProxyDebugLog('ilo_path_role_not_elevated_after_context_check', [
+                'trace'   => $trace,
+                'bmcPath' => $bmcPath,
+                'score'   => $h['score'],
+            ]);
+        }
+
+        return $out;
+    }
+    $out['role'] = $h['score'] >= 58 || $promoted ? 'bootstrap_critical' : 'runtime_fragment';
+    $out['bootstrap_critical'] = true;
+    $out['recoverable'] = true;
+    $out['debug_class'] = 'helper_fragment';
+    $out['flags']['html_heuristic'] = true;
+    $out['flags']['context_elevated'] = true;
+    if ($promoted) {
+        $out['flags']['promoted_observed'] = true;
+    }
+    if (ipmiProxyDebugEnabled() && $trace !== '') {
+        ipmiProxyDebugLog('ilo_html_fragment_heuristic_positive', [
+            'trace'   => $trace,
+            'bmcPath' => $bmcPath,
+            'score'   => $h['score'],
+            'reasons' => $h['reasons'],
+        ]);
+        ipmiProxyDebugLog('ilo_path_role_elevated_by_context', [
+            'trace' => $trace,
+            'bmcPath'  => $bmcPath,
+            'score'    => $h['score'],
+            'promoted' => $promoted ? 1 : 0,
+            'role'     => $out['role'],
+        ]);
+        ipmiProxyDebugLog('ilo_bootstrap_html_fragment_detected', [
+            'trace'   => $trace,
+            'bmcPath' => $bmcPath,
+            'score'   => $h['score'],
+        ]);
+        if ($out['role'] === 'bootstrap_critical') {
+            ipmiProxyDebugLog('ilo_html_fragment_promoted_to_bootstrap_critical', [
+                'trace'   => $trace,
+                'bmcPath' => $bmcPath,
+                'via'     => $promoted ? 'observed' : 'heuristic',
+            ]);
+        }
+    }
+
+    return $out;
+}
+
+/**
+ * @return array<string, mixed>
+ */
+function ipmiProxyIloObservedPathsNormalize(array $obs, int $now = 0): array
+{
+    if (!is_array($obs) || (int) ($obs['v'] ?? 0) !== 1) {
+        return ['v' => 1, 'paths' => []];
+    }
+    if ($now <= 0) {
+        $now = time();
+    }
+    $paths = is_array($obs['paths'] ?? null) ? $obs['paths'] : [];
+    foreach ($paths as $k => $row) {
+        if (!is_array($row)) {
+            unset($paths[$k]);
+            continue;
+        }
+        if ($now - (int) ($row['last'] ?? 0) > 600) {
+            unset($paths[$k]);
+        }
+    }
+    if (count($paths) > 12) {
+        $paths = array_slice($paths, -12, 12, true);
+    }
+
+    return ['v' => 1, 'paths' => $paths];
+}
+
+/**
+ * @param array<string, mixed> $state
+ * @return array<string, mixed>
+ */
+function ipmiProxyIloRecordObservedBootstrapPath(array $state, string $pathKey, bool $wasCritical, bool $outcomeOk): array
+{
+    $now = time();
+    $state['observed'] = ipmiProxyIloObservedPathsNormalize($state['observed'] ?? [], $now);
+    $paths = &$state['observed']['paths'];
+    if (!isset($paths[$pathKey])) {
+        $paths[$pathKey] = ['first' => $now, 'hits' => 0, 'promoted' => 0, 'last' => $now, 'ok' => 0, 'fail' => 0];
+    }
+    $paths[$pathKey]['hits'] = (int) ($paths[$pathKey]['hits'] ?? 0) + 1;
+    $paths[$pathKey]['last'] = $now;
+    if ($outcomeOk) {
+        $paths[$pathKey]['ok'] = (int) ($paths[$pathKey]['ok'] ?? 0) + 1;
+    } else {
+        $paths[$pathKey]['fail'] = (int) ($paths[$pathKey]['fail'] ?? 0) + 1;
+    }
+    if ($wasCritical && (int) $paths[$pathKey]['hits'] >= 2 && ipmiProxyIloIsWithinBootstrapWindow($state)) {
+        if (empty($paths[$pathKey]['promoted'])) {
+            $promoCount = 0;
+            foreach ($paths as $row) {
+                if (is_array($row) && !empty($row['promoted'])) {
+                    $promoCount++;
+                }
+            }
+            if ($promoCount >= 8) {
+                if (ipmiProxyDebugEnabled()) {
+                    ipmiProxyDebugLog('ilo_observed_path_promotion_skipped', [
+                        'path' => $pathKey,
+                        'reason'=> 'max_promoted_paths',
+                    ]);
+                    ipmiProxyDebugLog('ilo_bootstrap_recovery_guardrail_applied', [
+                        'rule' => 'observed_promotion_cap',
+                    ]);
+                }
+            } else {
+                $paths[$pathKey]['promoted'] = 1;
+                if (ipmiProxyDebugEnabled()) {
+                    ipmiProxyDebugLog('ilo_observed_path_promoted', ['path' => $pathKey, 'hits' => (int) $paths[$pathKey]['hits']]);
+                    ipmiProxyDebugLog('ilo_path_promoted_by_observation', ['path' => $pathKey]);
+                }
+            }
+        }
+    }
+    foreach ($paths as $k => $row) {
+        if (!is_array($row)) {
+            unset($paths[$k]);
+            continue;
+        }
+        if ($now - (int) ($row['last'] ?? 0) > 600) {
+            unset($paths[$k]);
+            if (ipmiProxyDebugEnabled()) {
+                ipmiProxyDebugLog('ilo_observed_path_expired', ['path' => $k]);
+            }
+        }
+    }
+    if (count($paths) > 12) {
+        $paths = array_slice($paths, -12, 12, true);
+    }
+    if (ipmiProxyDebugEnabled()) {
+        ipmiProxyDebugLog('ilo_observed_path_recorded', [
+            'path'    => $pathKey,
+            'critical'=> $wasCritical ? 1 : 0,
+            'ok'      => $outcomeOk ? 1 : 0,
+        ]);
+    }
+
+    return $state;
+}
+
+/**
+ * Small HTML fragments the iLO SPA loads during bootstrap (not full application pages).
+ * With optional $context (bootstrap_state), includes heuristic/promoted HTML helpers.
+ */
+function ipmiProxyIsIloRuntimeFragmentPath(string $bmcPath, array $context = []): bool
+{
+    if (ipmiProxyIloRuntimeFragmentPathNamed($bmcPath)) {
+        return true;
+    }
+    if ($context !== [] && ipmiProxyIloShouldTreatHtmlFragmentAsBootstrapCritical($bmcPath, $context)) {
+        return true;
+    }
+
+    return false;
+}
+
+/**
+ * Use for semantic HTML checks when session context is unavailable (path-only heuristic).
+ */
+function ipmiProxyIloIsHtmlFragmentForSemanticCheck(string $bmcPath): bool
+{
+    if (ipmiProxyIloRuntimeFragmentPathNamed($bmcPath)) {
+        return true;
+    }
+    $p = strtolower((string) parse_url($bmcPath, PHP_URL_PATH));
+    if (ipmiProxyIloHtmlFragmentPathStrictExclude($p)) {
+        return false;
+    }
+
+    return str_starts_with($p, '/html/') && str_ends_with($p, '.html')
+        && ipmiProxyIloHtmlFragmentHeuristicScore($bmcPath, [])['score'] >= 40;
 }
 
 function ipmiProxyIsIloBootstrapPath(string $bmcPath): bool
@@ -1669,7 +2068,8 @@ function ipmiProxyIsIloRecoverableRuntimePath(string $bmcPath): bool
         return true;
     }
 
-    return ipmiProxyIsIloRuntimeFragmentPath($bmcPath);
+    return ipmiProxyIsIloRuntimeFragmentPath($bmcPath)
+        || ipmiProxyIloHtmlFragmentRecoverableHeuristic($bmcPath);
 }
 
 function ipmiProxyIsIloSpaShellEntryPath(string $bmcPath): bool
@@ -1682,98 +2082,185 @@ function ipmiProxyIsIloSpaShellEntryPath(string $bmcPath): bool
 /**
  * Authoritative iLO path roles for bootstrap / recovery / debug (normalized iLO only at call sites).
  *
- * @return array{
- *   role: string,
- *   bootstrap_critical: bool,
- *   recoverable: bool,
- *   debug_class: string,
- *   path_key: string
- * }
+ * $context may include bootstrap_state, shell_ts, trace (for debug), accept_header (reserved).
+ *
+ * @param array<string, mixed> $context
+ * @return array<string, mixed>
  */
-function ipmiProxyClassifyIloPathRole(string $bmcPath, string $method = 'GET'): array
+function ipmiProxyClassifyIloPathRole(string $bmcPath, string $method = 'GET', array $context = []): array
 {
+    unset($method);
     $p = strtolower((string) parse_url($bmcPath, PHP_URL_PATH));
     $pathKey = $p !== '' ? $p : '/';
-    if ($p === '') {
-        return [
-            'role'               => 'noncritical',
-            'bootstrap_critical' => false,
-            'recoverable'        => false,
-            'debug_class'        => 'other',
-            'path_key'           => $pathKey,
-        ];
+    $trace = (string) ($context['trace'] ?? '');
+    $fragCtx = $context;
+    if (isset($context['bootstrap_state']) && is_array($context['bootstrap_state'])) {
+        $fragCtx = array_merge($context, [
+            'bootstrap_state' => $context['bootstrap_state'],
+            'shell_ts'        => (int) ($context['bootstrap_state']['shell_ts'] ?? 0),
+        ]);
     }
-    if (ipmiProxyIsBmcStaticAssetPath($bmcPath)) {
-        return [
-            'role'               => 'static_asset',
-            'bootstrap_critical' => false,
-            'recoverable'        => false,
-            'debug_class'        => 'other',
-            'path_key'           => $pathKey,
-        ];
-    }
-    if (ipmiProxyIsIloSpaShellEntryPath($bmcPath)) {
-        return [
-            'role'               => 'shell_entry',
-            'bootstrap_critical' => true,
-            'recoverable'        => false,
-            'debug_class'        => 'other',
-            'path_key'           => $pathKey,
-        ];
-    }
-    if (ipmiProxyIsIloEventStreamPath($bmcPath)) {
-        return [
-            'role'               => 'event_stream',
-            'bootstrap_critical' => true,
-            'recoverable'        => true,
-            'debug_class'        => 'event_stream',
-            'path_key'           => $pathKey,
-        ];
-    }
-    if (ipmiProxyIsIloRuntimeFragmentPath($bmcPath)) {
-        return [
-            'role'               => 'runtime_fragment',
-            'bootstrap_critical' => true,
-            'recoverable'        => true,
-            'debug_class'        => 'helper_fragment',
-            'path_key'           => $pathKey,
-        ];
-    }
-    if (str_starts_with($p, '/json/') || str_starts_with($p, '/api/') || str_starts_with($p, '/rest/')) {
-        if (ipmiProxyIsHealthPollPath($bmcPath)) {
-            return [
-                'role'               => 'noncritical',
-                'bootstrap_critical' => false,
-                'recoverable'        => false,
-                'debug_class'        => 'runtime_api',
-                'path_key'           => $pathKey,
-            ];
-        }
-        return [
-            'role'               => 'runtime_api',
-            'bootstrap_critical' => true,
-            'recoverable'        => true,
-            'debug_class'        => 'runtime_api',
-            'path_key'           => $pathKey,
-        ];
-    }
-    if (str_starts_with($p, '/html/') && str_ends_with($p, '.html')) {
-        return [
-            'role'               => 'transport_related',
-            'bootstrap_critical' => false,
-            'recoverable'        => false,
-            'debug_class'        => 'other',
-            'path_key'           => $pathKey,
-        ];
-    }
-
-    return [
+    $base = [
         'role'               => 'noncritical',
         'bootstrap_critical' => false,
         'recoverable'        => false,
         'debug_class'        => 'other',
         'path_key'           => $pathKey,
+        'flags'              => [
+            'html_heuristic'     => false,
+            'promoted_observed'  => false,
+            'context_elevated'   => false,
+            'api_bootstrap'      => false,
+        ],
+        'heuristic_score'      => 0,
+        'heuristic_reasons'  => [],
+        'base_role'          => 'noncritical',
     ];
+    if ($p === '') {
+        return $base;
+    }
+    if (ipmiProxyIsBmcStaticAssetPath($bmcPath)) {
+        if (ipmiProxyDebugEnabled() && $trace !== '') {
+            ipmiProxyDebugLog('ilo_path_excluded_as_static_asset', ['trace' => $trace, 'bmcPath' => $bmcPath]);
+        }
+        $base['role'] = 'static_asset';
+        $base['base_role'] = 'static_asset';
+
+        return $base;
+    }
+    if (ipmiProxyIsIloSpaShellEntryPath($bmcPath)) {
+        $base['role'] = 'shell_entry';
+        $base['base_role'] = 'shell_entry';
+        $base['bootstrap_critical'] = true;
+
+        return $base;
+    }
+    if (ipmiProxyIsIloEventStreamPath($bmcPath)) {
+        $base['role'] = 'event_stream';
+        $base['base_role'] = 'event_stream';
+        $base['bootstrap_critical'] = true;
+        $base['recoverable'] = true;
+        $base['debug_class'] = 'event_stream';
+
+        return $base;
+    }
+    if (ipmiProxyIsIloRuntimeFragmentPath($bmcPath, $fragCtx)) {
+        $h = ipmiProxyIloHtmlFragmentHeuristicScore($bmcPath, $fragCtx);
+        $base['role'] = 'runtime_fragment';
+        $base['base_role'] = 'runtime_fragment';
+        $base['bootstrap_critical'] = true;
+        $base['recoverable'] = true;
+        $base['debug_class'] = 'helper_fragment';
+        $base['heuristic_score'] = $h['score'];
+        $base['heuristic_reasons'] = $h['reasons'];
+        if ($h['score'] >= 40 && !ipmiProxyIloRuntimeFragmentPathNamed($bmcPath)) {
+            $base['flags']['html_heuristic'] = true;
+        }
+
+        return $base;
+    }
+    if (str_starts_with($p, '/json/') || str_starts_with($p, '/api/') || str_starts_with($p, '/rest/')) {
+        if (ipmiProxyIsHealthPollPath($bmcPath)) {
+            $base['role'] = 'noncritical';
+            $base['base_role'] = 'noncritical';
+            $base['debug_class'] = 'runtime_api';
+
+            return $base;
+        }
+        $base['role'] = 'runtime_api';
+        $base['base_role'] = 'runtime_api';
+        $base['bootstrap_critical'] = true;
+        $base['recoverable'] = true;
+        $base['debug_class'] = 'runtime_api';
+        $base['flags']['api_bootstrap'] = true;
+        if (ipmiProxyDebugEnabled() && $trace !== '') {
+            ipmiProxyDebugLog('ilo_bootstrap_api_detected', ['trace' => $trace, 'bmcPath' => $bmcPath]);
+        }
+
+        return $base;
+    }
+    if (str_starts_with($p, '/html/') && str_ends_with($p, '.html')) {
+        $base['role'] = 'transport_related';
+        $base['base_role'] = 'transport_related';
+
+        return $base;
+    }
+    $base['base_role'] = 'noncritical';
+
+    return $base;
+}
+
+/**
+ * Classify with session bootstrap state + contextual elevation + debug summary.
+ *
+ * @return array<string, mixed>
+ */
+function ipmiProxyClassifyIloPathRoleForSession(
+    mysqli $mysqli,
+    string $token,
+    array &$session,
+    string $bmcPath,
+    string $method,
+    string $traceId
+): array {
+    if (!ipmiWebIsNormalizedIloType(ipmiWebNormalizeBmcType((string) ($session['bmc_type'] ?? 'generic')))) {
+        return ipmiProxyClassifyIloPathRole($bmcPath, $method, []);
+    }
+    $ctx = ipmiProxyIloPathContextFromSession($session);
+    $ctx['trace'] = $traceId;
+    $state = is_array($ctx['bootstrap_state'] ?? null) ? $ctx['bootstrap_state'] : [];
+    if (ipmiProxyIloIsWithinBootstrapWindow($state) && ipmiProxyDebugEnabled()) {
+        ipmiProxyDebugLog('ilo_bootstrap_context_window_active', [
+            'trace'    => $traceId,
+            'shell_ts' => (int) ($state['shell_ts'] ?? 0),
+            'phase'    => (string) ($state['phase'] ?? ''),
+        ]);
+    }
+    $base = ipmiProxyClassifyIloPathRole($bmcPath, $method, $ctx);
+    $base['base_role'] = (string) ($base['base_role'] ?? $base['role']);
+    $final = $base;
+    if ($state !== []) {
+        $final = ipmiProxyIloContextualizePathRole($base, $state, [
+            'bmcPath' => $bmcPath,
+            'trace'   => $traceId,
+        ]);
+    }
+    if (ipmiProxyDebugEnabled()) {
+        ipmiProxyDebugLog('ilo_role_heuristic_summary', [
+            'trace'            => $traceId,
+            'bmcPath'          => $bmcPath,
+            'base_role'        => (string) ($final['base_role'] ?? ''),
+            'final_role'       => (string) ($final['role'] ?? ''),
+            'bootstrap_crit'   => !empty($final['bootstrap_critical']) ? 1 : 0,
+            'heuristic_score'  => (int) ($final['heuristic_score'] ?? 0),
+            'heuristic_reasons'=> $final['heuristic_reasons'] ?? [],
+            'flags'            => $final['flags'] ?? [],
+        ]);
+        ipmiProxyDebugLog('ilo_bootstrap_role_finalized', [
+            'trace'      => $traceId,
+            'bmcPath'    => $bmcPath,
+            'final_role' => (string) ($final['role'] ?? ''),
+        ]);
+    }
+    if (
+        ($final['base_role'] ?? '') === 'transport_related'
+        && ($final['role'] ?? '') === 'transport_related'
+        && str_starts_with(strtolower((string) parse_url($bmcPath, PHP_URL_PATH)), '/html/')
+        && ipmiProxyIloIsWithinBootstrapWindow($state)
+        && ipmiProxyDebugEnabled()
+    ) {
+        $hs = ipmiProxyIloHtmlFragmentHeuristicScore($bmcPath, [
+            'bootstrap_state' => $state,
+            'shell_ts'        => (int) ($state['shell_ts'] ?? 0),
+        ]);
+        ipmiProxyDebugLog('ilo_path_missed_as_bootstrap_critical', [
+            'trace'   => $traceId,
+            'bmcPath' => $bmcPath,
+            'score'   => $hs['score'],
+        ]);
+    }
+
+    return $final;
 }
 
 /** @return array<string, mixed> */
@@ -1791,6 +2278,10 @@ function ipmiProxyIloBootstrapStateLoad(array $session): array
     $raw['events'] = is_array($raw['events'] ?? null) ? array_slice($raw['events'], -24) : [];
     $raw['refresh_ts'] = is_array($raw['refresh_ts'] ?? null) ? $raw['refresh_ts'] : [];
     $raw['sse'] = is_array($raw['sse'] ?? null) ? $raw['sse'] : ipmiProxyIloBootstrapStateDefaults()['sse'];
+    if (!isset($raw['shell_ts'])) {
+        $raw['shell_ts'] = 0;
+    }
+    $raw['observed'] = ipmiProxyIloObservedPathsNormalize($raw['observed'] ?? [], $now);
     $raw['phase'] = ipmiProxyIloBootstrapStateClassify($raw);
 
     return $raw;
@@ -1806,7 +2297,9 @@ function ipmiProxyIloBootstrapStateDefaults(): array
         'events'     => [],
         'sse'        => ['last' => '', 'fail_streak' => 0, 'last_ts' => 0, 'ok_after_refresh' => 0],
         'refresh_ts' => [],
-        'window'     => ['t0' => time(), 'crit_ok' => 0, 'crit_fail' => 0, 'soft_fail' => 0, 'shell_ok' => 0],
+        'window'     => ['t0' => time(), 'crit_ok' => 0, 'crit_fail' => 0, 'soft_fail' => 0, 'shell_ok' => 0, 'roles_ok' => ''],
+        'shell_ts'   => 0,
+        'observed'   => ['v' => 1, 'paths' => []],
     ];
 }
 
@@ -1819,8 +2312,11 @@ function ipmiProxyIloBootstrapStateClassify(array $state): string
     $critFail = (int) ($w['crit_fail'] ?? 0);
     $softFail = (int) ($w['soft_fail'] ?? 0);
     $shellOk = (int) ($w['shell_ok'] ?? 0);
+    $rolesCsv = (string) ($w['roles_ok'] ?? '');
+    $distinctRoles = count(array_filter(array_unique(array_filter(explode(',', $rolesCsv)))));
 
-    if ($shellOk > 0 && $critOk >= 2 && $failStreak < 2 && $critFail <= 1 && $softFail <= 2) {
+    if ($shellOk > 0 && $critOk >= 2 && $failStreak < 2 && $critFail <= 1 && $softFail <= 2
+        && ($distinctRoles >= 2 || $critOk >= 3)) {
         return 'healthy';
     }
     if ($shellOk > 0 && ($critFail >= 3 || $failStreak >= 2 || ($softFail >= 3 && $critOk < 2))) {
@@ -1937,26 +2433,61 @@ function ipmiProxyIloBootstrapStateUpdate(array $state, array $event): array
 
     $w = is_array($state['window'] ?? null) ? $state['window'] : ['t0' => $now, 'crit_ok' => 0, 'crit_fail' => 0, 'soft_fail' => 0, 'shell_ok' => 0];
     if ($now - (int) ($w['t0'] ?? $now) > 75) {
-        $w = ['t0' => $now, 'crit_ok' => 0, 'crit_fail' => 0, 'soft_fail' => 0, 'shell_ok' => 0];
+        $w = ['t0' => $now, 'crit_ok' => 0, 'crit_fail' => 0, 'soft_fail' => 0, 'shell_ok' => 0, 'roles_ok' => ''];
     }
     $role = (string) ($event['role'] ?? '');
     $critical = !empty($event['critical']);
     $outcome = (string) ($event['outcome'] ?? '');
     if ($role === 'shell_entry' && $outcome === 'ok') {
         $w['shell_ok'] = (int) $w['shell_ok'] + 1;
+        $state['shell_ts'] = $now;
     }
     if ($critical) {
         if ($outcome === 'ok') {
             $w['crit_ok'] = (int) $w['crit_ok'] + 1;
+            if ($role !== '' && $role !== 'shell_entry') {
+                $rlist = array_values(array_filter(explode(',', (string) ($w['roles_ok'] ?? ''))));
+                if (!in_array($role, $rlist, true)) {
+                    $rlist[] = $role;
+                    $w['roles_ok'] = implode(',', array_slice($rlist, -6));
+                }
+            }
+            if (ipmiProxyDebugEnabled()) {
+                ipmiProxyDebugLog('ilo_bootstrap_positive_signal_registered', [
+                    'role' => $role,
+                    'path' => (string) ($event['path'] ?? ''),
+                ]);
+            }
         } elseif (str_starts_with($outcome, 'fail_soft') || str_contains($outcome, 'soft')) {
             $w['crit_fail'] = (int) $w['crit_fail'] + 1;
             $w['soft_fail'] = (int) $w['soft_fail'] + 1;
+            if (ipmiProxyDebugEnabled()) {
+                ipmiProxyDebugLog('ilo_bootstrap_negative_signal_registered', [
+                    'role'   => $role,
+                    'path'   => (string) ($event['path'] ?? ''),
+                    'outcome'=> $outcome,
+                ]);
+            }
         } elseif (str_starts_with($outcome, 'fail')) {
             $w['crit_fail'] = (int) $w['crit_fail'] + 1;
+            if (ipmiProxyDebugEnabled()) {
+                ipmiProxyDebugLog('ilo_bootstrap_negative_signal_registered', [
+                    'role'   => $role,
+                    'path'   => (string) ($event['path'] ?? ''),
+                    'outcome'=> $outcome,
+                ]);
+            }
         }
     }
     $state['window'] = $w;
+    $prevPhase = (string) ($state['phase'] ?? '');
     $state['phase'] = ipmiProxyIloBootstrapStateClassify($state);
+    if (ipmiProxyDebugEnabled() && (string) ($state['phase'] ?? '') !== $prevPhase) {
+        ipmiProxyDebugLog('ilo_bootstrap_health_recomputed', [
+            'phase'      => (string) ($state['phase'] ?? ''),
+            'phase_prev' => $prevPhase,
+        ]);
+    }
 
     return $state;
 }
@@ -2153,9 +2684,62 @@ function ipmiProxyIloRuntimeJsonLooksSemanticallyBroken(string $bmcPath, string 
     return false;
 }
 
+function ipmiProxyIloApiJsonPlaceholderBroken(string $body, string $pLower): bool
+{
+    $t = trim($body);
+    if ($t === '{}' || $t === '[]' || strcasecmp($t, 'null') === 0) {
+        return str_contains($pLower, 'session') || str_contains($pLower, 'login')
+            || str_contains($pLower, 'masthead') || str_contains($pLower, 'host_power');
+    }
+
+    return false;
+}
+
+function ipmiProxyIloApiResponseLooksBootstrapBroken(string $bmcPath, string $contentType, string $body): bool
+{
+    $ct = strtolower(trim(explode(';', $contentType)[0] ?? ''));
+    if (!str_contains($ct, 'json')) {
+        return false;
+    }
+    $p = strtolower((string) parse_url($bmcPath, PHP_URL_PATH));
+    if (ipmiProxyIsHealthPollPath($bmcPath)) {
+        return false;
+    }
+    if (!str_starts_with($p, '/json/') && !str_starts_with($p, '/api/') && !str_starts_with($p, '/rest/')) {
+        return false;
+    }
+    if (ipmiProxyIloRuntimeJsonLooksSemanticallyBroken($bmcPath, $body)) {
+        return true;
+    }
+
+    return ipmiProxyIloApiJsonPlaceholderBroken($body, $p);
+}
+
+function ipmiProxyIloResponseLooksLikeUnexpectedFullShell(string $bmcPath, string $contentType, string $body): bool
+{
+    if (!ipmiProxyIloIsHtmlFragmentForSemanticCheck($bmcPath)) {
+        return false;
+    }
+    $ct = strtolower(trim(explode(';', $contentType)[0] ?? ''));
+    if (!str_contains($ct, 'html')) {
+        return false;
+    }
+    if (strlen($body) < 65000) {
+        return false;
+    }
+    $head = strtolower(substr($body, 0, 14000));
+    if (str_contains($head, 'masthead') || str_contains($head, 'sidebar')
+        || str_contains($head, 'nav-container') || str_contains($head, 'fragment')
+        || str_contains($head, 'widget-pane')) {
+        return false;
+    }
+
+    return str_contains($head, '<html');
+}
+
 function ipmiProxyIloFragmentLooksWrong(string $bmcPath, string $contentType, string $body): bool
 {
-    return ipmiProxyIsIloRuntimeFragmentPath($bmcPath)
+    return ipmiProxyIloIsHtmlFragmentForSemanticCheck($bmcPath)
         && ipmiProxyIloBootstrapResponseLooksWrong($bmcPath, $contentType, $body);
 }
 
@@ -2164,8 +2748,23 @@ function ipmiProxyIloResponseLooksBootstrapBroken(string $bmcPath, string $conte
     if (ipmiProxyIloBootstrapResponseLooksWrong($bmcPath, $contentType, $body)) {
         return true;
     }
+    if (ipmiProxyIloResponseLooksLikeUnexpectedFullShell($bmcPath, $contentType, $body)) {
+        if (ipmiProxyDebugEnabled()) {
+            ipmiProxyDebugLog('ilo_fragment_returned_full_shell', [
+                'bmcPath' => $bmcPath,
+            ]);
+        }
+
+        return true;
+    }
     $ct = strtolower(trim(explode(';', $contentType)[0] ?? ''));
-    if (str_contains($ct, 'json') && ipmiProxyIloRuntimeJsonLooksSemanticallyBroken($bmcPath, $body)) {
+    if (str_contains($ct, 'json') && ipmiProxyIloApiResponseLooksBootstrapBroken($bmcPath, $contentType, $body)) {
+        if (ipmiProxyDebugEnabled()) {
+            ipmiProxyDebugLog('ilo_api_response_bootstrap_broken', [
+                'bmcPath' => $bmcPath,
+            ]);
+        }
+
         return true;
     }
 
@@ -2243,7 +2842,7 @@ function ipmiProxyIloSseHealthUpdate(
 }
 
 /**
- * @param array<string, mixed> $pathRole from ipmiProxyClassifyIloPathRole
+ * @param array<string, mixed> $pathRole final role from ipmiProxyClassifyIloPathRoleForSession (or equivalent)
  */
 function ipmiProxyIloBootstrapTrackBufferedResponse(
     mysqli $mysqli,
@@ -2279,7 +2878,7 @@ function ipmiProxyIloBootstrapTrackBufferedResponse(
         ipmiProxyDebugLog('ilo_bootstrap_semantic_failure_detected', [
             'trace'   => $traceId,
             'bmcPath' => $bmcPath,
- ]);
+        ]);
         if (ipmiProxyIloFragmentLooksWrong($bmcPath, $contentType, $body)) {
             ipmiProxyDebugLog('ilo_fragment_shape_unexpected', ['trace' => $traceId, 'bmcPath' => $bmcPath]);
         }
@@ -2306,6 +2905,10 @@ function ipmiProxyIloBootstrapTrackBufferedResponse(
         'path'     => (string) $pathRole['path_key'],
         'recovery' => $recoveryWasAttempted ? 1 : 0,
     ]);
+    $pathKey = (string) ($pathRole['path_key'] ?? '');
+    if ($pathKey !== '') {
+        $state = ipmiProxyIloRecordObservedBootstrapPath($state, $pathKey, $critical, $ok);
+    }
     $phase = (string) ($state['phase'] ?? '');
     if (ipmiProxyIloBootstrapLooksStalled($state) && ipmiProxyDebugEnabled()) {
         ipmiProxyDebugLog('ilo_shell_loaded_spa_stalled', [
@@ -2314,8 +2917,27 @@ function ipmiProxyIloBootstrapTrackBufferedResponse(
             'last_event' => $outcome,
         ]);
     }
-    ipmiProxyIloBootstrapStatePersist($mysqli, $token, $session, $state, $traceId, 'ilo_bootstrap_state_updated');
+    ipmiProxyIloBootstrapStatePersist($mysqli, $token, $session, $state, $traceId, 'ilo_bootstrap_state_updated_from_role');
     if (ipmiProxyDebugEnabled()) {
+        if ($critical) {
+            ipmiProxyDebugLog('ilo_path_contributed_to_bootstrap_health', [
+                'trace'    => $traceId,
+                'bmcPath'  => $bmcPath,
+                'role'     => (string) $pathRole['role'],
+                'outcome'  => $outcome,
+                'positive' => $ok ? 1 : 0,
+                'flags'    => $pathRole['flags'] ?? [],
+            ]);
+        }
+        if ($recoveryWasAttempted) {
+            ipmiProxyDebugLog('ilo_bootstrap_recovery_role_used', [
+                'trace'              => $traceId,
+                'bmcPath'            => $bmcPath,
+                'role'               => (string) $pathRole['role'],
+                'bootstrap_critical' => $critical ? 1 : 0,
+                'outcome'            => $outcome,
+            ]);
+        }
         ipmiProxyDebugLog('ilo_bootstrap_finalized', [
             'trace'     => $traceId,
             'bmcPath'   => $bmcPath,
@@ -2334,7 +2956,7 @@ function ipmiProxyIloRuntimePathDebugClass(string $bmcPath): string
     if (ipmiProxyIsIloEventStreamPath($bmcPath)) {
         return 'event_stream';
     }
-    if (ipmiProxyIsIloRuntimeFragmentPath($bmcPath)) {
+    if (ipmiProxyIloIsHtmlFragmentForSemanticCheck($bmcPath)) {
         return 'helper_fragment';
     }
     $p = strtolower((string) parse_url($bmcPath, PHP_URL_PATH));
@@ -2563,18 +3185,20 @@ function ipmiProxyMaybeIloRuntimePreflight(mysqli $mysqli, string $token, array 
     $pf = $meta['ilo_preflight'] ?? null;
     $bootstrapState = ipmiProxyIloBootstrapStateLoad($session);
     $bootstrapPhase = (string) ($bootstrapState['phase'] ?? 'fresh');
-    $shellPathRole = ipmiProxyClassifyIloPathRole($bmcPath, 'GET');
+    $shellPathRole = ipmiProxyClassifyIloPathRoleForSession($mysqli, $token, $session, $bmcPath, 'GET', $traceId);
     if (ipmiProxyDebugEnabled()) {
         ipmiProxyDebugLog('ilo_bootstrap_preflight_started', [
             'trace'           => $traceId,
             'bootstrap_phase' => $bootstrapPhase,
             'path_role'       => $shellPathRole['role'],
+            'path_role_base'  => (string) ($shellPathRole['base_role'] ?? $shellPathRole['role']),
             'bootstrap_critical' => !empty($shellPathRole['bootstrap_critical']) ? 1 : 0,
         ]);
         ipmiProxyDebugLog('ilo_path_role_classified', [
             'trace'              => $traceId,
             'bmcPath'            => $bmcPath,
             'path_role'          => $shellPathRole['role'],
+            'path_role_base'     => (string) ($shellPathRole['base_role'] ?? $shellPathRole['role']),
             'bootstrap_critical' => !empty($shellPathRole['bootstrap_critical']) ? 1 : 0,
             'gate'               => 'preflight',
         ]);
@@ -2849,7 +3473,7 @@ function ipmiProxyIloBootstrapResponseLooksWrong(string $bmcPath, string $conten
 {
     $p = strtolower((string) parse_url($bmcPath, PHP_URL_PATH));
     $ct = strtolower(trim(explode(';', $contentType)[0] ?? ''));
-    if (ipmiProxyIsIloRuntimeFragmentPath($bmcPath)) {
+    if (ipmiProxyIloIsHtmlFragmentForSemanticCheck($bmcPath)) {
         if (str_contains($ct, 'json')) {
             return true;
         }
@@ -2896,8 +3520,15 @@ function ipmiProxyIloIsSoftAuthFailure(string $bmcPath, int $httpCode, string $c
 /**
  * @return array{recover: bool, reason: string, kind: 'none'|'hard'|'soft', soft_detail?: string}
  */
-function ipmiProxyIloClassifyBufferedRecovery(array $result, string $bmcPath, string $method): array
-{
+function ipmiProxyIloClassifyBufferedRecovery(
+    mysqli $mysqli,
+    string $token,
+    array &$session,
+    array $result,
+    string $bmcPath,
+    string $method,
+    string $traceId
+): array {
     if (!ipmiProxyIsIloRecoverableRuntimePath($bmcPath)) {
         return ['recover' => false, 'reason' => 'not_recoverable_path', 'kind' => 'none'];
     }
@@ -2914,11 +3545,12 @@ function ipmiProxyIloClassifyBufferedRecovery(array $result, string $bmcPath, st
     }
     [, $body] = ipmiWebCurlExtractFinalHeadersAndBody((string) $result['raw']);
     $ct = (string) ($result['content_type'] ?? '');
-    $pathRole = ipmiProxyClassifyIloPathRole($bmcPath, $method);
-    if ($pathRole['bootstrap_critical'] && $http0 >= 200 && $http0 < 400) {
+    $pathRole = ipmiProxyClassifyIloPathRoleForSession($mysqli, $token, $session, $bmcPath, $method, $traceId);
+    if (!empty($pathRole['bootstrap_critical']) && $http0 >= 200 && $http0 < 400) {
         if (ipmiProxyIloResponseLooksBootstrapBroken($bmcPath, $ct, $body)) {
             if (ipmiProxyDebugEnabled()) {
                 ipmiProxyDebugLog('ilo_bootstrap_semantic_failure_detected', [
+                    'trace'   => $traceId,
                     'bmcPath' => $bmcPath,
                     'gate'    => 'classify_recovery',
                 ]);
@@ -2998,7 +3630,7 @@ function ipmiProxyIloMaybeRecoverBufferedRuntime(
     if (!empty($GLOBALS['__ipmi_ilo_runtime_recover_attempted'])) {
         return;
     }
-    $pathRole = ipmiProxyClassifyIloPathRole($bmcPath, $method);
+    $pathRole = ipmiProxyClassifyIloPathRoleForSession($mysqli, $token, $session, $bmcPath, $method, $ipmiTraceId);
     $class = (string) ($pathRole['debug_class'] ?? 'other');
     $bootstrapCritical = !empty($pathRole['bootstrap_critical']) ? 1 : 0;
     $bootstrapState = ipmiProxyIloBootstrapStateLoad($session);
@@ -3014,6 +3646,7 @@ function ipmiProxyIloMaybeRecoverBufferedRuntime(
             'bmcPath'            => $bmcPath,
             'method'             => $method,
             'path_role'          => $pathRole['role'],
+            'path_role_base'     => (string) ($pathRole['base_role'] ?? $pathRole['role']),
             'bootstrap_critical' => $bootstrapCritical,
             'recoverable'        => !empty($pathRole['recoverable']) ? 1 : 0,
         ]);
@@ -3032,7 +3665,7 @@ function ipmiProxyIloMaybeRecoverBufferedRuntime(
             'path_role'     => $pathRole['role'],
         ]);
     }
-    $decision = ipmiProxyIloClassifyBufferedRecovery($result, $bmcPath, $method);
+    $decision = ipmiProxyIloClassifyBufferedRecovery($mysqli, $token, $session, $result, $bmcPath, $method, $ipmiTraceId);
     if (ipmiProxyDebugEnabled()) {
         ipmiProxyDebugLog('ilo_runtime_request_classified', [
             'trace'              => $ipmiTraceId,
@@ -4558,12 +5191,13 @@ if ($method === 'GET' && ($httpCode === 404 || $httpCode === 400) && ipmiProxyIs
 }
 
 if (ipmiWebIsNormalizedIloType($bmcTypeNorm)) {
-    $pathRoleTrack = ipmiProxyClassifyIloPathRole($bmcPath, $method);
+    $pathRoleTrack = ipmiProxyClassifyIloPathRoleForSession($mysqli, $token, $session, $bmcPath, $method, $ipmiTraceId);
     if (ipmiProxyDebugEnabled()) {
         ipmiProxyDebugLog('ilo_path_role_classified', [
             'trace'              => $ipmiTraceId,
             'bmcPath'            => $bmcPath,
             'path_role'          => $pathRoleTrack['role'],
+            'path_role_base'     => (string) ($pathRoleTrack['base_role'] ?? $pathRoleTrack['role']),
             'bootstrap_critical' => !empty($pathRoleTrack['bootstrap_critical']) ? 1 : 0,
             'gate'               => 'post_upstream',
         ]);
@@ -5415,7 +6049,12 @@ if (ipmiProxyDebugEnabled()) {
     $iloDbgExtra = [];
     if (ipmiWebIsNormalizedIloType($bmcTypeNorm)) {
         $iloDbgExtra['ilo_bootstrap'] = ipmiProxyIloBootstrapDebugSnapshot($session);
-        $iloDbgExtra['ilo_path_role'] = ipmiProxyClassifyIloPathRole($bmcPath, $method)['role'];
+        $iloPrFinal = ipmiProxyClassifyIloPathRoleForSession($mysqli, $token, $session, $bmcPath, $method, $ipmiTraceId);
+        $iloDbgExtra['ilo_path_role'] = (string) ($iloPrFinal['role'] ?? '');
+        $iloDbgExtra['ilo_path_role_base'] = (string) ($iloPrFinal['base_role'] ?? $iloDbgExtra['ilo_path_role']);
+        $iloDbgExtra['ilo_path_bootstrap_critical'] = !empty($iloPrFinal['bootstrap_critical']) ? 1 : 0;
+        $iloDbgExtra['ilo_path_role_flags'] = $iloPrFinal['flags'] ?? [];
+        $iloDbgExtra['ilo_path_heuristic_score'] = (int) ($iloPrFinal['heuristic_score'] ?? 0);
     }
     ipmiProxyDebugEmitLogHeader(array_merge([
         'trace'   => $ipmiTraceId,

@@ -36,8 +36,17 @@
  * ilo_bootstrap_preflight_{started,cache_hit,auth_ok,fragment_ok,degraded,refreshed_auth},
  * ilo_sse_health_{positive,negative}, ilo_sse_recovered_after_refresh, ilo_sse_still_failing_after_refresh,
  * ilo_refresh_attempt_suppressed_due_to_recent_failure, ilo_refresh_attempt_recorded, ilo_refresh_budget_exhausted.
+ * iLO path roles (session-aware): HTML elevation requires a structural heuristic signal (name/keyword/repeat/promoted), not time-only;
+ * ilo_bootstrap_context_window_active, ilo_role_heuristic_summary, ilo_bootstrap_role_finalized,
+ * ilo_html_fragment_heuristic_{positive,negative}, ilo_path_role_{elevated_by_context,not_elevated_after_context_check},
+ * ilo_bootstrap_html_fragment_detected, ilo_html_fragment_promoted_to_bootstrap_critical, ilo_path_missed_as_bootstrap_critical,
+ * ilo_path_excluded_as_static_asset, ilo_bootstrap_api_detected, ilo_observed_path_{recorded,promoted,expired},
+ * ilo_observed_path_promotion_skipped, ilo_path_promoted_by_observation, ilo_bootstrap_recovery_guardrail_applied,
+ * ilo_fragment_{shape_unexpected,returned_full_shell}, ilo_api_response_bootstrap_broken,
+ * ilo_bootstrap_state_updated_from_role, ilo_path_contributed_to_bootstrap_health, ilo_bootstrap_recovery_role_used.
  * Debug response header/console: ilo_bootstrap snapshot (phase, sse_fail_streak, refresh_60s, blank_ui_hypothesis,
- * last_event_outcome/path) + ilo_path_role on final emit. Preflight: ilo_bootstrap_preflight_skip_second_refresh when stall/degraded relogin already ran once in the same preflight.
+ * last_event_outcome/path) + ilo_path_role, ilo_path_role_base, ilo_path_bootstrap_critical, ilo_path_role_flags,
+ * ilo_path_heuristic_score on final emit. Preflight: ilo_bootstrap_preflight_skip_second_refresh when stall/degraded relogin already ran once in the same preflight.
  */
 
 /** @var list<array{ts: float, event: string, context: array<string, mixed>}>|null */
