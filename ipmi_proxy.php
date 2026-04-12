@@ -476,8 +476,8 @@ function ipmiProxyBuildKvmAutoLaunchPreambleJs(string $familyJs, string $planJs,
         . 'try{flowActive=queryAuto||AUTO||(window.sessionStorage&&sessionStorage.getItem("_ipmi_kvm_auto_flow")==="1");}catch(_e1){flowActive=queryAuto||AUTO;}'
         . 'if(!flowActive){return;}'
         . 'if(FAMILY==="ilo"&&PLAN&&PLAN.should_attempt_proxy_autolaunch===false){'
-        . 'try{_kvmDbg("ilo_autolaunch_suppressed_due_to_missing_surface",{verdict:String(PLAN.ilo_native_console_verdict||""),cap:String(PLAN.console_capability||"")});}catch(_eSup){}'
-        . 'try{_kvmDbg("ilo_no_transport_after_shell_launch",{suppressed:1});}catch(_eNt){}'
+        . 'try{_kvmDbg("ilo_autolaunch_suppressed",{verdict:String(PLAN.ilo_native_console_verdict||""),cap:String(PLAN.console_capability||""),suppression:String(PLAN.autolaunch_suppression_detail||"")});}catch(_eSup){}'
+        . 'try{_kvmDbg("ilo_no_transport_after_shell_launch",{suppressed:1,suppression:String(PLAN.autolaunch_suppression_detail||"")});}catch(_eNt){}'
         . 'return;}'
         . 'var launchDone=false;'
         . 'try{launchDone=!!(window.sessionStorage&&sessionStorage.getItem("_ipmi_kvm_autolaunch_done")==="1");}catch(_e2){launchDone=false;}'
@@ -938,6 +938,7 @@ function ipmiProxyInjectKvmAutoLaunchPatch(string $html, string $token, $session
         'ilo_native_console_verdict' => (string) ($plan['ilo_native_console_verdict'] ?? ''),
         'console_capability' => (string) ($plan['console_capability'] ?? ''),
         'native_launch_viable' => !empty($plan['native_launch_viable']),
+        'autolaunch_suppression_detail' => (string) ($plan['autolaunch_suppression_detail'] ?? ''),
     ];
     $familyJs = json_encode((string) ($plan['vendor_family'] ?? 'generic'), JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_SLASHES);
     $planJs = json_encode($planLite, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_SLASHES);
@@ -948,13 +949,34 @@ function ipmiProxyInjectKvmAutoLaunchPatch(string $html, string $token, $session
     if (ipmiProxyDebugEnabled()
         && (($plan['vendor_family'] ?? '') === 'ilo')
         && empty($plan['should_attempt_proxy_autolaunch'])) {
-        ipmiProxyDebugLog('ilo_autolaunch_suppressed_due_to_missing_surface', [
+        $sup = (string) ($plan['autolaunch_suppression_detail'] ?? '');
+        $capDbg = (string) ($plan['console_capability'] ?? '');
+        $evt = 'ilo_autolaunch_suppressed';
+        $ctx = [
             'verdict'    => (string) ($plan['ilo_native_console_verdict'] ?? ''),
-            'capability' => (string) ($plan['console_capability'] ?? ''),
+            'capability' => $capDbg,
             'strategy'   => (string) ($plan['launch_strategy'] ?? ''),
-        ]);
+            'suppression'=> $sup,
+        ];
+        if ($sup === 'no_launch_surface' || ($sup === '' && str_contains((string) ($plan['ilo_native_console_verdict'] ?? ''), 'not_detected'))) {
+            $evt = 'ilo_autolaunch_suppressed_due_to_no_surface';
+        } elseif ($sup === 'bounded_launch_budget_exhausted') {
+            $evt = 'ilo_autolaunch_suppressed_due_to_budget_exhausted';
+        } elseif ($sup === 'hard_blocker_license_or_feature') {
+            $evt = 'ilo_autolaunch_suppressed_due_to_hard_blocker';
+        } elseif ($sup === 'repeated_transport_or_sse_failure') {
+            $evt = 'ilo_autolaunch_suppressed_due_to_repeated_transport_failure';
+        } elseif ($sup === 'session_bootstrap_unhealthy') {
+            $evt = 'ilo_autolaunch_suppressed_due_to_session_bootstrap_unhealthy';
+        } elseif ($sup === 'surface_evidence_below_bounded_threshold') {
+            $evt = 'ilo_autolaunch_suppressed_due_to_weak_surface_evidence';
+        } elseif ($sup !== '') {
+            $evt = 'ilo_autolaunch_suppressed_due_to_capability_gate';
+        }
+        ipmiProxyDebugLog($evt, $ctx);
         ipmiProxyDebugLog('ilo_native_launch_marked_unavailable_for_session', [
             'verdict' => (string) ($plan['ilo_native_console_verdict'] ?? ''),
+            'suppression' => $sup,
         ]);
     }
     $patch = '<script data-ipmi-proxy-kvm-autolaunch="1">'

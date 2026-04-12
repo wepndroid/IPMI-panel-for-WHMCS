@@ -3953,6 +3953,7 @@ function ipmiWebResolveKvmLaunchPlan(array $session, ?mysqli $persistMetaMysqli 
         $plan['native_launch_reason'] = implode(';', array_slice((array) ($cap['reasons'] ?? []), 0, 8));
         $plan['native_launch_blockers'] = array_slice((array) ($cap['blockers'] ?? []), 0, 12);
         $plan['ilo_native_console_verdict'] = (string) ($cap['ilo_native_console_verdict'] ?? 'native_html5_unconfirmed');
+        $plan['autolaunch_suppression_detail'] = (string) ($cap['autolaunch_suppression_detail'] ?? '');
         $plan['shell_authenticated_hint'] = !empty($cap['shell_authenticated']) ? 1 : 0;
         $plan['shell_bootstrap_healthy_hint'] = !empty($cap['shell_bootstrap_healthy']) ? 1 : 0;
         $plan['should_attempt_proxy_autolaunch'] = !empty($cap['should_attempt_proxy_autolaunch']);
@@ -4455,7 +4456,9 @@ function ipmiWebIloAnalyzeDocumentForLaunchSurface(string $html): array
         $rcRef = true;
         $reasons[] = 'remote_console_text';
     }
-    if ((str_contains($s, '<iframe') || str_contains($s, 'framecontent')) && (str_contains($s, 'irc') || str_contains($s, 'rc_info') || str_contains($s, 'console'))) {
+    $iframeConsoleSignal = (str_contains($s, '<iframe') || str_contains($s, 'framecontent'))
+        && (str_contains($s, 'irc') || str_contains($s, 'rc_info') || str_contains($s, 'console'));
+    if ($iframeConsoleSignal) {
         $reasons[] = 'iframe_console';
         $evidence[] = 'iframe_console_pattern';
     }
@@ -4474,7 +4477,9 @@ function ipmiWebIloAnalyzeDocumentForLaunchSurface(string $html): array
         $reasons[] = 'license_language';
         $evidence[] = 'license_gated_text';
     }
-    $hasSurface = $html5 || (($rcRef || str_contains($s, 'ilo.')) && (str_contains($s, 'framecontent') || str_contains($s, 'html/application') || str_contains($s, 'rc_info')));
+    $hasSurface = $html5
+        || $iframeConsoleSignal
+        || (($rcRef || str_contains($s, 'ilo.')) && (str_contains($s, 'framecontent') || str_contains($s, 'html/application') || str_contains($s, 'rc_info')));
 
     return [
         'has_launch_surface'    => $hasSurface,
@@ -4496,6 +4501,311 @@ function ipmiWebIloLooksLegacyOnlyFromAnalysis(array $analysis): bool
 function ipmiWebIloLooksLicenseGatedFromAnalysis(array $analysis): bool
 {
     return !empty($analysis['license_gated_markers']);
+}
+
+/**
+ * Score current shell HTML for native-console launch surface (0–100). Higher = stronger live evidence.
+ *
+ * @param array<string, mixed> $surface from ipmiWebIloAnalyzeDocumentForLaunchSurface
+ */
+function ipmiWebIloCurrentSurfaceEvidenceScore(array $surface): int
+{
+    $score = 0;
+    if (!empty($surface['html5_native_markers'])) {
+        $score += 48;
+    }
+    if (!empty($surface['iframe_console_refs'])) {
+        $score += 38;
+    }
+    $reasons = is_array($surface['reasons'] ?? null) ? $surface['reasons'] : [];
+    foreach ($reasons as $r) {
+        if ($r === 'iframe_console') {
+            $score += 34;
+        } elseif ($r === 'html5_marker') {
+            $score += 40;
+        } elseif ($r === 'remote_console_text') {
+            $score += 22;
+        }
+    }
+    if (!empty($surface['has_launch_surface'])) {
+        $score += 18;
+    }
+
+    return min(100, $score);
+}
+
+/**
+ * Weight stale pessimistic session signals (0–100). Used only for confidence / logging — not to veto surface alone.
+ *
+ * @param array<string, mixed> $bootstrapMeta from ipmiWebIloBootstrapMetaFromSession
+ */
+function ipmiWebIloHistoricalFailureWeight(array $bootstrapMeta): int
+{
+    $w = 0;
+    $phase = (string) ($bootstrapMeta['phase'] ?? '');
+    if ($phase === 'stalled') {
+        $w += 40;
+    } elseif (in_array($phase, ['degraded', 'bootstrapping'], true)) {
+        $w += 18;
+    }
+    $streak = (int) ($bootstrapMeta['sse_fail_streak'] ?? 0);
+    $w += min(36, $streak * 10);
+    if (!empty($bootstrapMeta['runtime_stall_signal'])) {
+        $w += 22;
+    }
+    if (($bootstrapMeta['masthead_fragment_ok'] ?? null) === false) {
+        $w += 12;
+    }
+    if (($bootstrapMeta['preflight_bootstrap_ok'] ?? null) === false) {
+        $w += 10;
+    }
+
+    return min(100, $w);
+}
+
+/**
+ * @return array{v: int, spent: int, max: int}
+ */
+function ipmiWebIloBoundedLaunchBudgetFromSession(array $session): array
+{
+    $m = is_array($session['session_meta'] ?? null) ? $session['session_meta'] : [];
+    $b = is_array($m['ilo_bounded_native_launch'] ?? null) ? $m['ilo_bounded_native_launch'] : [];
+    if ((int) ($b['v'] ?? 0) !== 1) {
+        return ['v' => 1, 'spent' => 0, 'max' => 1];
+    }
+
+    return [
+        'v'     => 1,
+        'spent' => min(1, (int) ($b['spent'] ?? 0)),
+        'max'   => 1,
+    ];
+}
+
+function ipmiWebIloBoundedLaunchCanSpend(array $session): bool
+{
+    $b = ipmiWebIloBoundedLaunchBudgetFromSession($session);
+
+    return $b['spent'] < $b['max'];
+}
+
+/**
+ * Record one bounded native autolaunch attempt (server-side budget). Pair with capability “surface present” path.
+ */
+function ipmiWebIloBoundedLaunchBudgetRecordSpend(?mysqli $mysqli, string $token, array &$session): void
+{
+    if (!$mysqli || !preg_match('/^[a-f0-9]{64}$/', $token)) {
+        return;
+    }
+    ipmiWebSessionMetaMutate($mysqli, $token, static function (array &$meta): void {
+        $b = is_array($meta['ilo_bounded_native_launch'] ?? null) ? $meta['ilo_bounded_native_launch'] : [];
+        if ((int) ($b['v'] ?? 0) !== 1) {
+            $b = ['v' => 1, 'spent' => 0];
+        }
+        $b['spent'] = min(1, (int) ($b['spent'] ?? 0) + 1);
+        $b['t'] = time();
+        $meta['ilo_bounded_native_launch'] = $b;
+    });
+    if (!isset($session['session_meta']) || !is_array($session['session_meta'])) {
+        $session['session_meta'] = [];
+    }
+    $cur = ipmiWebIloBoundedLaunchBudgetFromSession($session);
+    $session['session_meta']['ilo_bounded_native_launch'] = [
+        'v'     => 1,
+        'spent' => min(1, $cur['spent'] + 1),
+        't'     => time(),
+    ];
+}
+
+/**
+ * SSE instability must not veto the first bounded launch when the current shell shows a launch surface.
+ * When $shellAuthed && $hasLaunchSurface, always returns false (policy); kept for explicit reuse / tooling.
+ */
+function ipmiWebIloSseFailureShouldBlockInitialLaunch(array $bootstrapMeta, bool $shellAuthed, bool $hasLaunchSurface): bool
+{
+    if ($shellAuthed && $hasLaunchSurface) {
+        return false;
+    }
+
+    return (int) ($bootstrapMeta['sse_fail_streak'] ?? 0) >= 3;
+}
+
+function ipmiWebIloSseFailureShouldBlockRepeatedLaunch(array $bootstrapMeta, bool $budgetCanSpend): bool
+{
+    if ($budgetCanSpend) {
+        return false;
+    }
+
+    return (int) ($bootstrapMeta['sse_fail_streak'] ?? 0) >= 2;
+}
+
+/**
+ * When stalled SSE/phase should be softened for a fresh authenticated shell with measurable surface evidence.
+ *
+ * @param array<string, mixed> $surface launch_surface from shell analysis
+ */
+function ipmiWebIloShouldSoftResetStallState(array $bootstrapMeta, array $shellPack, array $surface): bool
+{
+    if (empty($shellPack['shell_authenticated']) || empty($shellPack['has_launch_surface'])) {
+        return false;
+    }
+    if (ipmiWebIloLooksLicenseGatedFromAnalysis($surface)) {
+        return false;
+    }
+    if (ipmiWebIloCurrentSurfaceEvidenceScore($surface) < 28) {
+        return false;
+    }
+    $phase = (string) ($bootstrapMeta['phase'] ?? '');
+    $streak = (int) ($bootstrapMeta['sse_fail_streak'] ?? 0);
+
+    return $phase === 'stalled' || ($streak >= 2 && in_array($phase, ['degraded', 'stalled'], true));
+}
+
+/**
+ * @param array<string, mixed> $surface
+ */
+function ipmiWebIloMaybeSoftResetBootstrapStallForSurface(
+    ?mysqli $mysqli,
+    string $token,
+    array &$session,
+    array $shellPack,
+    array $bootstrapMeta,
+    array $surface
+): bool {
+    if (!$mysqli || !preg_match('/^[a-f0-9]{64}$/', $token)) {
+        return false;
+    }
+    if (!ipmiWebIloShouldSoftResetStallState($bootstrapMeta, $shellPack, $surface)) {
+        if (function_exists('ipmiProxyDebugEnabled') && function_exists('ipmiProxyDebugLog') && ipmiProxyDebugEnabled()) {
+            $phase = (string) ($bootstrapMeta['phase'] ?? '');
+            $streak = (int) ($bootstrapMeta['sse_fail_streak'] ?? 0);
+            if (($phase === 'stalled' || $streak >= 2) && !empty($shellPack['shell_authenticated'])) {
+                ipmiProxyDebugLog('ilo_stall_state_retained_due_to_strong_negative_evidence', [
+                    'phase'           => $phase,
+                    'sse_fail_streak' => $streak,
+                    'surface_score'   => ipmiWebIloCurrentSurfaceEvidenceScore($surface),
+                ]);
+            }
+        }
+
+        return false;
+    }
+    $patched = null;
+    ipmiWebSessionMetaMutate($mysqli, $token, static function (array &$meta) use (&$patched): void {
+        $ib = is_array($meta['ilo_bootstrap'] ?? null) ? $meta['ilo_bootstrap'] : [];
+        if ((int) ($ib['v'] ?? 0) !== 1) {
+            return;
+        }
+        $sse = is_array($ib['sse'] ?? null) ? $ib['sse'] : ['last' => '', 'fail_streak' => 0, 'last_ts' => 0, 'ok_after_refresh' => 0];
+        $streak = (int) ($sse['fail_streak'] ?? 0);
+        if (($ib['phase'] ?? '') === 'stalled') {
+            $ib['phase'] = 'degraded';
+        }
+        $sse['fail_streak'] = min($streak, 1);
+        $ib['sse'] = $sse;
+        $ib['updated_at'] = time();
+        $meta['ilo_bootstrap'] = $ib;
+        $patched = $ib;
+    });
+    if (!is_array($patched)) {
+        return false;
+    }
+    if (!isset($session['session_meta']) || !is_array($session['session_meta'])) {
+        $session['session_meta'] = [];
+    }
+    $session['session_meta']['ilo_bootstrap'] = $patched;
+    if (function_exists('ipmiProxyDebugEnabled') && function_exists('ipmiProxyDebugLog') && ipmiProxyDebugEnabled()) {
+        ipmiProxyDebugLog('ilo_stall_state_soft_reset', [
+            'phase_now'       => (string) ($patched['phase'] ?? ''),
+            'sse_fail_streak' => (int) (($patched['sse'] ?? [])['fail_streak'] ?? 0),
+        ]);
+        ipmiProxyDebugLog('ilo_state_soft_reset_decision', ['applied' => 1]);
+        ipmiProxyDebugLog('ilo_fresh_shell_attempt_window_active', ['surface_score' => ipmiWebIloCurrentSurfaceEvidenceScore($surface)]);
+    }
+
+    return true;
+}
+
+/**
+ * @param array<string, mixed> $session
+ * @param array<string, mixed> $surface
+ * @param array<string, mixed> $bootstrapMeta
+ * @return array{allow: bool, reason: string}
+ */
+function ipmiWebIloShouldAllowBoundedLaunchAttempt(
+    ?array $session,
+    array $surface,
+    array $bootstrapMeta,
+    bool $shellAuthed,
+    bool $hasSurface,
+    bool $runtimeStall,
+    bool $provenHtml5
+): array {
+    if ($session === null || !$shellAuthed || !$hasSurface || $provenHtml5) {
+        return ['allow' => false, 'reason' => 'preconditions_not_met'];
+    }
+    if (!$runtimeStall) {
+        return ['allow' => false, 'reason' => 'no_runtime_stall'];
+    }
+    if (ipmiWebIloLooksLicenseGatedFromAnalysis($surface)) {
+        return ['allow' => false, 'reason' => 'license_gate'];
+    }
+    $score = ipmiWebIloCurrentSurfaceEvidenceScore($surface);
+    if ($score < 32) {
+        return ['allow' => false, 'reason' => 'surface_evidence_too_weak'];
+    }
+    if (!ipmiWebIloBoundedLaunchCanSpend($session)) {
+        return ['allow' => false, 'reason' => 'bounded_launch_budget_exhausted'];
+    }
+    // When shellAuthed && hasSurface, SseFailureShouldBlockInitialLaunch is always false — SSE is not an absolute veto.
+    return ['allow' => true, 'reason' => 'surface_outweighs_stale_stall'];
+}
+
+/**
+ * @param bool $attemptAutolaunch
+ * @param array<string, mixed> $surface
+ * @param array<string, mixed> $bootstrapMeta
+ * @param string $boundedDenyReason reason from ipmiWebIloShouldAllowBoundedLaunchAttempt when stall gate denied override
+ */
+function ipmiWebIloSurfaceAwareSuppressionDetail(
+    bool $attemptAutolaunch,
+    string $verdict,
+    bool $hasSurface,
+    array $surface,
+    array $bootstrapMeta,
+    ?array $session,
+    string $boundedDenyReason = ''
+): string {
+    if ($attemptAutolaunch) {
+        return '';
+    }
+    if (ipmiWebIloLooksLicenseGatedFromAnalysis($surface)) {
+        return 'hard_blocker_license_or_feature';
+    }
+    if (!$hasSurface) {
+        return 'no_launch_surface';
+    }
+    if ($boundedDenyReason === 'bounded_launch_budget_exhausted'
+        || ($session !== null && !ipmiWebIloBoundedLaunchCanSpend($session))) {
+        return 'bounded_launch_budget_exhausted';
+    }
+    if ($boundedDenyReason === 'surface_evidence_too_weak') {
+        return 'surface_evidence_below_bounded_threshold';
+    }
+    if ($boundedDenyReason === 'license_gate') {
+        return 'hard_blocker_license_or_feature';
+    }
+    if ($verdict === 'native_html5_possible_but_session_degraded') {
+        return 'session_bootstrap_unhealthy';
+    }
+    if ((int) ($bootstrapMeta['sse_fail_streak'] ?? 0) >= 3 && empty($surface['html5_native_markers'])) {
+        return 'repeated_transport_or_sse_failure';
+    }
+    if (in_array((string) ($bootstrapMeta['phase'] ?? ''), ['stalled', 'degraded'], true)
+        && !empty($bootstrapMeta['runtime_stall_signal'])) {
+        return 'session_bootstrap_unhealthy';
+    }
+
+    return 'capability_or_transport_unavailable';
 }
 
 /**
@@ -4564,9 +4874,10 @@ function ipmiWebIloAnalyzeShellForConsoleCapability(array $session, string $shel
  * @param list<array{path: string, probe: array<string, mixed>}> $ranked
  * @param array<string, mixed> $shellPack from ipmiWebIloAnalyzeShellForConsoleCapability
  * @param array<string, mixed> $bootstrapMeta
+ * @param array<string, mixed>|null $session for bounded native-launch budget (optional)
  * @return array<string, mixed>
  */
-function ipmiWebIloConsoleCapabilityFromProbe(array $ranked, array $shellPack, array $bootstrapMeta, string $variant, bool $iloHtml5StandaloneProbe): array
+function ipmiWebIloConsoleCapabilityFromProbe(array $ranked, array $shellPack, array $bootstrapMeta, string $variant, bool $iloHtml5StandaloneProbe, ?array $session = null): array
 {
     $pathCodes = [];
     foreach ($ranked as $row) {
@@ -4698,38 +5009,131 @@ function ipmiWebIloConsoleCapabilityFromProbe(array $ranked, array $shellPack, a
         $recStrategy = 'ilo_manual_navigation';
     }
 
+    $surfaceEvidenceScore = ipmiWebIloCurrentSurfaceEvidenceScore($surface);
+    $historicalFailureW = ipmiWebIloHistoricalFailureWeight($bootstrapMeta);
+    $boundedConsumed = false;
+    $boundedDenyReason = '';
+
     $runtimeStall = !empty($bootstrapMeta['runtime_stall_signal']);
     $stallEvidence = [];
     if ($runtimeStall && $shellAuthed && empty($surface['html5_native_markers'])) {
-        $blockers[] = 'bootstrap_stalled_or_sse_unstable';
-        $reasons[] = 'server_session_suggests_no_reliable_html5_transport';
-        $stallEvidence['runtime_stall_signal'] = 1;
-        $stallEvidence['sse_fail_streak'] = (int) ($bootstrapMeta['sse_fail_streak'] ?? 0);
         $provenHtml5 = ($cap === 'html5_native_available')
             || !empty($surface['html5_native_markers'])
             || ($iloHtml5StandaloneProbe && !$ilo4ProbeHtml5NeedsShellProof);
-        if ($attemptAutolaunch && !$provenHtml5) {
-            $attemptAutolaunch = false;
-            if ($verdict === 'native_html5_unconfirmed' || $cap === 'html5_native_possible_but_unconfirmed' || $cap === 'unknown') {
-                $verdict = 'native_html5_not_detected';
-                $cap = 'unknown';
-            }
-            $recStrategy = 'ilo_shell_only';
-        }
+        $stallEvidence['runtime_stall_signal'] = 1;
+        $stallEvidence['sse_fail_streak'] = (int) ($bootstrapMeta['sse_fail_streak'] ?? 0);
+
         if (function_exists('ipmiProxyDebugEnabled') && function_exists('ipmiProxyDebugLog') && ipmiProxyDebugEnabled()) {
             ipmiProxyDebugLog('ilo_native_transport_evidence_applied', [
                 'sse_fail_streak' => (int) ($bootstrapMeta['sse_fail_streak'] ?? 0),
                 'phase'           => $phase,
             ]);
         }
+
+        if ($attemptAutolaunch && !$provenHtml5) {
+            $bounded = ipmiWebIloShouldAllowBoundedLaunchAttempt(
+                $session,
+                $surface,
+                $bootstrapMeta,
+                $shellAuthed,
+                $hasSurface,
+                true,
+                $provenHtml5
+            );
+            if ($bounded['allow']) {
+                $verdict = 'native_html5_surface_present_launch_allowed_once';
+                $cap = 'html5_native_possible_but_unconfirmed';
+                $recStrategy = 'ilo_speculative_shell_autolaunch';
+                $confidence = min(58, max($confidence, 50));
+                $reasons[] = 'bounded_launch_surface_overrides_stale_stall';
+                $blockers[] = 'historical_stall_softened_for_bounded_native_attempt';
+                $boundedConsumed = true;
+                if (function_exists('ipmiProxyDebugEnabled') && function_exists('ipmiProxyDebugLog') && ipmiProxyDebugEnabled()) {
+                    ipmiProxyDebugLog('ilo_bounded_launch_allowed_due_to_surface', [
+                        'surface_evidence_score' => $surfaceEvidenceScore,
+                        'historical_weight'      => $historicalFailureW,
+                        'reason'                 => $bounded['reason'],
+                    ]);
+                    ipmiProxyDebugLog('ilo_current_surface_evidence_applied', ['score' => $surfaceEvidenceScore]);
+                    ipmiProxyDebugLog('ilo_historical_failure_weight_applied', ['weight' => $historicalFailureW]);
+                    ipmiProxyDebugLog('ilo_sse_failures_softened_for_initial_launch', [
+                        'sse_fail_streak' => (int) ($bootstrapMeta['sse_fail_streak'] ?? 0),
+                    ]);
+                    ipmiProxyDebugLog('ilo_sse_failures_not_used_as_absolute_block', ['surface' => 1]);
+                    ipmiProxyDebugLog('ilo_surface_vs_history_decision', [
+                        'winner' => 'current_surface',
+                        'bounded'=> 1,
+                    ]);
+                    ipmiProxyDebugLog('ilo_capability_health_separated', [
+                        'surface_present'  => $hasSurface ? 1 : 0,
+                        'session_degraded'   => in_array($phase, ['stalled', 'degraded'], true) ? 1 : 0,
+                    ]);
+                    ipmiProxyDebugLog('ilo_launch_attempt_allowed_despite_degraded_state', [
+                        'masthead_ok' => $mastheadOk === null ? 'null' : (int) (bool) $mastheadOk,
+                    ]);
+                    ipmiProxyDebugLog('ilo_launch_budget_decision', [
+                        'can_spend' => ipmiWebIloBoundedLaunchCanSpend($session ?? []) ? 1 : 0,
+                        'will_spend'=> 1,
+                    ]);
+                }
+            } else {
+                $boundedDenyReason = (string) ($bounded['reason'] ?? '');
+                $blockers[] = 'bootstrap_stalled_or_sse_unstable';
+                $reasons[] = 'server_session_suggests_no_reliable_html5_transport';
+                $attemptAutolaunch = false;
+                if ($verdict === 'native_html5_unconfirmed' || $cap === 'html5_native_possible_but_unconfirmed' || $cap === 'unknown') {
+                    if ($hasSurface) {
+                        $verdict = 'native_html5_possible_but_session_degraded';
+                        $cap = 'html5_native_possible_but_unconfirmed';
+                    } else {
+                        $verdict = 'native_html5_not_detected';
+                        $cap = 'unknown';
+                    }
+                }
+                $recStrategy = 'ilo_shell_only';
+                if (function_exists('ipmiProxyDebugEnabled') && function_exists('ipmiProxyDebugLog') && ipmiProxyDebugEnabled()) {
+                    ipmiProxyDebugLog('ilo_bounded_launch_denied_due_to_gate', [
+                        'reason'                 => $bounded['reason'],
+                        'surface_evidence_score' => $surfaceEvidenceScore,
+                    ]);
+                    ipmiProxyDebugLog('ilo_surface_vs_history_decision', [
+                        'winner' => 'stale_session_signals',
+                        'bounded'=> 0,
+                    ]);
+                    if ($bounded['reason'] === 'bounded_launch_budget_exhausted') {
+                        ipmiProxyDebugLog('ilo_sse_failures_block_repeated_launch', [
+                            'sse_fail_streak' => (int) ($bootstrapMeta['sse_fail_streak'] ?? 0),
+                        ]);
+                    }
+                }
+            }
+        }
+    }
+
+    $suppressionDetail = ipmiWebIloSurfaceAwareSuppressionDetail(
+        $attemptAutolaunch,
+        $verdict,
+        $hasSurface,
+        $surface,
+        $bootstrapMeta,
+        $session,
+        $boundedDenyReason
+    );
+    if ($hasSurface && !$attemptAutolaunch && function_exists('ipmiProxyDebugEnabled') && function_exists('ipmiProxyDebugLog') && ipmiProxyDebugEnabled()) {
+        ipmiProxyDebugLog('ilo_surface_present_but_suppressed_reason', [
+            'detail' => $suppressionDetail,
+            'verdict'=> $verdict,
+        ]);
     }
 
     $evidence = array_merge(
         [
-            'path_codes'     => $pathCodes,
-            'shell_http'     => (int) ($shellPack['http_code'] ?? 0),
-            'variant'        => $variant,
-            'bootstrap_phase'=> $phase,
+            'path_codes'              => $pathCodes,
+            'shell_http'              => (int) ($shellPack['http_code'] ?? 0),
+            'variant'                 => $variant,
+            'bootstrap_phase'         => $phase,
+            'surface_evidence_score'  => $surfaceEvidenceScore,
+            'historical_failure_weight'=> $historicalFailureW,
         ],
         $stallEvidence,
         is_array($surface['evidence'] ?? null) ? ['surface' => $surface['evidence']] : []
@@ -4755,25 +5159,35 @@ function ipmiWebIloConsoleCapabilityFromProbe(array $ranked, array $shellPack, a
             'attempt_auto'  => $attemptAutolaunch ? 1 : 0,
             'reasons_csv'   => implode(',', array_slice($reasons, 0, 10)),
             'blockers_csv'  => implode(',', array_slice($blockers, 0, 10)),
+            'suppression'   => $suppressionDetail,
+            'bounded_deny'  => $boundedDenyReason !== '' ? $boundedDenyReason : null,
         ]);
     }
 
     return [
-        'capability'                      => $cap,
-        'confidence'                      => $confidence,
-        'reasons'                         => $reasons,
-        'evidence'                        => $evidence,
-        'recommended_strategy'            => $recStrategy,
-        'should_attempt_proxy_autolaunch' => $attemptAutolaunch,
-        'should_fallback_to_shell_only'   => $fallbackShell,
-        'should_offer_legacy_or_alt_fallback' => $offerLegacy,
-        'ilo_native_console_verdict'      => $verdict,
-        'shell_authenticated'             => $shellAuthed,
-        'shell_bootstrap_healthy'         => $shellAuthed && !$bootstrapIncomplete,
-        'native_console_available'        => $cap === 'html5_native_available',
-        'native_console_transport_started'=> false,
-        'blockers'                        => $blockers,
-        'launch_surface'                  => $surface,
+        'capability'                         => $cap,
+        'confidence'                         => $confidence,
+        'reasons'                            => $reasons,
+        'evidence'                           => $evidence,
+        'recommended_strategy'               => $recStrategy,
+        'should_attempt_proxy_autolaunch'    => $attemptAutolaunch,
+        'should_fallback_to_shell_only'      => $fallbackShell,
+        'should_offer_legacy_or_alt_fallback'=> $offerLegacy,
+        'ilo_native_console_verdict'         => $verdict,
+        'shell_authenticated'                => $shellAuthed,
+        'shell_bootstrap_healthy'            => $shellAuthed && !$bootstrapIncomplete,
+        'native_console_available'           => $cap === 'html5_native_available',
+        'native_console_transport_started'   => false,
+        'blockers'                           => $blockers,
+        'launch_surface'                     => $surface,
+        'native_console_surface_present'     => $hasSurface,
+        'native_console_capability_possible' => $hasSurface && $shellAuthed && !ipmiWebIloLooksLicenseGatedFromAnalysis($surface),
+        'current_session_launch_allowed'     => $attemptAutolaunch,
+        'current_session_launch_suppressed'  => !$attemptAutolaunch,
+        'autolaunch_suppression_detail'      => $suppressionDetail,
+        'bounded_native_launch_consumed'     => $boundedConsumed,
+        'surface_evidence_score'             => $surfaceEvidenceScore,
+        'historical_failure_weight'          => $historicalFailureW,
     ];
 }
 
@@ -4788,7 +5202,10 @@ function ipmiWebIloConsoleCapability(array $session, ?mysqli $mysqli, array $opt
     $meta = is_array($session['session_meta'] ?? null) ? $session['session_meta'] : [];
     $cached = $meta['ilo_console_capability'] ?? null;
     $ttl = 280;
+    $bootstrapQuick = ipmiWebIloBootstrapMetaFromSession($session);
+    $stallMayHeal = !empty($bootstrapQuick['runtime_stall_signal']);
     if (empty($options['force'])
+        && !$stallMayHeal
         && is_array($cached)
         && (int) ($cached['v'] ?? 0) === 1
         && time() - (int) ($cached['t'] ?? 0) < $ttl
@@ -4815,10 +5232,21 @@ function ipmiWebIloConsoleCapability(array $session, ?mysqli $mysqli, array $opt
         $shellPack = ipmiWebIloAnalyzeShellForConsoleCapability($session, '/index.html');
     }
     $variant = ipmiWebBmcVariant((string) ($session['bmc_type'] ?? 'generic'));
+    $tok = (string) ($session['token'] ?? '');
+    $surfForReset = is_array($shellPack['launch_surface'] ?? null) ? $shellPack['launch_surface'] : [];
+    $bm0 = ipmiWebIloBootstrapMetaFromSession($session);
+    ipmiWebIloMaybeSoftResetBootstrapStallForSurface($mysqli, $tok, $session, $shellPack, $bm0, $surfForReset);
     $bootstrapMeta = ipmiWebIloBootstrapMetaFromSession($session);
-    $data = ipmiWebIloConsoleCapabilityFromProbe($rankedRows, $shellPack, $bootstrapMeta, $variant, $iloH5);
-    if ($mysqli && preg_match('/^[a-f0-9]{64}$/', (string) ($session['token'] ?? ''))) {
-        $tok = (string) $session['token'];
+    $data = ipmiWebIloConsoleCapabilityFromProbe($rankedRows, $shellPack, $bootstrapMeta, $variant, $iloH5, $session);
+    if (!empty($data['bounded_native_launch_consumed']) && $mysqli && preg_match('/^[a-f0-9]{64}$/', $tok)) {
+        ipmiWebIloBoundedLaunchBudgetRecordSpend($mysqli, $tok, $session);
+        if (function_exists('ipmiProxyDebugEnabled') && function_exists('ipmiProxyDebugLog') && ipmiProxyDebugEnabled()) {
+            ipmiProxyDebugLog('ilo_launch_budget_spent', [
+                'budget' => ipmiWebIloBoundedLaunchBudgetFromSession($session),
+            ]);
+        }
+    }
+    if ($mysqli && preg_match('/^[a-f0-9]{64}$/', $tok)) {
         ipmiWebSessionMetaMutate($mysqli, $tok, static function (array &$m) use ($data): void {
             $m['ilo_console_capability'] = ['v' => 1, 't' => time(), 'data' => $data];
         });

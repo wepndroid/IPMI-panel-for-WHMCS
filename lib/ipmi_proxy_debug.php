@@ -54,9 +54,19 @@
  * ilo_shell_console_capability_legacy_marker_found, ilo_shell_console_capability_license_marker_found,
  * ilo_shell_console_capability_result, ilo_launch_surface_found, ilo_launch_surface_missing, ilo_native_console_evidence_summary,
  * ilo_native_console_verdict, ilo_console_capability_declined_native, ilo_autolaunch_suppressed,
- * ilo_autolaunch_suppressed_due_to_missing_surface, ilo_native_launch_marked_unavailable_for_session, ilo_no_transport_after_shell_launch,
- * ilo_native_transport_evidence_applied (SSE/phase stall lowers native autolaunch when HTML5 not proven in shell),
- * ilo_native_console_verdict_finalized (reasons_csv / blockers_csv after all gates).
+ * ilo_autolaunch_suppressed_due_to_no_surface, ilo_autolaunch_suppressed_due_to_budget_exhausted,
+ * ilo_autolaunch_suppressed_due_to_hard_blocker, ilo_autolaunch_suppressed_due_to_repeated_transport_failure,
+ * ilo_autolaunch_suppressed_due_to_session_bootstrap_unhealthy, ilo_autolaunch_suppressed_due_to_weak_surface_evidence,
+ * ilo_autolaunch_suppressed_due_to_capability_gate,
+ * ilo_native_launch_marked_unavailable_for_session, ilo_no_transport_after_shell_launch,
+ * Surface vs stale bootstrap/SSE: ilo_bounded_launch_allowed_due_to_surface, ilo_bounded_launch_denied_due_to_gate,
+ * ilo_current_surface_evidence_applied, ilo_historical_failure_weight_applied, ilo_surface_vs_history_decision,
+ * ilo_sse_failures_softened_for_initial_launch, ilo_sse_failures_not_used_as_absolute_block, ilo_sse_failures_block_repeated_launch,
+ * ilo_stall_state_soft_reset, ilo_stall_state_retained_due_to_strong_negative_evidence, ilo_state_soft_reset_decision,
+ * ilo_fresh_shell_attempt_window_active, ilo_capability_health_separated, ilo_launch_attempt_allowed_despite_degraded_state,
+ * ilo_launch_budget_decision, ilo_launch_budget_spent, ilo_surface_present_but_suppressed_reason,
+ * ilo_native_transport_evidence_applied,
+ * ilo_native_console_verdict_finalized (reasons_csv / blockers_csv / suppression after gates).
  * Debug response header/console: ilo_bootstrap snapshot (phase, sse_fail_streak, refresh_60s, sec_helper_ok/fail, blank_ui_hypothesis,
  * last_event_outcome/path) + ilo_path_role, ilo_path_role_base, ilo_path_bootstrap_critical, ilo_path_role_flags,
  * ilo_path_heuristic_score on final emit. Preflight: ilo_bootstrap_preflight_skip_second_refresh when stall/degraded relogin already ran once in the same preflight.
