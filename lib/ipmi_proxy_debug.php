@@ -52,12 +52,15 @@
  * ilo_console_interactive_likely_while_loading (heuristic only, not success),
  * ilo_console_startup_helper_{seen,ok,failed}.
  * iLO /index.html speculative shell launch discovery: speculative_shell_autolaunch in PLAN, ilo_shell_autolaunch_allowed,
- * ilo_launch_discovery_started, ilo_launch_menu_expanded, ilo_launch_function_found, ilo_launch_control_found (deep_scan),
+ * ilo_launch_discovery_started, ilo_launch_menu_expanded, ilo_launch_surface_found, ilo_launch_function_found,
+ * ilo_launch_function_invocation_{attempted,succeeded,failed}, ilo_launch_control_found (deep_scan / console_href),
  * ilo_launch_triggered, ilo_launch_navigation_triggered, ilo_launch_discovery_escalation_{allowed,attempted,failed,skipped},
  * ilo_launch_frame_candidate_found, ilo_console_frame_candidate_{detected,followed,rejected}, ilo_frame_contains_launch_surface,
  * ilo_frame_subdocument_launch_control (clickable control found inside same-origin iframe),
- * ilo_no_launch_target_found, ilo_launch_discovery_failed, ilo_stalled_before_transport (discovery:1),
- * ilo_console_readiness_reclassified, ilo_console_start_failed_no_launch_target,
+ * ilo_shell_only_ui_detected, ilo_white_screen_stall_detected, ilo_launch_action_no_effect,
+ * ilo_no_launch_target_found, ilo_launch_discovery_failed, ilo_stalled_before_transport (discovery:1 / white_screen:1),
+ * ilo_console_readiness_reclassified, ilo_console_start_failed_no_launch_target, ilo_launch_discovery_server_finalized,
+ * session _m.ilo_launch_discovery (ipmiProxyIloLaunchDiscoveryState* / ipmiProxyIloLaunchDiscoveryReadinessVerdict),
  * ilo_launch_helper_{seen,aided_discovery,seen_but_no_target_found}, ilo_launch_discovery_server_updated.
  * iLO strict native-console confirmation (capability vs reach vs session vs live display): ilo_confirmation_signals_collected,
  * ilo_confirmation_{weak_only,reached_not_ready,strong}, ilo_confirmation_failed_{shell_only,loading_only},
