@@ -37,13 +37,19 @@
  * ilo_sse_health_{positive,negative}, ilo_sse_recovered_after_refresh, ilo_sse_still_failing_after_refresh,
  * ilo_refresh_attempt_suppressed_due_to_recent_failure, ilo_refresh_attempt_recorded, ilo_refresh_budget_exhausted.
  * iLO path roles (session-aware): HTML elevation requires a structural heuristic signal (name/keyword/repeat/promoted), not time-only;
- * ilo_bootstrap_context_window_active, ilo_role_heuristic_summary, ilo_bootstrap_role_finalized,
+ * ilo_bootstrap_context_window_active, ilo_role_heuristic_summary (native_console_context, native_ctx_match, secondary_promotion on helper paths), ilo_bootstrap_role_finalized,
  * ilo_html_fragment_heuristic_{positive,negative}, ilo_path_role_{elevated_by_context,not_elevated_after_context_check},
  * ilo_bootstrap_html_fragment_detected, ilo_html_fragment_promoted_to_bootstrap_critical, ilo_path_missed_as_bootstrap_critical,
  * ilo_path_excluded_as_static_asset, ilo_bootstrap_api_detected, ilo_observed_path_{recorded,promoted,expired},
  * ilo_observed_path_promotion_skipped, ilo_path_promoted_by_observation, ilo_bootstrap_recovery_guardrail_applied,
  * ilo_fragment_{shape_unexpected,returned_full_shell}, ilo_api_response_bootstrap_broken,
  * ilo_bootstrap_state_updated_from_role, ilo_path_contributed_to_bootstrap_health, ilo_bootstrap_recovery_role_used.
+ * iLO secondary native-console helpers (e.g. jnlp_template during proven HTML5): ilo_secondary_helper_context_check (verdict/strategy/family/phase),
+ * ilo_secondary_helper_context_active, ilo_secondary_console_helper_detected, ilo_jnlp_template_promoted (incl. native_ctx_match),
+ * ilo_path_role_classified adds native_console_context for helper paths post-upstream,
+ * ilo_secondary_helper_role_finalized, ilo_secondary_helper_promotion_skipped, ilo_secondary_helper_guardrail_applied,
+ * ilo_secondary_helper_health_signal, ilo_secondary_console_helper_contributed, ilo_legacy_named_helper_seen_in_html5_flow,
+ * ilo_secondary_helper_not_treated_as_legacy_fallback.
  * iLO native console vs auth: ilo_shell_console_capability_analysis_started, ilo_shell_console_capability_html5_marker_found,
  * ilo_shell_console_capability_legacy_marker_found, ilo_shell_console_capability_license_marker_found,
  * ilo_shell_console_capability_result, ilo_launch_surface_found, ilo_launch_surface_missing, ilo_native_console_evidence_summary,
@@ -51,7 +57,7 @@
  * ilo_autolaunch_suppressed_due_to_missing_surface, ilo_native_launch_marked_unavailable_for_session, ilo_no_transport_after_shell_launch,
  * ilo_native_transport_evidence_applied (SSE/phase stall lowers native autolaunch when HTML5 not proven in shell),
  * ilo_native_console_verdict_finalized (reasons_csv / blockers_csv after all gates).
- * Debug response header/console: ilo_bootstrap snapshot (phase, sse_fail_streak, refresh_60s, blank_ui_hypothesis,
+ * Debug response header/console: ilo_bootstrap snapshot (phase, sse_fail_streak, refresh_60s, sec_helper_ok/fail, blank_ui_hypothesis,
  * last_event_outcome/path) + ilo_path_role, ilo_path_role_base, ilo_path_bootstrap_critical, ilo_path_role_flags,
  * ilo_path_heuristic_score on final emit. Preflight: ilo_bootstrap_preflight_skip_second_refresh when stall/degraded relogin already ran once in the same preflight.
  */

@@ -1918,6 +1918,244 @@ function ipmiProxyIloPathContextFromSession(array $session): array
 }
 
 /**
+ * Cached KVM launch plan from session DB metadata (if present).
+ *
+ * @return array<string, mixed>
+ */
+function ipmiProxyIloKvmPlanFromSession(array $session): array
+{
+    $meta = is_array($session['session_meta'] ?? null) ? $session['session_meta'] : [];
+    $kp = $meta['kvm_plan'] ?? null;
+
+    return is_array($kp) && is_array($kp['plan'] ?? null) ? $kp['plan'] : [];
+}
+
+/**
+ * Narrow allowlist: HTML routes that are not primary bootstrap fragments but travel with native HTML5 console.
+ */
+function ipmiProxyIloLooksLikeSecondaryConsoleHelper(string $path): bool
+{
+    $p = strtolower((string) parse_url($path, PHP_URL_PATH));
+    static $helpers = [
+        '/html/jnlp_template.html',
+    ];
+
+    return in_array($p, $helpers, true);
+}
+
+/**
+ * Relative weight for secondary-helper health signals (kept small vs masthead/session_info).
+ */
+function ipmiProxyIloSecondaryHelperWeight(string $path): float
+{
+    $p = strtolower((string) parse_url($path, PHP_URL_PATH));
+    if ($p === '/html/jnlp_template.html') {
+        return 0.22;
+    }
+
+    return 0.0;
+}
+
+/**
+ * Inspect KVM plan + bootstrap phase for proven HTML5-native console (strict gate for secondary-helper promotion).
+ *
+ * @param array<string, mixed> $bootstrapState from ipmiProxyIloBootstrapStateLoad
+ * @return array{active: bool, match: string, verdict: string, strategy: string, vendor_family: string, phase: string}
+ */
+function ipmiProxyIloActiveNativeConsoleContextDetail(array $session, array $bootstrapState = []): array
+{
+    $plan = ipmiProxyIloKvmPlanFromSession($session);
+    $verdict = (string) ($plan['ilo_native_console_verdict'] ?? '');
+    $strategy = (string) ($plan['launch_strategy'] ?? '');
+    $fam = (string) ($plan['vendor_family'] ?? '');
+    $phase = (string) ($bootstrapState['phase'] ?? '');
+    $match = '';
+    if ($verdict === 'native_html5_available') {
+        $match = 'verdict_native_html5_available';
+    } elseif ($strategy === 'ilo_application_force_html5') {
+        $match = 'strategy_ilo_application_force_html5';
+    }
+    $active = $match !== '' && $phase !== 'stalled';
+    if ($fam !== '' && $fam !== 'ilo') {
+        $active = false;
+        $match = $match !== '' ? 'blocked_non_ilo_plan_family' : '';
+    }
+
+    return [
+        'active' => $active,
+        'match'          => $match,
+        'verdict'        => $verdict,
+        'strategy'       => $strategy,
+        'vendor_family'  => $fam,
+        'phase'          => $phase,
+    ];
+}
+
+/**
+ * True when the session model already shows proven/native HTML5 console intent and bootstrap is not stalled.
+ *
+ * @param array<string, mixed> $bootstrapState from ipmiProxyIloBootstrapStateLoad
+ */
+function ipmiProxyIloHasActiveNativeConsoleContext(array $session, array $bootstrapState = []): bool
+{
+    return ipmiProxyIloActiveNativeConsoleContextDetail($session, $bootstrapState)['active'];
+}
+
+/**
+ * Gated promotion: known secondary helpers only, and only with active native-console context.
+ *
+ * @param array<string, mixed> $bootstrapState
+ * @param array<string, mixed>|null $plan unused; reserved for callers that already loaded the plan
+ */
+function ipmiProxyIloShouldPromoteSecondaryConsoleHelper(
+    string $bmcPath,
+    array $session,
+    array $bootstrapState,
+    ?array $plan = null
+): bool {
+    unset($plan);
+    if (!ipmiProxyIloLooksLikeSecondaryConsoleHelper($bmcPath)) {
+        return false;
+    }
+    if (ipmiProxyIloSecondaryHelperWeight($bmcPath) <= 0.0) {
+        return false;
+    }
+
+    return ipmiProxyIloHasActiveNativeConsoleContext($session, $bootstrapState);
+}
+
+/**
+ * Increment lightweight secondary-helper counters in the bootstrap window (does not affect phase classification).
+ *
+ * @param array<string, mixed> $window
+ * @return array<string, mixed>
+ */
+function ipmiProxyIloBootstrapRegisterSecondarySignal(array $window, string $outcome): array
+{
+    $w = $window;
+    if ($outcome === 'ok') {
+        $w['sec_helper_ok'] = min(8, (int) ($w['sec_helper_ok'] ?? 0) + 1);
+    } elseif (str_starts_with($outcome, 'fail')) {
+        $w['sec_helper_fail'] = min(5, (int) ($w['sec_helper_fail'] ?? 0) + 1);
+    }
+
+    return $w;
+}
+
+/**
+ * Promote a narrow set of transport-shaped /html routes when native HTML5 is already proven — not bootstrap-critical.
+ *
+ * @param array<string, mixed> $final role row from ipmiProxyClassifyIloPathRole + contextualize
+ * @param array<string, mixed> $bootstrapState
+ * @return array<string, mixed>
+ */
+function ipmiProxyIloApplySecondaryConsoleHelperPathRole(
+    array $final,
+    string $bmcPath,
+    array $session,
+    array $bootstrapState,
+    string $traceId
+): array {
+    $baseRole = (string) ($final['base_role'] ?? '');
+    $curRole = (string) ($final['role'] ?? '');
+    if ($curRole !== 'transport_related' || $baseRole !== 'transport_related') {
+        return $final;
+    }
+    if (!ipmiProxyIloLooksLikeSecondaryConsoleHelper($bmcPath)) {
+        return $final;
+    }
+
+    $ctxDetail = ipmiProxyIloActiveNativeConsoleContextDetail($session, $bootstrapState);
+    $ctxActive = $ctxDetail['active'];
+    if (ipmiProxyDebugEnabled() && $traceId !== '') {
+        ipmiProxyDebugLog('ilo_secondary_helper_context_check', [
+            'trace'          => $traceId,
+            'bmcPath'        => $bmcPath,
+            'context_active' => $ctxActive ? 1 : 0,
+            'ctx_match'      => (string) ($ctxDetail['match'] ?? ''),
+            'verdict'        => (string) ($ctxDetail['verdict'] ?? ''),
+            'strategy'       => (string) ($ctxDetail['strategy'] ?? ''),
+            'vendor_family'  => (string) ($ctxDetail['vendor_family'] ?? ''),
+            'phase'          => (string) ($ctxDetail['phase'] ?? ''),
+        ]);
+    }
+
+    if (!$ctxActive) {
+        if (ipmiProxyDebugEnabled() && $traceId !== '') {
+            $skipReason = 'native_console_context_not_active';
+            if ((string) ($ctxDetail['match'] ?? '') === 'blocked_non_ilo_plan_family') {
+                $skipReason = 'plan_vendor_family_not_ilo';
+            } elseif ((string) ($ctxDetail['phase'] ?? '') === 'stalled') {
+                $skipReason = 'bootstrap_phase_stalled';
+            } elseif ($ctxDetail['match'] === '' && ipmiProxyIloKvmPlanFromSession($session) === []) {
+                $skipReason = 'kvm_plan_missing_in_session';
+            } elseif ($ctxDetail['match'] === '') {
+                $skipReason = 'no_verdict_or_force_html5_strategy';
+            }
+            ipmiProxyDebugLog('ilo_secondary_helper_promotion_skipped', [
+                'trace'   => $traceId,
+                'bmcPath' => $bmcPath,
+                'reason'  => $skipReason,
+            ]);
+        }
+
+        return $final;
+    }
+
+    $w = ipmiProxyIloSecondaryHelperWeight($bmcPath);
+    if ($w <= 0.0) {
+        if (ipmiProxyDebugEnabled() && $traceId !== '') {
+            ipmiProxyDebugLog('ilo_secondary_helper_guardrail_applied', [
+                'trace'   => $traceId,
+                'bmcPath' => $bmcPath,
+                'reason'  => 'zero_weight',
+            ]);
+        }
+
+        return $final;
+    }
+
+    $out = $final;
+    $out['role'] = 'secondary_console_helper';
+    $out['bootstrap_critical'] = false;
+    $out['recoverable'] = false;
+    $out['debug_class'] = 'secondary_native_console_helper';
+    $out['flags'] = is_array($out['flags'] ?? null) ? $out['flags'] : [];
+    $out['flags']['secondary_native_console_helper'] = true;
+    $out['flags']['legacy_named_helper_in_html5_flow'] = true;
+    $out['secondary_helper_weight'] = $w;
+
+    if (ipmiProxyDebugEnabled() && $traceId !== '') {
+        ipmiProxyDebugLog('ilo_secondary_helper_context_active', [
+            'trace'   => $traceId,
+            'bmcPath' => $bmcPath,
+        ]);
+        ipmiProxyDebugLog('ilo_secondary_console_helper_detected', [
+            'trace'   => $traceId,
+            'bmcPath' => $bmcPath,
+            'weight'  => $w,
+        ]);
+        if (strtolower((string) parse_url($bmcPath, PHP_URL_PATH)) === '/html/jnlp_template.html') {
+            ipmiProxyDebugLog('ilo_jnlp_template_promoted', [
+                'trace'   => $traceId,
+                'bmcPath' => $bmcPath,
+            ]);
+        }
+        ipmiProxyDebugLog('ilo_secondary_helper_role_finalized', [
+            'trace'            => $traceId,
+            'bmcPath'          => $bmcPath,
+            'from_base'        => $baseRole,
+            'final_role'       => $out['role'],
+            'weight'           => $w,
+            'promotion_reason' => 'active_native_console_context',
+            'ctx_match'        => (string) ($ctxDetail['match'] ?? ''),
+        ]);
+    }
+
+    return $out;
+}
+
+/**
  * @param array<string, mixed> $baseRole from ipmiProxyClassifyIloPathRole inner
  * @param array<string, mixed> $state
  * @param array<string, mixed> $requestContext path, heuristic breakdown, trace
@@ -2176,6 +2414,8 @@ function ipmiProxyIsIloSpaShellEntryPath(string $bmcPath): bool
  * Authoritative iLO path roles for bootstrap / recovery / debug (normalized iLO only at call sites).
  *
  * $context may include bootstrap_state, shell_ts, trace (for debug), accept_header (reserved).
+ * Narrow "secondary_console_helper" roles (legacy-named helpers during proven HTML5 flow) are applied
+ * only in ipmiProxyClassifyIloPathRoleForSession via ipmiProxyIloApplySecondaryConsoleHelperPathRole.
  *
  * @param array<string, mixed> $context
  * @return array<string, mixed>
@@ -2318,16 +2558,32 @@ function ipmiProxyClassifyIloPathRoleForSession(
             'trace'   => $traceId,
         ]);
     }
+    $final = ipmiProxyIloApplySecondaryConsoleHelperPathRole($final, $bmcPath, $session, $state, $traceId);
     if (ipmiProxyDebugEnabled()) {
+        $ctxSnap = ipmiProxyIloActiveNativeConsoleContextDetail($session, $state);
+        $secPromo = 'n/a';
+        if (ipmiProxyIloLooksLikeSecondaryConsoleHelper($bmcPath)) {
+            if (($final['role'] ?? '') === 'secondary_console_helper') {
+                $secPromo = 'promoted';
+            } elseif (($final['base_role'] ?? '') === 'transport_related' && ($final['role'] ?? '') === 'transport_related') {
+                $secPromo = $ctxSnap['active'] ? 'invariant_transport_despite_active_ctx' : 'skipped_no_native_context';
+            } else {
+                $secPromo = 'skipped_role_not_transport';
+            }
+        }
         ipmiProxyDebugLog('ilo_role_heuristic_summary', [
-            'trace'            => $traceId,
-            'bmcPath'          => $bmcPath,
-            'base_role'        => (string) ($final['base_role'] ?? ''),
-            'final_role'       => (string) ($final['role'] ?? ''),
-            'bootstrap_crit'   => !empty($final['bootstrap_critical']) ? 1 : 0,
-            'heuristic_score'  => (int) ($final['heuristic_score'] ?? 0),
-            'heuristic_reasons'=> $final['heuristic_reasons'] ?? [],
-            'flags'            => $final['flags'] ?? [],
+            'trace'                 => $traceId,
+            'bmcPath'               => $bmcPath,
+            'base_role'             => (string) ($final['base_role'] ?? ''),
+            'final_role'            => (string) ($final['role'] ?? ''),
+            'bootstrap_crit'        => !empty($final['bootstrap_critical']) ? 1 : 0,
+            'heuristic_score'       => (int) ($final['heuristic_score'] ?? 0),
+            'heuristic_reasons'     => $final['heuristic_reasons'] ?? [],
+            'flags'                 => $final['flags'] ?? [],
+            'secondary_w'           => (float) ($final['secondary_helper_weight'] ?? 0.0),
+            'native_console_context'=> $ctxSnap['active'] ? 1 : 0,
+            'native_ctx_match'      => (string) ($ctxSnap['match'] ?? ''),
+            'secondary_promotion'   => $secPromo,
         ]);
         ipmiProxyDebugLog('ilo_bootstrap_role_finalized', [
             'trace'      => $traceId,
@@ -2339,6 +2595,7 @@ function ipmiProxyClassifyIloPathRoleForSession(
         ($final['base_role'] ?? '') === 'transport_related'
         && ($final['role'] ?? '') === 'transport_related'
         && str_starts_with(strtolower((string) parse_url($bmcPath, PHP_URL_PATH)), '/html/')
+        && !ipmiProxyIloLooksLikeSecondaryConsoleHelper($bmcPath)
         && ipmiProxyIloIsWithinBootstrapWindow($state)
         && ipmiProxyDebugEnabled()
     ) {
@@ -2390,7 +2647,7 @@ function ipmiProxyIloBootstrapStateDefaults(): array
         'events'     => [],
         'sse'        => ['last' => '', 'fail_streak' => 0, 'last_ts' => 0, 'ok_after_refresh' => 0],
         'refresh_ts' => [],
-        'window'     => ['t0' => time(), 'crit_ok' => 0, 'crit_fail' => 0, 'soft_fail' => 0, 'shell_ok' => 0, 'roles_ok' => ''],
+        'window'     => ['t0' => time(), 'crit_ok' => 0, 'crit_fail' => 0, 'soft_fail' => 0, 'shell_ok' => 0, 'roles_ok' => '', 'sec_helper_ok' => 0, 'sec_helper_fail' => 0],
         'shell_ts'   => 0,
         'observed'   => ['v' => 1, 'paths' => []],
     ];
@@ -2446,11 +2703,15 @@ function ipmiProxyIloBootstrapDebugSnapshot(array $session): array
     $evs = is_array($s['events'] ?? null) ? $s['events'] : [];
     $lastEv = $evs !== [] ? $evs[count($evs) - 1] : [];
 
+    $w = is_array($s['window'] ?? null) ? $s['window'] : [];
+
     return [
         'phase'            => (string) ($s['phase'] ?? ''),
         'sse_last'         => (string) ($sse['last'] ?? ''),
         'sse_fail_streak'  => (int) ($sse['fail_streak'] ?? 0),
         'refresh_60s'      => count(array_filter($rts, static fn ($t) => $t > $now - 60)),
+        'sec_helper_ok'    => (int) ($w['sec_helper_ok'] ?? 0),
+        'sec_helper_fail'  => (int) ($w['sec_helper_fail'] ?? 0),
         'blank_ui_hypothesis' => ipmiProxyIloBootstrapBlankUiHypothesis($s),
         'last_event_outcome'  => is_array($lastEv) ? (string) ($lastEv['outcome'] ?? '') : '',
         'last_event_path'     => is_array($lastEv) ? (string) ($lastEv['path'] ?? '') : '',
@@ -2524,9 +2785,9 @@ function ipmiProxyIloBootstrapStateUpdate(array $state, array $event): array
     $evs[] = $event;
     $state['events'] = array_slice($evs, -24);
 
-    $w = is_array($state['window'] ?? null) ? $state['window'] : ['t0' => $now, 'crit_ok' => 0, 'crit_fail' => 0, 'soft_fail' => 0, 'shell_ok' => 0];
+    $w = is_array($state['window'] ?? null) ? $state['window'] : ['t0' => $now, 'crit_ok' => 0, 'crit_fail' => 0, 'soft_fail' => 0, 'shell_ok' => 0, 'roles_ok' => '', 'sec_helper_ok' => 0, 'sec_helper_fail' => 0];
     if ($now - (int) ($w['t0'] ?? $now) > 75) {
-        $w = ['t0' => $now, 'crit_ok' => 0, 'crit_fail' => 0, 'soft_fail' => 0, 'shell_ok' => 0, 'roles_ok' => ''];
+        $w = ['t0' => $now, 'crit_ok' => 0, 'crit_fail' => 0, 'soft_fail' => 0, 'shell_ok' => 0, 'roles_ok' => '', 'sec_helper_ok' => 0, 'sec_helper_fail' => 0];
     }
     $role = (string) ($event['role'] ?? '');
     $critical = !empty($event['critical']);
@@ -2570,6 +2831,18 @@ function ipmiProxyIloBootstrapStateUpdate(array $state, array $event): array
                     'outcome'=> $outcome,
                 ]);
             }
+        }
+    }
+    if ($role === 'secondary_console_helper') {
+        $w = ipmiProxyIloBootstrapRegisterSecondarySignal($w, $outcome);
+        if (ipmiProxyDebugEnabled()) {
+            ipmiProxyDebugLog('ilo_secondary_helper_health_signal', [
+                'role'            => $role,
+                'path'            => (string) ($event['path'] ?? ''),
+                'outcome'         => $outcome,
+                'sec_helper_ok'   => (int) ($w['sec_helper_ok'] ?? 0),
+                'sec_helper_fail' => (int) ($w['sec_helper_fail'] ?? 0),
+            ]);
         }
     }
     $state['window'] = $w;
@@ -3012,6 +3285,19 @@ function ipmiProxyIloBootstrapTrackBufferedResponse(
     }
     ipmiProxyIloBootstrapStatePersist($mysqli, $token, $session, $state, $traceId, 'ilo_bootstrap_state_updated_from_role');
     if (ipmiProxyDebugEnabled()) {
+        if (($pathRole['role'] ?? '') === 'secondary_console_helper') {
+            ipmiProxyDebugLog('ilo_secondary_console_helper_contributed', [
+                'trace'    => $traceId,
+                'bmcPath'  => $bmcPath,
+                'weight'   => (float) ($pathRole['secondary_helper_weight'] ?? 0.0),
+                'positive' => $ok ? 1 : 0,
+                'outcome'  => $outcome,
+                'sec_snap' => [
+                    'sec_helper_ok'   => (int) ($state['window']['sec_helper_ok'] ?? 0),
+                    'sec_helper_fail' => (int) ($state['window']['sec_helper_fail'] ?? 0),
+                ],
+            ]);
+        }
         if ($critical) {
             ipmiProxyDebugLog('ilo_path_contributed_to_bootstrap_health', [
                 'trace'    => $traceId,
@@ -5295,14 +5581,22 @@ if ($method === 'GET' && ($httpCode === 404 || $httpCode === 400) && ipmiProxyIs
 if (ipmiWebIsNormalizedIloType($bmcTypeNorm)) {
     $pathRoleTrack = ipmiProxyClassifyIloPathRoleForSession($mysqli, $token, $session, $bmcPath, $method, $ipmiTraceId);
     if (ipmiProxyDebugEnabled()) {
-        ipmiProxyDebugLog('ilo_path_role_classified', [
+        $pathRoleLog = [
             'trace'              => $ipmiTraceId,
             'bmcPath'            => $bmcPath,
             'path_role'          => $pathRoleTrack['role'],
             'path_role_base'     => (string) ($pathRoleTrack['base_role'] ?? $pathRoleTrack['role']),
             'bootstrap_critical' => !empty($pathRoleTrack['bootstrap_critical']) ? 1 : 0,
             'gate'               => 'post_upstream',
-        ]);
+        ];
+        if (ipmiProxyIloLooksLikeSecondaryConsoleHelper($bmcPath)) {
+            $ctxP = ipmiProxyIloActiveNativeConsoleContextDetail($session, ipmiProxyIloBootstrapStateLoad($session));
+            $pathRoleLog['native_console_context'] = $ctxP['active'] ? 1 : 0;
+            $pathRoleLog['native_ctx_match'] = (string) ($ctxP['match'] ?? '');
+            $pathRoleLog['secondary_promotion'] = (($pathRoleTrack['role'] ?? '') === 'secondary_console_helper')
+                ? 'promoted' : 'not_promoted';
+        }
+        ipmiProxyDebugLog('ilo_path_role_classified', $pathRoleLog);
         if (!empty($pathRoleTrack['bootstrap_critical'])) {
             ipmiProxyDebugLog('ilo_bootstrap_critical_path_detected', [
                 'trace'     => $ipmiTraceId,
@@ -5358,13 +5652,28 @@ if (
     && ipmiWebIsNormalizedIloType(ipmiWebNormalizeBmcType((string) ($session['bmc_type'] ?? 'generic')))
     && strtolower((string) parse_url($bmcPath, PHP_URL_PATH)) === '/html/jnlp_template.html'
 ) {
+    $iloBoot = ipmiProxyIloBootstrapStateLoad($session);
+    $nativeCtxSnap = ipmiProxyIloActiveNativeConsoleContextDetail($session, $iloBoot);
+    $nativeCtx = $nativeCtxSnap['active'];
     if (ipmiProxyDebugEnabled()) {
         ipmiProxyDebugLog('ilo_jnlp_template_detected', [
             'trace' => $ipmiTraceId,
             'bmcPath' => $bmcPath,
             'fromKvmAutoFlow' => ipmiProxyIsKvmAutoFlowRequest() ? 1 : 0,
             'looksUnavailable' => ipmiProxyBodyLooksLikeIloHtml5ConsoleUnavailable($responseBody) ? 1 : 0,
+            'native_console_context' => $nativeCtx ? 1 : 0,
+            'native_ctx_match' => (string) ($nativeCtxSnap['match'] ?? ''),
         ]);
+        if ($nativeCtx) {
+            ipmiProxyDebugLog('ilo_legacy_named_helper_seen_in_html5_flow', [
+                'trace'   => $ipmiTraceId,
+                'bmcPath' => $bmcPath,
+            ]);
+            ipmiProxyDebugLog('ilo_secondary_helper_not_treated_as_legacy_fallback', [
+                'trace'   => $ipmiTraceId,
+                'bmcPath' => $bmcPath,
+            ]);
+        }
     }
 }
 
