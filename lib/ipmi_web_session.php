@@ -10,6 +10,9 @@
  *   _m.ilo_bootstrap (v1): phase, rolling event window, SSE health, refresh_ts budget, shell_ts (last successful shell_entry),
  *   window.roles_ok (distinct critical roles that succeeded in the short window), and observed.paths — bounded per-session
  *   hints (hit counts, promotion flags, ~600s TTL) for firmware-specific helper routes; no secrets.
+ *   ilo_console_capability (v1, TTL ~280s): classified native HTML5 vs legacy/shell-only evidence from path probes + /index.html shell sample.
+ *   ilo_ui_blockers: masthead_fragment_ok from preflight (auth vs SPA assembly).
+ *   ilo_native_launch_failures: bounded client/server launch failure reasons (no secrets).
  *   created_ip, user_agent,
  *   created_at, expires_at, last_access_at, revoked_at
  */
@@ -3750,7 +3753,7 @@ function ipmiWebKvmLaunchPlanCacheInvalidate(?mysqli $mysqli, string $token): vo
     }
     if ($mysqli) {
         ipmiWebSessionMetaMutate($mysqli, $token, static function (array &$meta): void {
-            unset($meta['kvm_plan']);
+            unset($meta['kvm_plan'], $meta['ilo_console_capability']);
         });
     }
     $g = &$GLOBALS['__ipmi_kvm_launch_plan_cache'];
@@ -3938,6 +3941,30 @@ function ipmiWebResolveKvmLaunchPlan(array $session, ?mysqli $persistMetaMysqli 
         $bestProbe = is_array($bestRow) ? ($bestRow['probe'] ?? []) : [];
         $bestPath = is_array($bestRow) ? (string) ($bestRow['path'] ?? '') : '';
 
+        $shellPackForCap = ipmiWebIloAnalyzeShellForConsoleCapability($session, '/index.html');
+        $cap = ipmiWebIloConsoleCapability($session, $persistMetaMysqli, [
+            'ranked_rows' => $ranked['ranked'],
+            'ilo_html5'   => $iloHtml5,
+            'shell_pack'  => $shellPackForCap,
+        ]);
+        $plan['console_capability'] = (string) ($cap['capability'] ?? 'unknown');
+        $plan['console_capability_confidence'] = (int) ($cap['confidence'] ?? 0);
+        $plan['native_launch_viable'] = !empty($cap['should_attempt_proxy_autolaunch']);
+        $plan['native_launch_reason'] = implode(';', array_slice((array) ($cap['reasons'] ?? []), 0, 8));
+        $plan['native_launch_blockers'] = array_slice((array) ($cap['blockers'] ?? []), 0, 12);
+        $plan['ilo_native_console_verdict'] = (string) ($cap['ilo_native_console_verdict'] ?? 'native_html5_unconfirmed');
+        $plan['shell_authenticated_hint'] = !empty($cap['shell_authenticated']) ? 1 : 0;
+        $plan['shell_bootstrap_healthy_hint'] = !empty($cap['shell_bootstrap_healthy']) ? 1 : 0;
+        $plan['should_attempt_proxy_autolaunch'] = !empty($cap['should_attempt_proxy_autolaunch']);
+        $plan['should_fallback_to_shell_only'] = !empty($cap['should_fallback_to_shell_only']);
+        $plan['should_offer_legacy_or_alt_fallback'] = !empty($cap['should_offer_legacy_or_alt_fallback']);
+        $plan['debug']['ilo_console_capability'] = [
+            'capability'   => $plan['console_capability'],
+            'verdict'      => $plan['ilo_native_console_verdict'],
+            'confidence'   => $plan['console_capability_confidence'],
+            'attempt_auto' => $plan['should_attempt_proxy_autolaunch'] ? 1 : 0,
+        ];
+
         $strategy = 'ilo_application_autolaunch';
         $kvmPath = '/html/application.html?ipmi_kvm_auto=1';
         if ($iloHtml5) {
@@ -3961,23 +3988,65 @@ function ipmiWebResolveKvmLaunchPlan(array $session, ?mysqli $persistMetaMysqli 
             $strategy = 'ilo_rc_info_first';
         }
 
+        if (!$plan['should_attempt_proxy_autolaunch']) {
+            if (function_exists('ipmiProxyDebugEnabled') && function_exists('ipmiProxyDebugLog') && ipmiProxyDebugEnabled()) {
+                ipmiProxyDebugLog('ilo_console_capability_declined_native', [
+                    'capability' => $plan['console_capability'],
+                    'verdict'    => $plan['ilo_native_console_verdict'],
+                ]);
+                ipmiProxyDebugLog('ilo_autolaunch_suppressed', [
+                    'reason' => 'capability_not_proven',
+                    'verdict'=> $plan['ilo_native_console_verdict'],
+                ]);
+            }
+            $strategy = (string) ($cap['recommended_strategy'] ?? 'ilo_shell_only');
+            if ($strategy === 'ilo_shell_degraded_wait'
+                || $strategy === 'ilo_shell_only'
+                || $strategy === 'ilo_shell_only_legacy_fallback'
+                || $strategy === 'ilo_license_or_feature_gate') {
+                $kvmPath = '/index.html?ipmi_kvm_auto=1';
+            } elseif ($strategy === 'ilo_shell_explore' || $strategy === 'ilo_manual_navigation') {
+                $kvmPath = '/index.html';
+            }
+            $plan['requires_client_bootstrap'] = false;
+            $plan['console_ready_timeout_ms'] = 14000;
+            $plan['renderer_direct_possible'] = false;
+        } elseif ($plan['console_capability'] === 'html5_native_possible_but_unconfirmed') {
+            $strategy = 'ilo_speculative_shell_autolaunch';
+            $kvmPath = '/index.html?ipmi_kvm_auto=1';
+            $plan['console_ready_timeout_ms'] = 34000;
+            $plan['renderer_direct_possible'] = $iloHtml5 || !empty($bestProbe['browser_native_like']);
+        } else {
+            $plan['console_ready_timeout_ms'] = 52000;
+            $plan['renderer_direct_possible'] = $iloHtml5 || !empty($bestProbe['browser_native_like']);
+        }
+
         $plan['kvm_entry_path'] = $kvmPath;
         $plan['shell_entry_path'] = '/index.html';
         $plan['console_bootstrap_path'] = '/html/rc_info.html';
         $plan['launch_strategy'] = $strategy;
-        $plan['renderer_direct_possible'] = $iloHtml5 || !empty($bestProbe['browser_native_like']);
-        $plan['requires_client_bootstrap'] = !str_contains($kvmPath, 'irc.html');
+        if ($plan['should_attempt_proxy_autolaunch']) {
+            $plan['requires_client_bootstrap'] = !str_contains($kvmPath, 'irc.html');
+        }
         $plan['mode'] = 'proxy_autolaunch';
         $plan['needs_runtime_patch'] = true;
         $plan['needs_ws_relay'] = true;
-        $plan['fallback_path'] = '/html/application.html';
+        $plan['fallback_path'] = '/index.html';
         $plan['debug']['selection_note'] = 'iLO: strategy=' . $strategy . '; ranked_top=' . $bestPath
-            . '; html5=' . ($iloHtml5 ? '1' : '0') . '; score=' . (int) ($bestProbe['score'] ?? 0);
+            . '; html5=' . ($iloHtml5 ? '1' : '0') . '; score=' . (int) ($bestProbe['score'] ?? 0)
+            . '; cap=' . $plan['console_capability'] . '; verdict=' . $plan['ilo_native_console_verdict'];
         $plan['debug']['ilo_html5_probe'] = $iloHtml5 ? 1 : 0;
-        $plan['console_ready_timeout_ms'] = 52000;
         $plan['bootstrap_markers'] = ['ilo_shell', 'ilo_rc_bootstrap', 'ilo_html5_markers'];
         $plan['transport_markers'] = ['ipmi_ws_relay', 'websocket', 'renderer_connected'];
         $plan['interactive_success_markers'] = ['console_visible', 'irc_window', 'canvas'];
+
+        if (function_exists('ipmiProxyDebugEnabled') && function_exists('ipmiProxyDebugLog') && ipmiProxyDebugEnabled()) {
+            ipmiProxyDebugLog('ilo_native_console_verdict', [
+                'verdict' => $plan['ilo_native_console_verdict'],
+                'capability' => $plan['console_capability'],
+                'strategy'   => $strategy,
+            ]);
+        }
 
         ipmiWebKvmLaunchPlanCachePut($g, $cacheKey, $plan, $persistMetaMysqli, $tok);
 
@@ -4159,6 +4228,12 @@ function ipmiWebKvmPlanLogSummary(array $plan): array
         'bootstrap_markers' => is_array($plan['bootstrap_markers'] ?? null) ? array_slice($plan['bootstrap_markers'], 0, 12) : [],
         'transport_markers' => is_array($plan['transport_markers'] ?? null) ? array_slice($plan['transport_markers'], 0, 12) : [],
         'interactive_success_markers' => is_array($plan['interactive_success_markers'] ?? null) ? array_slice($plan['interactive_success_markers'], 0, 12) : [],
+        'console_capability' => (string) ($plan['console_capability'] ?? ''),
+        'ilo_native_console_verdict' => (string) ($plan['ilo_native_console_verdict'] ?? ''),
+        'native_launch_viable' => !empty($plan['native_launch_viable']) ? 1 : 0,
+        'should_attempt_proxy_autolaunch' => !empty($plan['should_attempt_proxy_autolaunch']) ? 1 : 0,
+        'shell_authenticated_hint' => (int) ($plan['shell_authenticated_hint'] ?? 0),
+        'shell_bootstrap_healthy_hint' => (int) ($plan['shell_bootstrap_healthy_hint'] ?? 0),
     ];
 }
 
@@ -4252,6 +4327,548 @@ function ipmiWebIloSupportsStandaloneHtml5Kvm(array $session): bool
     }
 
     return false;
+}
+
+/**
+ * Fetch HTML from BMC for iLO shell/console analysis (bounded body).
+ *
+ * @return array{code: int, body: string, login_like: bool}
+ */
+function ipmiWebIloProbePathBodySample(array $session, string $path, int $maxBytes = 240000): array
+{
+    $ip = trim((string) ($session['ipmi_ip'] ?? ''));
+    if ($ip === '') {
+        return ['code' => 0, 'body' => '', 'login_like' => true];
+    }
+    $scheme = (($session['bmc_scheme'] ?? 'https') === 'http') ? 'http' : 'https';
+    $url = $scheme . '://' . $ip . '/' . ltrim($path, '/');
+    $cookieHeader = ipmiWebBuildCookieString($session);
+    $ch = curl_init($url);
+    $appliedResolve = ipmiBmcApplyCurlUrlAndResolve($ch, $url, $ip);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 8);
+    curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 3);
+    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+    curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+    curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+    curl_setopt($ch, CURLOPT_HEADER, true);
+    curl_setopt($ch, CURLOPT_ENCODING, '');
+    curl_setopt($ch, CURLOPT_HTTPGET, true);
+    curl_setopt($ch, CURLOPT_USERAGENT, ipmiWebCurlUserAgent());
+    if ($cookieHeader !== '') {
+        curl_setopt($ch, CURLOPT_COOKIE, $cookieHeader);
+    }
+    $reqHeaders = [];
+    $fh = $session['forward_headers'] ?? [];
+    if (is_array($fh)) {
+        foreach ($fh as $hn => $hv) {
+            $hn = trim((string) $hn);
+            if ($hn === '' || strcasecmp($hn, 'Cookie') === 0) {
+                continue;
+            }
+            $reqHeaders[] = $hn . ': ' . $hv;
+        }
+    }
+    if ($reqHeaders !== []) {
+        curl_setopt($ch, CURLOPT_HTTPHEADER, $reqHeaders);
+    }
+    $raw = curl_exec($ch);
+    $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    if (($raw === false || $code === 0) && $appliedResolve) {
+        $ch = curl_init($url);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 8);
+        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 3);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+        curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+        curl_setopt($ch, CURLOPT_HEADER, true);
+        curl_setopt($ch, CURLOPT_ENCODING, '');
+        curl_setopt($ch, CURLOPT_HTTPGET, true);
+        curl_setopt($ch, CURLOPT_USERAGENT, ipmiWebCurlUserAgent());
+        if ($cookieHeader !== '') {
+            curl_setopt($ch, CURLOPT_COOKIE, $cookieHeader);
+        }
+        if ($reqHeaders !== []) {
+            curl_setopt($ch, CURLOPT_HTTPHEADER, $reqHeaders);
+        }
+        $raw = curl_exec($ch);
+        $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+    }
+    $body = '';
+    if (is_string($raw) && $raw !== '') {
+        [, $respBody] = ipmiWebCurlExtractFinalHeadersAndBody($raw);
+        $body = (string) $respBody;
+        if (strlen($body) > $maxBytes) {
+            $body = substr($body, 0, $maxBytes);
+        }
+    }
+    $loginLike = ipmiWebResponseLooksLikeBmcLoginPage($body, 'text/html');
+    if ($loginLike && ipmiWebResponseLooksLikeIloAuthedShell($body)) {
+        $loginLike = false;
+    }
+
+    return ['code' => $code, 'body' => $body, 'login_like' => $loginLike];
+}
+
+/**
+ * @return array<string, mixed>
+ */
+function ipmiWebIloAnalyzeDocumentForLaunchSurface(string $html): array
+{
+    $s = strtolower(substr($html, 0, 220000));
+    $reasons = [];
+    $evidence = [];
+    $html5 = false;
+    $legacy = false;
+    $license = false;
+    $rcRef = false;
+    if ($s === '') {
+        return [
+            'has_launch_surface'       => false,
+            'html5_native_markers'     => false,
+            'legacy_java_markers'      => false,
+            'license_gated_markers'    => false,
+            'remote_console_refs'      => false,
+            'iframe_console_refs'      => false,
+            'reasons'                  => ['empty_body'],
+            'evidence'               => [],
+        ];
+    }
+    if (str_contains($s, 'starthtml5irc')
+        || str_contains($s, 'start_html5_irc')
+        || str_contains($s, 'ilo.starthtml5')
+        || (str_contains($s, 'html5') && str_contains($s, 'integrated remote console'))
+        || str_contains($s, 'html5 irc')
+        || str_contains($s, 'ircwindow')
+        || str_contains($s, 'hrcbutton')
+        || (str_contains($s, 'new renderer') && str_contains($s, 'irc'))
+        || str_contains($s, 'htmlircwindowmode')) {
+        $html5 = true;
+        $reasons[] = 'html5_marker';
+        $evidence[] = 'html5_console_marker';
+    }
+    if (str_contains($s, 'remote console') || str_contains($s, 'remote control') || str_contains($s, 'virtual media')
+        || str_contains($s, 'launch console') || str_contains($s, 'kvm')) {
+        $rcRef = true;
+        $reasons[] = 'remote_console_text';
+    }
+    if ((str_contains($s, '<iframe') || str_contains($s, 'framecontent')) && (str_contains($s, 'irc') || str_contains($s, 'rc_info') || str_contains($s, 'console'))) {
+        $reasons[] = 'iframe_console';
+        $evidence[] = 'iframe_console_pattern';
+    }
+    if (str_contains($s, 'java integrated remote console')
+        || str_contains($s, 'applet-based console')
+        || str_contains($s, '.net integrated remote console')
+        || (str_contains($s, 'java') && str_contains($s, 'jnlp') && str_contains($s, 'console'))) {
+        $legacy = true;
+        $reasons[] = 'legacy_java_net';
+        $evidence[] = 'legacy_console_marker';
+    }
+    if (str_contains($s, 'license') && (str_contains($s, 'remote') || str_contains($s, 'ilo advanced') || str_contains($s, 'not available'))
+        || str_contains($s, 'evaluation license')
+        || str_contains($s, 'requires an advanced license')) {
+        $license = true;
+        $reasons[] = 'license_language';
+        $evidence[] = 'license_gated_text';
+    }
+    $hasSurface = $html5 || (($rcRef || str_contains($s, 'ilo.')) && (str_contains($s, 'framecontent') || str_contains($s, 'html/application') || str_contains($s, 'rc_info')));
+
+    return [
+        'has_launch_surface'    => $hasSurface,
+        'html5_native_markers'  => $html5,
+        'legacy_java_markers'   => $legacy,
+        'license_gated_markers' => $license,
+        'remote_console_refs'   => $rcRef,
+        'iframe_console_refs'   => str_contains($s, 'iframe') && (str_contains($s, 'irc') || str_contains($s, 'console')),
+        'reasons'               => $reasons,
+        'evidence'              => array_slice(array_unique($evidence), 0, 12),
+    ];
+}
+
+function ipmiWebIloLooksLegacyOnlyFromAnalysis(array $analysis): bool
+{
+    return !empty($analysis['legacy_java_markers']) && empty($analysis['html5_native_markers']);
+}
+
+function ipmiWebIloLooksLicenseGatedFromAnalysis(array $analysis): bool
+{
+    return !empty($analysis['license_gated_markers']);
+}
+
+/**
+ * @return array<string, mixed>
+ */
+function ipmiWebIloBootstrapMetaFromSession(array $session): array
+{
+    $m = is_array($session['session_meta'] ?? null) ? $session['session_meta'] : [];
+    $ib = is_array($m['ilo_bootstrap'] ?? null) ? $m['ilo_bootstrap'] : [];
+    $pf = is_array($m['ilo_preflight'] ?? null) ? $m['ilo_preflight'] : [];
+    $bl = is_array($m['ilo_ui_blockers'] ?? null) ? $m['ilo_ui_blockers'] : [];
+    $sse = is_array($ib['sse'] ?? null) ? $ib['sse'] : [];
+    $sseStreak = (int) ($sse['fail_streak'] ?? 0);
+    $phase = (string) ($ib['phase'] ?? 'fresh');
+    $runtimeStallSignal = ($phase === 'stalled') || ($sseStreak >= 2);
+
+    return [
+        'phase'                 => $phase,
+        'preflight_bootstrap_ok'=> $pf['bootstrap_ok'] ?? null,
+        'masthead_fragment_ok'  => $bl['masthead_fragment_ok'] ?? null,
+        'sse_fail_streak'       => $sseStreak,
+        'runtime_stall_signal'  => $runtimeStallSignal,
+    ];
+}
+
+/**
+ * @return array<string, mixed>
+ */
+function ipmiWebIloAnalyzeShellForConsoleCapability(array $session, string $shellPath = '/index.html'): array
+{
+    if (function_exists('ipmiProxyDebugEnabled') && function_exists('ipmiProxyDebugLog') && ipmiProxyDebugEnabled()) {
+        ipmiProxyDebugLog('ilo_shell_console_capability_analysis_started', ['shellPath' => $shellPath]);
+    }
+    $fetch = ipmiWebIloProbePathBodySample($session, $shellPath);
+    $code = (int) $fetch['code'];
+    $body = (string) $fetch['body'];
+    $loginLike = !empty($fetch['login_like']);
+    $shellAuthed = $code >= 200 && $code < 400 && !$loginLike && $body !== '';
+    $surface = ipmiWebIloAnalyzeDocumentForLaunchSurface($body);
+    if (!empty($surface['html5_native_markers']) && function_exists('ipmiProxyDebugEnabled') && function_exists('ipmiProxyDebugLog') && ipmiProxyDebugEnabled()) {
+        ipmiProxyDebugLog('ilo_shell_console_capability_html5_marker_found', ['shellPath' => $shellPath]);
+    }
+    if (!empty($surface['legacy_java_markers']) && function_exists('ipmiProxyDebugEnabled') && function_exists('ipmiProxyDebugLog') && ipmiProxyDebugEnabled()) {
+        ipmiProxyDebugLog('ilo_shell_console_capability_legacy_marker_found', ['shellPath' => $shellPath]);
+    }
+    if (!empty($surface['license_gated_markers']) && function_exists('ipmiProxyDebugEnabled') && function_exists('ipmiProxyDebugLog') && ipmiProxyDebugEnabled()) {
+        ipmiProxyDebugLog('ilo_shell_console_capability_license_marker_found', ['shellPath' => $shellPath]);
+    }
+    if (!empty($surface['has_launch_surface']) && function_exists('ipmiProxyDebugEnabled') && function_exists('ipmiProxyDebugLog') && ipmiProxyDebugEnabled()) {
+        ipmiProxyDebugLog('ilo_launch_surface_found', ['shellPath' => $shellPath, 'reasons' => $surface['reasons'] ?? []]);
+    } elseif ($shellAuthed && function_exists('ipmiProxyDebugEnabled') && function_exists('ipmiProxyDebugLog') && ipmiProxyDebugEnabled()) {
+        ipmiProxyDebugLog('ilo_launch_surface_missing', ['shellPath' => $shellPath]);
+    }
+
+    return [
+        'shell_path'           => $shellPath,
+        'http_code'            => $code,
+        'shell_authenticated'  => $shellAuthed,
+        'login_like'           => $loginLike,
+        'launch_surface'       => $surface,
+        'has_launch_surface'   => !empty($surface['has_launch_surface']),
+    ];
+}
+
+/**
+ * @param list<array{path: string, probe: array<string, mixed>}> $ranked
+ * @param array<string, mixed> $shellPack from ipmiWebIloAnalyzeShellForConsoleCapability
+ * @param array<string, mixed> $bootstrapMeta
+ * @return array<string, mixed>
+ */
+function ipmiWebIloConsoleCapabilityFromProbe(array $ranked, array $shellPack, array $bootstrapMeta, string $variant, bool $iloHtml5StandaloneProbe): array
+{
+    $pathCodes = [];
+    foreach ($ranked as $row) {
+        $full = (string) ($row['path'] ?? '');
+        $pr = is_array($row['probe'] ?? null) ? $row['probe'] : [];
+        $c = (int) ($pr['code'] ?? 0);
+        if (stripos($full, 'application.html') !== false) {
+            $pathCodes['application'] = $c;
+        }
+        if (stripos($full, 'rc_info') !== false) {
+            $pathCodes['rc_info'] = $c;
+        }
+        if (stripos($full, 'irc.html') !== false) {
+            $pathCodes['irc'] = $c;
+        }
+        if (stripos($full, 'index.html') !== false || preg_match('#(^|/)index\\.html#i', $full)) {
+            $pathCodes['index'] = $c;
+        }
+    }
+    $app404 = isset($pathCodes['application']) && $pathCodes['application'] === 404;
+    $rc404 = isset($pathCodes['rc_info']) && $pathCodes['rc_info'] === 404;
+    $irc404 = isset($pathCodes['irc']) && $pathCodes['irc'] === 404;
+    $indexOk = isset($pathCodes['index']) && $pathCodes['index'] >= 200 && $pathCodes['index'] < 400;
+    $tripleConsole404 = $app404 && $rc404 && $irc404;
+    $ilo4ish = stripos($variant, 'ilo4') !== false || str_contains(strtolower($variant), 'ilo4');
+    $ilo4ProbeHtml5NeedsShellProof = $ilo4ish && $tripleConsole404;
+
+    $surface = is_array($shellPack['launch_surface'] ?? null) ? $shellPack['launch_surface'] : [];
+    $hasSurface = !empty($shellPack['has_launch_surface']);
+    $shellAuthed = !empty($shellPack['shell_authenticated']);
+
+    $phase = (string) ($bootstrapMeta['phase'] ?? 'fresh');
+    $mastheadOk = $bootstrapMeta['masthead_fragment_ok'];
+    $preflightBootOk = $bootstrapMeta['preflight_bootstrap_ok'];
+    $bootstrapIncomplete = ($mastheadOk === false)
+        || in_array($phase, ['degraded', 'stalled'], true)
+        || ($preflightBootOk === false);
+
+    $blockers = [];
+    $reasons = [];
+    $cap = 'unknown';
+    $confidence = 30;
+    $verdict = 'native_html5_unconfirmed';
+    $recStrategy = 'ilo_shell_explore';
+    $attemptAutolaunch = true;
+    $fallbackShell = true;
+    $offerLegacy = false;
+
+    if (ipmiWebIloLooksLicenseGatedFromAnalysis($surface)) {
+        $cap = 'license_gated_or_disabled';
+        $confidence = 72;
+        $verdict = 'native_html5_likely_license_gated';
+        $blockers[] = 'license_gated';
+        $reasons[] = 'license_text_in_shell';
+        $attemptAutolaunch = false;
+        $recStrategy = 'ilo_license_or_feature_gate';
+    } elseif ($iloHtml5StandaloneProbe && $shellAuthed && $ilo4ProbeHtml5NeedsShellProof && empty($surface['html5_native_markers'])) {
+        $cap = 'html5_native_possible_but_unconfirmed';
+        $confidence = 42;
+        $verdict = 'native_html5_unconfirmed';
+        $reasons[] = 'ilo4_console_routes_404_probe_only_index';
+        $blockers[] = 'ilo4_requires_shell_html5_proof';
+        $attemptAutolaunch = $hasSurface;
+        $recStrategy = $hasSurface ? 'ilo_speculative_shell_autolaunch' : 'ilo_shell_only';
+    } elseif ($iloHtml5StandaloneProbe && $shellAuthed) {
+        $cap = 'html5_native_available';
+        $confidence = 88;
+        $verdict = 'native_html5_available';
+        $reasons[] = 'probe_html5_confirmed';
+        $attemptAutolaunch = true;
+        $recStrategy = 'ilo_application_autolaunch';
+    } elseif (!empty($surface['html5_native_markers']) && $shellAuthed) {
+        $cap = 'html5_native_available';
+        $confidence = 78;
+        $verdict = 'native_html5_available';
+        $reasons[] = 'shell_html5_markers';
+        $attemptAutolaunch = true;
+        $recStrategy = 'ilo_application_autolaunch';
+    } elseif ($hasSurface && $shellAuthed) {
+        $cap = 'html5_native_possible_but_unconfirmed';
+        $confidence = 55;
+        $verdict = 'native_html5_unconfirmed';
+        $reasons[] = 'launch_surface_heuristic';
+        $attemptAutolaunch = true;
+        $recStrategy = 'ilo_speculative_shell_autolaunch';
+    } elseif ($bootstrapIncomplete && $shellAuthed) {
+        $cap = 'shell_bootstrap_incomplete';
+        $confidence = 68;
+        $verdict = 'native_html5_blocked_by_shell_degradation';
+        $blockers[] = 'fragment_failure_blocks_native_launch';
+        $blockers[] = 'missing_bootstrap_fragment';
+        $reasons[] = 'bootstrap_phase_or_masthead';
+        $attemptAutolaunch = false;
+        $recStrategy = 'ilo_shell_degraded_wait';
+    } elseif ((stripos($variant, 'ilo4') !== false || str_contains(strtolower($variant), 'ilo4'))
+        && $app404 && $rc404 && $irc404 && $indexOk && $shellAuthed) {
+        $cap = 'legacy_only';
+        $confidence = 62;
+        $verdict = 'native_html5_likely_legacy_only';
+        $blockers[] = 'console_routes_404';
+        $reasons[] = 'ilo4_routes_missing';
+        $attemptAutolaunch = false;
+        $offerLegacy = true;
+        $recStrategy = 'ilo_shell_only_legacy_fallback';
+    } elseif ($app404 && $rc404 && $irc404 && $indexOk && $shellAuthed && !$hasSurface) {
+        $cap = 'legacy_only';
+        $confidence = 58;
+        $verdict = 'native_html5_not_detected';
+        $blockers[] = 'no_launch_surface';
+        $blockers[] = 'console_routes_404';
+        $reasons[] = 'typical_html5_paths_absent';
+        $attemptAutolaunch = false;
+        $offerLegacy = true;
+        $recStrategy = 'ilo_shell_only';
+    } elseif (!$shellAuthed) {
+        $cap = 'unknown';
+        $confidence = 25;
+        $verdict = 'native_html5_unconfirmed';
+        $blockers[] = 'shell_not_authenticated';
+        $attemptAutolaunch = false;
+        $recStrategy = 'ilo_auth_first';
+    } elseif (!$hasSurface) {
+        $cap = 'unknown';
+        $confidence = 40;
+        $verdict = 'native_html5_not_detected';
+        $blockers[] = 'no_launch_surface';
+        $reasons[] = 'shell_missing_console_markers';
+        $attemptAutolaunch = false;
+        $recStrategy = 'ilo_manual_navigation';
+    }
+
+    $runtimeStall = !empty($bootstrapMeta['runtime_stall_signal']);
+    $stallEvidence = [];
+    if ($runtimeStall && $shellAuthed && empty($surface['html5_native_markers'])) {
+        $blockers[] = 'bootstrap_stalled_or_sse_unstable';
+        $reasons[] = 'server_session_suggests_no_reliable_html5_transport';
+        $stallEvidence['runtime_stall_signal'] = 1;
+        $stallEvidence['sse_fail_streak'] = (int) ($bootstrapMeta['sse_fail_streak'] ?? 0);
+        $provenHtml5 = ($cap === 'html5_native_available')
+            || !empty($surface['html5_native_markers'])
+            || ($iloHtml5StandaloneProbe && !$ilo4ProbeHtml5NeedsShellProof);
+        if ($attemptAutolaunch && !$provenHtml5) {
+            $attemptAutolaunch = false;
+            if ($verdict === 'native_html5_unconfirmed' || $cap === 'html5_native_possible_but_unconfirmed' || $cap === 'unknown') {
+                $verdict = 'native_html5_not_detected';
+                $cap = 'unknown';
+            }
+            $recStrategy = 'ilo_shell_only';
+        }
+        if (function_exists('ipmiProxyDebugEnabled') && function_exists('ipmiProxyDebugLog') && ipmiProxyDebugEnabled()) {
+            ipmiProxyDebugLog('ilo_native_transport_evidence_applied', [
+                'sse_fail_streak' => (int) ($bootstrapMeta['sse_fail_streak'] ?? 0),
+                'phase'           => $phase,
+            ]);
+        }
+    }
+
+    $evidence = array_merge(
+        [
+            'path_codes'     => $pathCodes,
+            'shell_http'     => (int) ($shellPack['http_code'] ?? 0),
+            'variant'        => $variant,
+            'bootstrap_phase'=> $phase,
+        ],
+        $stallEvidence,
+        is_array($surface['evidence'] ?? null) ? ['surface' => $surface['evidence']] : []
+    );
+
+    if (function_exists('ipmiProxyDebugEnabled') && function_exists('ipmiProxyDebugLog') && ipmiProxyDebugEnabled()) {
+        ipmiProxyDebugLog('ilo_shell_console_capability_result', [
+            'capability' => $cap,
+            'verdict'    => $verdict,
+            'confidence' => $confidence,
+            'attempt'    => $attemptAutolaunch ? 1 : 0,
+        ]);
+        ipmiProxyDebugLog('ilo_native_console_evidence_summary', [
+            'capability' => $cap,
+            'verdict'    => $verdict,
+            'blockers'   => $blockers,
+            'reasons'    => $reasons,
+        ]);
+        ipmiProxyDebugLog('ilo_native_console_verdict_finalized', [
+            'verdict'       => $verdict,
+            'capability'    => $cap,
+            'shell_authed'  => $shellAuthed ? 1 : 0,
+            'attempt_auto'  => $attemptAutolaunch ? 1 : 0,
+            'reasons_csv'   => implode(',', array_slice($reasons, 0, 10)),
+            'blockers_csv'  => implode(',', array_slice($blockers, 0, 10)),
+        ]);
+    }
+
+    return [
+        'capability'                      => $cap,
+        'confidence'                      => $confidence,
+        'reasons'                         => $reasons,
+        'evidence'                        => $evidence,
+        'recommended_strategy'            => $recStrategy,
+        'should_attempt_proxy_autolaunch' => $attemptAutolaunch,
+        'should_fallback_to_shell_only'   => $fallbackShell,
+        'should_offer_legacy_or_alt_fallback' => $offerLegacy,
+        'ilo_native_console_verdict'      => $verdict,
+        'shell_authenticated'             => $shellAuthed,
+        'shell_bootstrap_healthy'         => $shellAuthed && !$bootstrapIncomplete,
+        'native_console_available'        => $cap === 'html5_native_available',
+        'native_console_transport_started'=> false,
+        'blockers'                        => $blockers,
+        'launch_surface'                  => $surface,
+    ];
+}
+
+/**
+ * Cached console capability (session meta TTL). Recomputes when stale or missing.
+ *
+ * @param array<string, mixed> $options ranked_rows?: list, ilo_html5?: bool, force?: bool, shell_pack?: array
+ * @return array<string, mixed>
+ */
+function ipmiWebIloConsoleCapability(array $session, ?mysqli $mysqli, array $options = []): array
+{
+    $meta = is_array($session['session_meta'] ?? null) ? $session['session_meta'] : [];
+    $cached = $meta['ilo_console_capability'] ?? null;
+    $ttl = 280;
+    if (empty($options['force'])
+        && is_array($cached)
+        && (int) ($cached['v'] ?? 0) === 1
+        && time() - (int) ($cached['t'] ?? 0) < $ttl
+        && is_array($cached['data'] ?? null)) {
+        return $cached['data'];
+    }
+    $rankedRows = $options['ranked_rows'] ?? null;
+    if (!is_array($rankedRows)) {
+        $candidates = [
+            '/html/application.html?ipmi_kvm_auto=1&ipmi_kvm_force_html5=1',
+            '/html/application.html?ipmi_kvm_auto=1',
+            '/index.html?ipmi_kvm_auto=1',
+            '/html/rc_info.html',
+            '/html/irc.html',
+            '/index.html',
+        ];
+        $rankedRows = ipmiWebProbeVendorNativeKvm($session, $candidates)['ranked'];
+    }
+    $iloH5 = array_key_exists('ilo_html5', $options)
+        ? (bool) $options['ilo_html5']
+        : ipmiWebIloSupportsStandaloneHtml5Kvm($session);
+    $shellPack = $options['shell_pack'] ?? null;
+    if (!is_array($shellPack)) {
+        $shellPack = ipmiWebIloAnalyzeShellForConsoleCapability($session, '/index.html');
+    }
+    $variant = ipmiWebBmcVariant((string) ($session['bmc_type'] ?? 'generic'));
+    $bootstrapMeta = ipmiWebIloBootstrapMetaFromSession($session);
+    $data = ipmiWebIloConsoleCapabilityFromProbe($rankedRows, $shellPack, $bootstrapMeta, $variant, $iloH5);
+    if ($mysqli && preg_match('/^[a-f0-9]{64}$/', (string) ($session['token'] ?? ''))) {
+        $tok = (string) $session['token'];
+        ipmiWebSessionMetaMutate($mysqli, $tok, static function (array &$m) use ($data): void {
+            $m['ilo_console_capability'] = ['v' => 1, 't' => time(), 'data' => $data];
+        });
+        if (!isset($session['session_meta']) || !is_array($session['session_meta'])) {
+            $session['session_meta'] = [];
+        }
+        $session['session_meta']['ilo_console_capability'] = ['v' => 1, 't' => time(), 'data' => $data];
+    }
+
+    return $data;
+}
+
+function ipmiWebIloInvalidateConsoleCapabilityMeta(?mysqli $mysqli, string $token, array &$session): void
+{
+    if ($mysqli && preg_match('/^[a-f0-9]{64}$/', $token)) {
+        ipmiWebSessionMetaMutate($mysqli, $token, static function (array &$meta): void {
+            unset($meta['ilo_console_capability']);
+        });
+    }
+    if (isset($session['session_meta']) && is_array($session['session_meta'])) {
+        unset($session['session_meta']['ilo_console_capability']);
+    }
+}
+
+/**
+ * Record masthead/fragment preflight outcome for planner (separate from auth).
+ */
+function ipmiWebIloRecordMastheadPreflightOutcome(?mysqli $mysqli, string $token, array &$session, bool $mastheadOk): void
+{
+    if ($mysqli && preg_match('/^[a-f0-9]{64}$/', $token)) {
+        ipmiWebSessionMetaMutate($mysqli, $token, static function (array &$meta) use ($mastheadOk): void {
+            $meta['ilo_ui_blockers'] = [
+                'v' => 1,
+                't'                    => time(),
+                'masthead_fragment_ok' => $mastheadOk,
+            ];
+        });
+    }
+    if (!isset($session['session_meta']) || !is_array($session['session_meta'])) {
+        $session['session_meta'] = [];
+    }
+    $session['session_meta']['ilo_ui_blockers'] = [
+        'v'                    => 1,
+        't'                    => time(),
+        'masthead_fragment_ok' => $mastheadOk,
+    ];
+    ipmiWebIloInvalidateConsoleCapabilityMeta($mysqli, $token, $session);
+    if (!$mastheadOk) {
+        ipmiWebKvmLaunchPlanCacheInvalidate($mysqli, $token);
+    }
 }
 
 function ipmiWebKvmPathLooksUnavailable(string $body): bool

@@ -475,6 +475,10 @@ function ipmiProxyBuildKvmAutoLaunchPreambleJs(string $familyJs, string $planJs,
         . 'var flowActive=false;'
         . 'try{flowActive=queryAuto||AUTO||(window.sessionStorage&&sessionStorage.getItem("_ipmi_kvm_auto_flow")==="1");}catch(_e1){flowActive=queryAuto||AUTO;}'
         . 'if(!flowActive){return;}'
+        . 'if(FAMILY==="ilo"&&PLAN&&PLAN.should_attempt_proxy_autolaunch===false){'
+        . 'try{_kvmDbg("ilo_autolaunch_suppressed_due_to_missing_surface",{verdict:String(PLAN.ilo_native_console_verdict||""),cap:String(PLAN.console_capability||"")});}catch(_eSup){}'
+        . 'try{_kvmDbg("ilo_no_transport_after_shell_launch",{suppressed:1});}catch(_eNt){}'
+        . 'return;}'
         . 'var launchDone=false;'
         . 'try{launchDone=!!(window.sessionStorage&&sessionStorage.getItem("_ipmi_kvm_autolaunch_done")==="1");}catch(_e2){launchDone=false;}'
         . 'function go(p){try{location.href=P+p;}catch(e){}}'
@@ -930,6 +934,10 @@ function ipmiProxyInjectKvmAutoLaunchPatch(string $html, string $token, $session
         'bootstrap_markers' => is_array($plan['bootstrap_markers'] ?? null) ? $plan['bootstrap_markers'] : [],
         'transport_markers' => is_array($plan['transport_markers'] ?? null) ? $plan['transport_markers'] : [],
         'interactive_success_markers' => is_array($plan['interactive_success_markers'] ?? null) ? $plan['interactive_success_markers'] : [],
+        'should_attempt_proxy_autolaunch' => !isset($plan['should_attempt_proxy_autolaunch']) || !empty($plan['should_attempt_proxy_autolaunch']),
+        'ilo_native_console_verdict' => (string) ($plan['ilo_native_console_verdict'] ?? ''),
+        'console_capability' => (string) ($plan['console_capability'] ?? ''),
+        'native_launch_viable' => !empty($plan['native_launch_viable']),
     ];
     $familyJs = json_encode((string) ($plan['vendor_family'] ?? 'generic'), JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_SLASHES);
     $planJs = json_encode($planLite, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_SLASHES);
@@ -937,6 +945,18 @@ function ipmiProxyInjectKvmAutoLaunchPatch(string $html, string $token, $session
     $pxJs = json_encode($px, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_SLASHES);
     $autoJs = $kvmAutoFlow ? 'true' : 'false';
     $dbgLit = ipmiProxyDebugEnabled() ? 'true' : 'false';
+    if (ipmiProxyDebugEnabled()
+        && (($plan['vendor_family'] ?? '') === 'ilo')
+        && empty($plan['should_attempt_proxy_autolaunch'])) {
+        ipmiProxyDebugLog('ilo_autolaunch_suppressed_due_to_missing_surface', [
+            'verdict'    => (string) ($plan['ilo_native_console_verdict'] ?? ''),
+            'capability' => (string) ($plan['console_capability'] ?? ''),
+            'strategy'   => (string) ($plan['launch_strategy'] ?? ''),
+        ]);
+        ipmiProxyDebugLog('ilo_native_launch_marked_unavailable_for_session', [
+            'verdict' => (string) ($plan['ilo_native_console_verdict'] ?? ''),
+        ]);
+    }
     $patch = '<script data-ipmi-proxy-kvm-autolaunch="1">'
         . ipmiProxyBuildKvmAutoLaunchPreambleJs($familyJs, $planJs, $pxJs, $autoJs, $dbgLit)
         . ipmiProxyBuildKvmAutoLaunchIloDomHelpersJs()
@@ -948,6 +968,79 @@ function ipmiProxyInjectKvmAutoLaunchPatch(string $html, string $token, $session
         . '})();</script>';
 
     return ipmiProxyInjectIntoHtmlHeadOrBody($html, $patch);
+}
+
+/**
+ * @param array<string, mixed> $analysis from ipmiWebIloAnalyzeDocumentForLaunchSurface
+ */
+function ipmiProxyIloHasLaunchSurface(array $analysis): bool
+{
+    return !empty($analysis['has_launch_surface']);
+}
+
+/** @return array<string, mixed> */
+function ipmiProxyIloLaunchSurfaceAnalysisFromHtml(string $html): array
+{
+    return ipmiWebIloAnalyzeDocumentForLaunchSurface($html);
+}
+
+/**
+ * @param array<string, mixed> $plan  KVM launch plan
+ * @param array<string, mixed> $cap   Console capability blob (optional)
+ * @param array<string, mixed> $state Bootstrap or session state (optional, unused)
+ */
+function ipmiProxyIloShouldAttemptAutolaunch(array $plan, array $cap = [], array $state = []): bool
+{
+    unset($cap, $state);
+    if (isset($plan['should_attempt_proxy_autolaunch'])) {
+        return !empty($plan['should_attempt_proxy_autolaunch']);
+    }
+
+    return !empty($plan['native_launch_viable']);
+}
+
+function ipmiProxyIloRecordNativeLaunchFailureReason(mysqli $mysqli, string $token, array &$session, string $reason): void
+{
+    if (!preg_match('/^[a-f0-9]{64}$/', $token)) {
+        return;
+    }
+    $reason = substr($reason, 0, 160);
+    ipmiWebSessionMetaMutate($mysqli, $token, static function (array &$meta) use ($reason): void {
+        $log = is_array($meta['ilo_native_launch_failures'] ?? null) ? $meta['ilo_native_launch_failures'] : ['v' => 1, 'items' => []];
+        if ((int) ($log['v'] ?? 0) !== 1) {
+            $log = ['v' => 1, 'items' => []];
+        }
+        $items = is_array($log['items'] ?? null) ? $log['items'] : [];
+        $items[] = ['t' => time(), 'r' => $reason];
+        $log['items'] = array_slice($items, -8);
+        $meta['ilo_native_launch_failures'] = $log;
+    });
+    if (!isset($session['session_meta']) || !is_array($session['session_meta'])) {
+        $session['session_meta'] = [];
+    }
+    $session['session_meta']['ilo_native_launch_failures'] = $session['session_meta']['ilo_native_launch_failures'] ?? ['v' => 1, 'items' => []];
+}
+
+/**
+ * @param array<string, mixed> $plan
+ * @param array<string, mixed> $session
+ */
+function ipmiProxyIloShouldSuppressFurtherAutolaunch(array $plan, array $session): bool
+{
+    if (empty($plan['should_attempt_proxy_autolaunch'])) {
+        return true;
+    }
+    $fail = is_array($session['session_meta']['ilo_native_launch_failures']['items'] ?? null)
+        ? $session['session_meta']['ilo_native_launch_failures']['items'] : [];
+    $recent = 0;
+    $now = time();
+    foreach ($fail as $row) {
+        if (is_array($row) && ($now - (int) ($row['t'] ?? 0)) < 600) {
+            $recent++;
+        }
+    }
+
+    return $recent >= 5;
 }
 
 function ipmiProxyInjectKvmUnavailableHint(string $html): string
@@ -3260,6 +3353,9 @@ function ipmiProxyMaybeIloRuntimePreflight(mysqli $mysqli, string $token, array 
         }
     }
     $bootstrapOk = $sessionOk && ipmiWebIloBootstrapFragmentProbe($baseUrl, $bmcIp, $cookies, $fwd);
+    if ($sessionOk) {
+        ipmiWebIloRecordMastheadPreflightOutcome($mysqli, $token, $session, $bootstrapOk);
+    }
     if (ipmiProxyDebugEnabled() && $sessionOk) {
         ipmiProxyDebugLog($bootstrapOk ? 'ilo_runtime_preflight_bootstrap_ok' : 'ilo_runtime_preflight_failed', [
             'trace'  => $traceId,
@@ -3314,6 +3410,9 @@ function ipmiProxyMaybeIloRuntimePreflight(mysqli $mysqli, string $token, array 
                 $fwd = is_array($session['forward_headers']) ? $session['forward_headers'] : [];
                 $sessionOk = ipmiWebIloVerifyAuthed($baseUrl, $bmcIp, $cookies, $fwd);
                 $bootstrapOk = $sessionOk && ipmiWebIloBootstrapFragmentProbe($baseUrl, $bmcIp, $cookies, $fwd);
+                if ($sessionOk) {
+                    ipmiWebIloRecordMastheadPreflightOutcome($mysqli, $token, $session, $bootstrapOk);
+                }
             }
         }
     }
@@ -3381,6 +3480,9 @@ function ipmiProxyMaybeIloRuntimePreflight(mysqli $mysqli, string $token, array 
         $fwd = is_array($session['forward_headers']) ? $session['forward_headers'] : [];
         $sessionOk2 = ipmiWebIloVerifyAuthed($baseUrl, $bmcIp, $cookies, $fwd);
         $bootstrapOk2 = $sessionOk2 && ipmiWebIloBootstrapFragmentProbe($baseUrl, $bmcIp, $cookies, $fwd);
+        if ($sessionOk2) {
+            ipmiWebIloRecordMastheadPreflightOutcome($mysqli, $token, $session, $bootstrapOk2);
+        }
         $payload = ['t' => time(), 'session_ok' => $sessionOk2, 'bootstrap_ok' => $bootstrapOk2];
         ipmiWebSessionMetaMutate($mysqli, $token, static function (array &$meta) use ($payload): void {
             $meta['ilo_preflight'] = $payload;
@@ -6055,6 +6157,26 @@ if (ipmiProxyDebugEnabled()) {
         $iloDbgExtra['ilo_path_bootstrap_critical'] = !empty($iloPrFinal['bootstrap_critical']) ? 1 : 0;
         $iloDbgExtra['ilo_path_role_flags'] = $iloPrFinal['flags'] ?? [];
         $iloDbgExtra['ilo_path_heuristic_score'] = (int) ($iloPrFinal['heuristic_score'] ?? 0);
+        $kvmPlanSnap = is_array($session['session_meta']['kvm_plan']['plan'] ?? null)
+            ? $session['session_meta']['kvm_plan']['plan'] : null;
+        if (is_array($kvmPlanSnap) && (($kvmPlanSnap['vendor_family'] ?? '') === 'ilo')) {
+            $iloDbgExtra['ilo_native_console_verdict'] = (string) ($kvmPlanSnap['ilo_native_console_verdict'] ?? '');
+            $iloDbgExtra['ilo_console_capability'] = (string) ($kvmPlanSnap['console_capability'] ?? '');
+            $iloDbgExtra['ilo_should_attempt_autolaunch'] = !empty($kvmPlanSnap['should_attempt_proxy_autolaunch']) ? 1 : 0;
+            $iloDbgExtra['ilo_native_launch_blockers'] = array_slice((array) ($kvmPlanSnap['native_launch_blockers'] ?? []), 0, 8);
+            $iloDbgExtra['ilo_native_launch_reason'] = substr((string) ($kvmPlanSnap['native_launch_reason'] ?? ''), 0, 220);
+            $iloDbgExtra['ilo_shell_auth_vs_native'] = [
+                'shell_authenticated_hint' => (int) ($kvmPlanSnap['shell_authenticated_hint'] ?? 0),
+                'native_launch_viable'     => !empty($kvmPlanSnap['native_launch_viable']) ? 1 : 0,
+                'bootstrap_healthy_hint'   => (int) ($kvmPlanSnap['shell_bootstrap_healthy_hint'] ?? 0),
+            ];
+        }
+        $capSnap = is_array($session['session_meta']['ilo_console_capability']['data'] ?? null)
+            ? $session['session_meta']['ilo_console_capability']['data'] : null;
+        if (is_array($capSnap) && ($iloDbgExtra['ilo_native_console_verdict'] ?? '') === '') {
+            $iloDbgExtra['ilo_native_console_verdict'] = (string) ($capSnap['ilo_native_console_verdict'] ?? '');
+            $iloDbgExtra['ilo_console_capability'] = (string) ($capSnap['capability'] ?? '');
+        }
     }
     ipmiProxyDebugEmitLogHeader(array_merge([
         'trace'   => $ipmiTraceId,

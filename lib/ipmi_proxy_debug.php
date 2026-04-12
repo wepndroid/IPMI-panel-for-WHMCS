@@ -44,6 +44,13 @@
  * ilo_observed_path_promotion_skipped, ilo_path_promoted_by_observation, ilo_bootstrap_recovery_guardrail_applied,
  * ilo_fragment_{shape_unexpected,returned_full_shell}, ilo_api_response_bootstrap_broken,
  * ilo_bootstrap_state_updated_from_role, ilo_path_contributed_to_bootstrap_health, ilo_bootstrap_recovery_role_used.
+ * iLO native console vs auth: ilo_shell_console_capability_analysis_started, ilo_shell_console_capability_html5_marker_found,
+ * ilo_shell_console_capability_legacy_marker_found, ilo_shell_console_capability_license_marker_found,
+ * ilo_shell_console_capability_result, ilo_launch_surface_found, ilo_launch_surface_missing, ilo_native_console_evidence_summary,
+ * ilo_native_console_verdict, ilo_console_capability_declined_native, ilo_autolaunch_suppressed,
+ * ilo_autolaunch_suppressed_due_to_missing_surface, ilo_native_launch_marked_unavailable_for_session, ilo_no_transport_after_shell_launch,
+ * ilo_native_transport_evidence_applied (SSE/phase stall lowers native autolaunch when HTML5 not proven in shell),
+ * ilo_native_console_verdict_finalized (reasons_csv / blockers_csv after all gates).
  * Debug response header/console: ilo_bootstrap snapshot (phase, sse_fail_streak, refresh_60s, blank_ui_hypothesis,
  * last_event_outcome/path) + ilo_path_role, ilo_path_role_base, ilo_path_bootstrap_critical, ilo_path_role_flags,
  * ilo_path_heuristic_score on final emit. Preflight: ilo_bootstrap_preflight_skip_second_refresh when stall/degraded relogin already ran once in the same preflight.
