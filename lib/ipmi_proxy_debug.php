@@ -61,6 +61,11 @@
  * ilo_launch_helper_{seen,aided_discovery,seen_but_no_target_found}, ilo_launch_discovery_server_updated.
  * iLO strict native-console confirmation (capability vs reach vs session vs live display): ilo_confirmation_signals_collected,
  * ilo_confirmation_{weak_only,reached_not_ready,strong}, ilo_confirmation_failed_{shell_only,loading_only},
+ * ilo_runtime_js_generation_{started,validated,invalid} (brace / tail sanity on injected autolaunch;
+ *   with proxy debug, injected &lt;script&gt; also carries data-ipmi-kvm-js-valid and data-ipmi-kvm-js-reason),
+ * ilo_application_path_loaded, ilo_overview_shell_detected, ilo_management_shell_{detected,still_visible}, ilo_shell_only_visible,
+ * ilo_live_console_visible, ilo_helper_activity_{seen,without_console_transition,correlated_with_console_reach}, ilo_console_not_reached,
+ * ilo_strong_confirmation_{rejected_shell_only,achieved} (visible live console + relay transport required; Overview shell excluded),
  * ilo_live_display_evidence_detected, ilo_console_{canvas_active,viewport_active},
  * ilo_loading_only_state_{present,cleared}, ilo_user_visible_console_success (strong confirmation only).
  * Session _m.ilo_native_console_confirmation: tier, final_debug_verdict, confidence, evidence buckets (server; live display browser-authoritative until optional beacon).
