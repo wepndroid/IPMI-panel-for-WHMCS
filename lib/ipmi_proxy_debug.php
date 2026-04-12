@@ -51,6 +51,13 @@
  * ilo_stuck_loading_escalation_{allowed,attempted,skipped}, ilo_stuck_loading_finalized, ilo_console_interactive_confirmed,
  * ilo_console_interactive_likely_while_loading (heuristic only, not success),
  * ilo_console_startup_helper_{seen,ok,failed}.
+ * iLO /index.html speculative shell launch discovery: speculative_shell_autolaunch in PLAN, ilo_shell_autolaunch_allowed,
+ * ilo_launch_discovery_started, ilo_launch_menu_expanded, ilo_launch_function_found, ilo_launch_control_found (deep_scan),
+ * ilo_launch_triggered, ilo_launch_navigation_triggered, ilo_launch_discovery_escalation_{allowed,skipped},
+ * ilo_console_frame_candidate_{detected,followed}, ilo_frame_contains_launch_surface,
+ * ilo_no_launch_target_found, ilo_launch_discovery_failed, ilo_stalled_before_transport (discovery:1),
+ * ilo_console_readiness_reclassified, ilo_console_start_failed_no_launch_target,
+ * ilo_launch_helper_{seen,aided_discovery,seen_but_no_target_found}, ilo_launch_discovery_server_updated.
  * iLO secondary native-console helpers (e.g. jnlp_template during proven HTML5): ilo_secondary_helper_context_check (verdict/strategy/family/phase),
  * ilo_secondary_helper_context_active, ilo_secondary_console_helper_detected, ilo_jnlp_template_promoted (incl. native_ctx_match),
  * ilo_path_role_classified adds native_console_context for helper paths post-upstream,

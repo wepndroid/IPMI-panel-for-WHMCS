@@ -610,7 +610,12 @@ function ipmiProxyBuildKvmAutoLaunchIloDomHelpersJs(): string
         . 'return ctx.document.getElementById("HRCButton")||ctx.document.querySelector("button[data-localize=\'rc_info.html5Console\']")||null;'
         . '}catch(e){return null;}}'
         . 'function iloKvText(s){s=String(s||"").toLowerCase();return(s.indexOf("html5")>=0&&(s.indexOf("console")>=0||s.indexOf("remote")>=0||s.indexOf("irc")>=0))||(s.indexOf("integrated")>=0&&s.indexOf("remote")>=0)||(s.indexOf("launch")>=0&&s.indexOf("console")>=0);}'
-        . 'function findIloHeuristicLaunch(ctx){try{var d=ctx.document;if(!d||!d.querySelectorAll)return null;var L=d.querySelectorAll("a[href],button,[role=button],input[type=button],input[type=submit],label,.btn");for(var i=0;i<L.length&&i<140;i++){var e=L[i],t=String(e.textContent||""),h=String(e.getAttribute("href")||"").toLowerCase(),oc=String(e.getAttribute("onclick")||"").toLowerCase(),dt=String(e.getAttribute("data-localize")||"").toLowerCase();if(iloKvText(t)||iloKvText(h)||iloKvText(oc)||iloKvText(dt)||h.indexOf("irc")>=0||h.indexOf("html5")>=0||h.indexOf("remote")>=0&&h.indexOf("console")>=0){return e;}}}catch(e2){}return null;}'
+        . 'function iloConsoleKeyword(s){s=String(s||"").toLowerCase();if(iloKvText(s))return true;if(s.indexOf("remote console")>=0)return true;if(s.indexOf("integrated remote console")>=0)return true;if(s.indexOf("launch console")>=0)return true;if(s.indexOf("html5 console")>=0)return true;if(s.indexOf("virtual console")>=0)return true;if(s.indexOf("kvm")>=0&&(s.indexOf("console")>=0||s.indexOf("launch")>=0||s.indexOf("remote")>=0))return true;if(s.indexOf("irc")>=0&&s.indexOf("console")>=0)return true;if(s==="console"||s.indexOf(" console")>=0)return true;return false;}'
+        . 'function ipmiProxyIloFrameCandidateScore(el){try{var s=0,src=String(el.getAttribute("src")||"").toLowerCase(),nm=String(el.getAttribute("name")||"").toLowerCase(),id=String(el.getAttribute("id")||"").toLowerCase(),cl=String(el.getAttribute("class")||"").toLowerCase(),ti=String(el.getAttribute("title")||"").toLowerCase();if(src.indexOf("rc_info")>=0||src.indexOf("irc.html")>=0)s+=62;if(src.indexOf("application.html")>=0)s+=55;if(src.indexOf("jnlp")>=0||src.indexOf("jnlp_template")>=0)s+=38;if(src.indexOf("html/irc")>=0)s+=45;if(nm.indexOf("appframe")>=0||id.indexOf("appframe")>=0||id==="appframe")s+=28;if(cl.indexOf("console")>=0||ti.indexOf("console")>=0)s+=18;if(nm.indexOf("frame")>=0&&src.indexOf("html/")>=0)s+=12;return s;}catch(e){return 0;}}'
+        . 'function ipmiProxyIloFindConsoleFrameCandidate(doc){try{if(!doc||!doc.querySelectorAll)return null;var F=doc.querySelectorAll("iframe,frame");var best=null,bs=0;for(var i=0;i<F.length&&i<48;i++){var sc=ipmiProxyIloFrameCandidateScore(F[i]);if(sc>bs){bs=sc;best=F[i];}}if(bs>=22)return {el:best,score:bs};}catch(e2){}return null;}'
+        . 'function ipmiProxyIloInspectSameOriginFrameForLaunch(fw){try{if(!fw||!fw.document)return null;var ifs=fw.document.querySelectorAll("iframe,frame");for(var ii=0;ii<ifs.length&&ii<28;ii++){try{var w=ifs[ii].contentWindow;if(!w||!w.document)continue;var el=findIloDeepLaunch({document:w.document})||findIloHeuristicLaunch({document:w.document});if(el){_kvmDbg("ilo_console_frame_candidate_followed",{iframe_index:ii});return el;}}catch(e2){}}}catch(e){}return null;}'
+        . 'function findIloDeepLaunch(ctx){try{var d=ctx.document;if(!d||!d.querySelectorAll)return null;var L=d.querySelectorAll("a[href],button,[role=button],input[type=button],input[type=submit],label,.btn,.hpJump,.menuItem,.nav-item,a[class*=nav],a[class*=menu],[data-action],[data-url],[data-href],.tree_view a,.gwt-Anchor");for(var i=0;i<L.length&&i<380;i++){var e=L[i],t=String(e.textContent||e.innerText||""),h=String(e.getAttribute("href")||"").toLowerCase(),oc=String(e.getAttribute("onclick")||"").toLowerCase(),da=String(e.getAttribute("data-action")||"").toLowerCase(),du=String(e.getAttribute("data-url")||"").toLowerCase(),dh=String(e.getAttribute("data-href")||"").toLowerCase();if(iloConsoleKeyword(t)||iloConsoleKeyword(h)||iloConsoleKeyword(oc)||iloConsoleKeyword(da)||iloConsoleKeyword(du)||iloConsoleKeyword(dh)||h.indexOf("rc_info")>=0||h.indexOf("application.html")>=0||h.indexOf("irc")>=0||h.indexOf("jnlp")>=0||h.indexOf("html5")>=0)return e;}}catch(e2){}return null;}'
+        . 'function findIloHeuristicLaunch(ctx){try{var d=ctx.document;if(!d||!d.querySelectorAll)return null;var L=d.querySelectorAll("a[href],button,[role=button],input[type=button],input[type=submit],label,.btn");for(var i=0;i<L.length&&i<140;i++){var e=L[i],t=String(e.textContent||""),h=String(e.getAttribute("href")||"").toLowerCase(),oc=String(e.getAttribute("onclick")||"").toLowerCase(),dt=String(e.getAttribute("data-localize")||"").toLowerCase();if(iloKvText(t)||iloKvText(h)||iloConsoleKeyword(t)||iloConsoleKeyword(h)||iloKvText(oc)||iloKvText(dt)||h.indexOf("irc")>=0||h.indexOf("html5")>=0||h.indexOf("remote")>=0&&h.indexOf("console")>=0){return e;}}}catch(e2){}return null;}'
         . 'function wireIloAppFrame(ctx){try{'
         . 'if(!ctx)return;'
         . 'var host=bindIloTopPage(ctx)||ctx;'
@@ -691,6 +696,8 @@ function ipmiProxyBuildKvmAutoLaunchIloDomHelpersJs(): string
         . 'if(typeof a.click==="function"){a.click();return true;}'
         . 'if(ctx.document.createEvent){var ev=ctx.document.createEvent("MouseEvents");ev.initEvent("click",true,true);a.dispatchEvent(ev);return true;}'
         . '}catch(e){}return false;}'
+        . 'function tryExpandIloHiddenMenus(doc,tag){try{if(!doc||!doc.querySelectorAll)return false;var M=doc.querySelectorAll(".menu-toggle,.nav-toggle,.gwt-MenuBar,.hp-menu-button,.hp-menu,.nav-item button,[class*=expand]");for(var i=0;i<M.length&&i<16;i++){var e=M[i];try{if(e&&e.offsetParent!==null){if(typeof e.click==="function"){e.click();return true;}}}catch(_me){}}}catch(e){}return false;}'
+        . 'function tryClickIloDiscoveryLaunch(ctxArr,tag){try{for(var qi=0;qi<ctxArr.length;qi++){var c=ctxArr[qi];if(!c||!c.document)continue;var dl=findIloDeepLaunch(c);if(dl){_kvmDbg("ilo_launch_control_found",{src:"deep_scan",tag:tag||""});if(typeof dl.click==="function"){dl.click();return"deep";}if(c.document.createEvent){var ev=c.document.createEvent("MouseEvents");ev.initEvent("click",true,true);dl.dispatchEvent(ev);return"deep";}}var ins=ipmiProxyIloInspectSameOriginFrameForLaunch(c);if(ins){_kvmDbg("ilo_frame_contains_launch_surface",{tag:tag||""});if(typeof ins.click==="function"){ins.click();return"frame_inspect";}if(c.document&&c.document.createEvent){var ev2=c.document.createEvent("MouseEvents");ev2.initEvent("click",true,true);ins.dispatchEvent(ev2);return"frame_inspect";}}var fc=ipmiProxyIloFindConsoleFrameCandidate(c.document);if(fc&&fc.el&&fc.score>=24){_kvmDbg("ilo_console_frame_candidate_detected",{score:fc.score,tag:tag||""});try{if(fc.el.focus)fc.el.focus();}catch(_fe){}}}}catch(_q){}return"";}'
         . 'function collectContexts(){'
         . 'var out=[];'
         . 'function add(c){if(!c)return;for(var i=0;i<out.length;i++){if(out[i]===c)return;}out.push(c);}'
@@ -703,6 +710,8 @@ function ipmiProxyBuildKvmAutoLaunchIloDomHelpersJs(): string
         . 'try{if(window.frames&&window.frames.frameContent&&window.frames.frameContent.frames&&window.frames.frameContent.frames.iframeContent){add(window.frames.frameContent.frames.iframeContent);}}catch(e4){}'
         . 'try{if(window.parent&&window.parent.frames&&window.parent.frames.frameContent)add(window.parent.frames.frameContent);}catch(e5){}'
         . 'try{if(window.parent&&window.parent.frames&&window.parent.frames.frameContent&&window.parent.frames.frameContent.frames&&window.parent.frames.frameContent.frames.iframeContent){add(window.parent.frames.frameContent.frames.iframeContent);}}catch(e6){}'
+        . 'try{if(window.frames){for(var fi=0;fi<window.frames.length&&fi<36;fi++){try{add(window.frames[fi]);}catch(fx){}}}}catch(f0){}'
+        . 'try{if(window.top&&window.top.frames){for(var fi2=0;fi2<window.top.frames.length&&fi2<36;fi2++){try{add(window.top.frames[fi2]);}catch(fx2){}}}}catch(f1){}'
         . 'return out;}';
 }
 
@@ -809,10 +818,12 @@ function ipmiProxyBuildIloKvmScript(): string
         . 'var pl=pathLower();'
         . 'if(pl.indexOf("/html/rc_info.html")!==-1&&!hasIloRendererHost(window)&&(!window.parent||window.parent===window)){go("/html/application.html?ipmi_kvm_auto=1");return;}'
         . 'var n=0,max=Math.max(220,Math.ceil(KVM_TMO/220));'
-        . 'var iloSt={phase:0,lastProgress:kvmNow(),clicks:0,navAttempts:0,reported:{boot:false,launch:false,trans:false,inter:false,rContainer:false,rDetected:false,wsEv:false,sessR:false,bootstrap:false,fin:false,stuck:false,noTrans:false,noSess:false,stuckEsc:false,stuckFin:false,interWhileLoad:false},finStable:0,ldSince:0,ldDbg:false,ldPerDbg:false,esc:0,stall:false,lastVerdict:"console_starting",prevVerdict:"",corrDbg:false};'
+        . 'var iloSt={phase:0,lastProgress:kvmNow(),clicks:0,navAttempts:0,reported:{boot:false,launch:false,trans:false,inter:false,rContainer:false,rDetected:false,wsEv:false,sessR:false,bootstrap:false,fin:false,stuck:false,noTrans:false,noSess:false,stuckEsc:false,stuckFin:false,interWhileLoad:false},finStable:0,ldSince:0,ldDbg:false,ldPerDbg:false,esc:0,stall:false,lastVerdict:"console_starting",prevVerdict:"",corrDbg:false,specShell:false,discoveryStarted:false,menuExpanded:false,discEsc:0,discNavTriggered:false,anyLaunchAction:false,launchDiscoveryFailed:false,discTriggered:false,funcFound:false};'
         . '(function tick(){'
         . 'n++;'
         . 'var ctx=collectContexts();'
+        . 'iloSt.specShell=!!(PLAN&&PLAN.speculative_shell_autolaunch);'
+        . 'if(iloSt.specShell&&!iloSt.discoveryStarted){iloSt.discoveryStarted=true;try{_kvmDbg("ilo_shell_autolaunch_allowed",{entry:String(PLAN.kvm_entry_path||""),strategy:String(PLAN.launch_strategy||"")});_kvmDbg("ilo_launch_discovery_started",{path:pathLower()});}catch(_ds0){}}'
         . 'var shell=getIloShellHost(window);'
         . 'var rootCtx=null;'
         . 'try{rootCtx=(window.top&&window.top.document&&window.top.document.getElementById&&window.top.document.getElementById("appFrame"))?window.top:window;}catch(_eroot){rootCtx=window;}'
@@ -820,8 +831,11 @@ function ipmiProxyBuildIloKvmScript(): string
         . 'if(shell){if(!shell.__ipmi_dbg_shell){try{shell.__ipmi_dbg_shell=1;kvmTouchProgress(iloSt);_kvmDbg("ilo_shell_detected",1);}catch(ds){}}forceSameTabOpen(shell);ensureIloFrameResizeShim(shell);ensureIloStartPatched(shell);ensureIloGlobalStartPatched(shell);wireIloAppFrame(shell);ensureIloShellLoaded(shell);ensureIloRcPageLoaded(shell);if((n%8)===0){clearIloStaleRenderer(shell);}}'
         . 'var rcPage=false,btnFound=false;'
         . 'for(var ri=0;ri<ctx.length;ri++){if(hasIloRcPage(ctx[ri])){rcPage=true;}if(findIloHtml5Button(ctx[ri])){btnFound=true;}}'
+        . 'if(rcPage||btnFound){iloSt.anyLaunchAction=true;}'
         . 'if(rcPage&&!iloSt.reported.boot){iloSt.reported.boot=true;kvmTouchProgress(iloSt);try{_kvmDbg("ilo_bootstrap_route_ready",1);_kvmDbg("ilo_console_bootstrap_started",1);}catch(eb){}}'
-        . 'if(btnFound&&!iloSt.reported.launch){iloSt.reported.launch=true;kvmTouchProgress(iloSt);try{_kvmDbg("ilo_launch_control_found",1);}catch(el){}}'
+        . 'if(btnFound&&!iloSt.reported.launch){iloSt.reported.launch=true;iloSt.anyLaunchAction=true;kvmTouchProgress(iloSt);try{_kvmDbg("ilo_launch_control_found",1);}catch(el){}}'
+        . 'if(iloSt.specShell&&(n===10||n===11)&&!iloSt.menuExpanded){iloSt.menuExpanded=true;for(var mx=0;mx<ctx.length;mx++){try{if(ctx[mx].document&&tryExpandIloHiddenMenus(ctx[mx].document,"shell")){_kvmDbg("ilo_launch_menu_expanded",{n:n});break;}}catch(_mex){}}}'
+        . 'if(iloSt.specShell&&(n%5===2)&&n>3){var dlr=tryClickIloDiscoveryLaunch(ctx,"scan");if(dlr){iloSt.discTriggered=true;iloSt.anyLaunchAction=true;iloSt.clicks++;kvmTouchProgress(iloSt);try{_kvmDbg("ilo_launch_triggered",{how:dlr,clicks:iloSt.clicks});}catch(_dlt){}}}'
         . 'for(var i=0;i<ctx.length;i++){forceSameTabOpen(ctx[i]);ensureIloFrameResizeShim(ctx[i]);ensureIloStartPatched(ctx[i]);ensureIloGlobalStartPatched(ctx[i]);wireIloAppFrame(ctx[i]);ensureIloRcButtonPatched(ctx[i]);if((n%8)===0){clearIloStaleRenderer(ctx[i]);}'
         . 'try{'
         . 'if(kvmIloRendererOrContainerPresent(ctx[i])&&!iloSt.reported.rContainer){iloSt.reported.rContainer=true;kvmTouchProgress(iloSt);_kvmDbg("ilo_renderer_container_detected",1);}'
@@ -830,6 +844,8 @@ function ipmiProxyBuildIloKvmScript(): string
         . '}catch(eic){}}'
         . 'var wsNow=kvmIloWsTransportEvidence();'
         . 'if(wsNow){kvmTouchProgress(iloSt);if(!iloSt.reported.wsEv){iloSt.reported.wsEv=true;iloSt.reported.trans=true;try{_kvmDbg("ilo_transport_evidence_detected",1);_kvmDbg("ilo_console_transport_started",1);_kvmDbg("ilo_transport_detected",1);}catch(et0){}}}'
+        . 'if(iloSt.specShell&&iloSt.discEsc===0&&n>=28&&n<=44&&!iloSt.discNavTriggered&&!wsNow){var plx2=pathLower();if((plx2.indexOf("/index.html")>=0||plx2.indexOf("/restgui/")>=0||plx2==="/"||plx2==="")&&!rcPage&&!iloSt.discTriggered){iloSt.discEsc=1;iloSt.discNavTriggered=true;iloSt.anyLaunchAction=true;try{_kvmDbg("ilo_launch_discovery_escalation_allowed",{reason:"navigate_spa_bootstrap"});go("/html/application.html?ipmi_kvm_auto=1");_kvmDbg("ilo_launch_navigation_triggered",{target:"html/application.html"});markAppRedirected();return;}catch(_navE2){}}}'
+        . 'if(iloSt.specShell&&n===45&&iloSt.discEsc===0&&!iloSt.discNavTriggered){try{var plxSk=pathLower();_kvmDbg("ilo_launch_discovery_escalation_skipped",{reason:plxSk.indexOf("/html/application.html")>=0?"already_in_spa":"still_on_shell_with_candidates"});}catch(_skp){}}'
         . 'if(kvmIloSessionReadyEvidence(window)&&!iloSt.reported.sessR){iloSt.reported.sessR=true;kvmTouchProgress(iloSt);try{_kvmDbg("ilo_session_ready_evidence_detected",1);_kvmDbg("ilo_console_session_ready",1);}catch(es0){}}'
         . 'var ldNow=kvmIloLoadingPleaseWaitAny(),rAny=iloSt.reported.rContainer,ldMs=iloSt.ldSince?(kvmNow()-iloSt.ldSince):0;'
         . 'if(ldNow){if(!iloSt.ldSince)iloSt.ldSince=kvmNow();ldMs=kvmNow()-iloSt.ldSince;if(!iloSt.ldDbg&&ldMs>6000){iloSt.ldDbg=true;try{_kvmDbg("ilo_loading_state_detected",{ms:ldMs});}catch(eld0){}}if(ldMs>12000&&!iloSt.ldPerDbg){iloSt.ldPerDbg=true;try{_kvmDbg("ilo_loading_state_persisted",{ms:ldMs});_kvmDbg("ilo_loading_spinner_persisted",{ms:ldMs});}catch(eld1){}}}'
@@ -842,26 +858,31 @@ function ipmiProxyBuildIloKvmScript(): string
         . 'if(rAny&&ldNow&&iloSt.ldSince&&(ldMs)>40000&&!iloSt.reported.stuck){iloSt.reported.stuck=true;iloSt.lastVerdict="console_stuck_loading";try{if(!wsNow){_kvmDbg("ilo_console_stuck_loading",{reason:"prolonged_loading_no_transport",ms:ldMs});_kvmDbg("ilo_console_readiness_verdict",{verdict:"console_start_failed_no_transport",detail:"no_ws_after_renderer",ms:ldMs});}else{_kvmDbg("ilo_console_stuck_loading",{reason:"prolonged_loading_with_transport",ms:ldMs,session_ready:iloSt.reported.sessR?1:0});_kvmDbg("ilo_console_readiness_verdict",{verdict:"console_stuck_loading",detail:"loading_with_ws_or_session_stall",ms:ldMs});}_kvmDbg("ilo_loading_state_escalated",{ms:ldMs,esc:iloSt.esc});if(iloSt.esc>=1){_kvmDbg("ilo_stuck_loading_finalized",{esc:iloSt.esc,verdict:"console_stuck_loading"});}}catch(est){}}'
         . 'var rf=kvmIloReadyToFinalize(window,iloSt);'
         . 'if(rf.ok&&!iloSt.reported.fin){iloSt.reported.fin=true;iloSt.lastVerdict="console_interactive_confirmed";try{_kvmDbg("ilo_console_interactive_confirmed",rf);_kvmDbg("ilo_console_readiness_verdict",{verdict:"console_interactive_confirmed",why:rf.why||""});markDone();return;}catch(emf){}}'
+        . 'var started=false,rcReady=rcPage||btnFound;'
+        . 'if(rcReady||iloSt.specShell){'
+        . 'if(iloSt.phase===0){var directTop=getIloDirectTopRenderer(window);if(directTop){if(!iloSt.funcFound){iloSt.funcFound=true;try{_kvmDbg("ilo_launch_function_found",{src:"directTop"});}catch(_ff0){}}_kvmDbg("ilo_direct_renderer_attempt",1);if(callStart(directTop)){started=true;iloSt.anyLaunchAction=true;iloSt.phase=1;kvmTouchProgress(iloSt);try{_kvmDbg("ilo_launch_function_invoked","direct");}catch(e0){}}}}'
+        . 'if(!started&&iloSt.phase<=1){for(var b=0;b<ctx.length;b++){if(callStart(ctx[b])){started=true;iloSt.anyLaunchAction=true;iloSt.phase=2;kvmTouchProgress(iloSt);try{_kvmDbg("ilo_launch_function_invoked","renderer_ctx");}catch(e1){}break;}}}'
+        . 'if(!started&&iloSt.phase<=2){for(var h=0;h<ctx.length;h++){if(callIloStart(ctx[h])){started=true;iloSt.anyLaunchAction=true;iloSt.phase=3;kvmTouchProgress(iloSt);try{_kvmDbg("ilo_launch_function_invoked","ilo_start");}catch(e2){}break;}}}'
+        . 'if(!started&&iloSt.phase<=3&&(n%6===0)){iloSt.clicks++;if(iloSt.clicks<=12){for(var k=0;k<ctx.length;k++){if(clickHtml5Anchor(ctx[k],false)){started=true;iloSt.anyLaunchAction=true;kvmTouchProgress(iloSt);try{_kvmDbg("ilo_launch_function_invoked","click");}catch(e3){}break;}}}}'
+        . 'if(!started&&iloSt.phase<=4&&shell&&(n%10===0)&&iloSt.navAttempts<3){iloSt.navAttempts++;if(ensureIloRcPageLoaded(shell)){iloSt.phase=4;kvmTouchProgress(iloSt);try{_kvmDbg("ilo_rc_info_navigation","phase");}catch(e4){}}}}'
+        . 'if(!rcReady&&iloSt.phase===0&&n<=16){var dtEarly=getIloDirectTopRenderer(window);if(dtEarly){_kvmDbg("ilo_direct_renderer_attempt",1);if(callStart(dtEarly)){iloSt.phase=1;kvmTouchProgress(iloSt);try{_kvmDbg("ilo_launch_function_invoked","direct_early");}catch(e5){}}}}'
+        . 'var hitMax=(n>=max);'
+        . 'if(!iloSt.stall&&(kvmNow()-iloSt.lastProgress)>KVM_TMO){iloSt.stall=true;var _discFail=iloSt.specShell&&!iloSt.reported.trans&&iloSt.clicks===0&&!iloSt.discNavTriggered&&!iloSt.discTriggered&&!rcPage;if(_discFail){iloSt.launchDiscoveryFailed=true;try{_kvmDbg("ilo_no_launch_target_found",{ticks:n,clicks:0});_kvmDbg("ilo_launch_discovery_failed",{reason:"stall_timeout_shell_no_surface"});_kvmDbg("ilo_stalled_before_transport",{discovery:1});_kvmDbg("ilo_console_readiness_reclassified",{to:"launch_discovery_failed"});_kvmDbg("ilo_console_start_failed_no_launch_target",1);}catch(_sfd){}}try{_kvmDbg("ilo_console_stalled",{ticks:n,phase:iloSt.phase,clicks:iloSt.clicks,no_transport:!iloSt.reported.trans,speculative_shell:iloSt.specShell?1:0,launch_discovery_failed:iloSt.launchDiscoveryFailed?1:0});}catch(es){}}'
+        . 'if(hitMax&&iloSt.specShell&&!iloSt.reported.trans&&iloSt.clicks===0&&!iloSt.discNavTriggered&&!iloSt.discTriggered&&!rcPage){iloSt.launchDiscoveryFailed=true;try{_kvmDbg("ilo_no_launch_target_found",{reason:"max_ticks"});_kvmDbg("ilo_launch_discovery_failed",{reason:"max_ticks_no_launch"});}catch(_mxd){}}'
         . 'var vNext="console_starting";'
         . 'if(iloSt.reported.stuck)vNext="console_stuck_loading";'
         . 'else if(iloSt.reported.fin)vNext="console_interactive_confirmed";'
+        . 'else if(iloSt.launchDiscoveryFailed)vNext="launch_discovery_failed";'
+        . 'else if(iloSt.specShell&&iloSt.discNavTriggered&&!wsNow)vNext="launch_triggered_waiting_transport";'
+        . 'else if(iloSt.specShell&&!iloSt.anyLaunchAction&&n>=6&&!wsNow&&!iloSt.discNavTriggered)vNext="launch_discovery_in_progress";'
         . 'else if(rAny&&ldNow&&!wsNow)vNext="console_transport_pending";'
         . 'else if(wsNow&&!iloSt.reported.sessR)vNext="console_transport_pending";'
         . 'else if(iloSt.reported.sessR&&!iloSt.reported.fin)vNext="console_session_ready";'
         . 'else if(rAny&&wsNow)vNext="console_transport_pending";'
         . 'iloSt.lastVerdict=vNext;'
-        . 'if(iloSt.lastVerdict!==iloSt.prevVerdict){iloSt.prevVerdict=iloSt.lastVerdict;try{_kvmDbg("ilo_console_readiness_verdict",{verdict:iloSt.lastVerdict,ws:wsNow?1:0,transport_evidence:wsNow?1:0,load:ldNow?1:0,loading_persisted:(ldNow&&ldMs>12000)?1:0,loading_ms:ldNow?ldMs:0,rContainer:rAny?1:0,renderer_container:rAny?1:0,session_ready_evidence:iloSt.reported.sessR?1:0,sess:iloSt.reported.sessR?1:0});}catch(ev){}}'
-        . 'var started=false,rcReady=rcPage||btnFound;'
-        . 'if(rcReady){'
-        . 'if(iloSt.phase===0){var directTop=getIloDirectTopRenderer(window);if(directTop){_kvmDbg("ilo_direct_renderer_attempt",1);if(callStart(directTop)){started=true;iloSt.phase=1;kvmTouchProgress(iloSt);try{_kvmDbg("ilo_launch_function_invoked","direct");}catch(e0){}}}}'
-        . 'if(!started&&iloSt.phase<=1){for(var b=0;b<ctx.length;b++){if(callStart(ctx[b])){started=true;iloSt.phase=2;kvmTouchProgress(iloSt);try{_kvmDbg("ilo_launch_function_invoked","renderer_ctx");}catch(e1){}break;}}}'
-        . 'if(!started&&iloSt.phase<=2){for(var h=0;h<ctx.length;h++){if(callIloStart(ctx[h])){started=true;iloSt.phase=3;kvmTouchProgress(iloSt);try{_kvmDbg("ilo_launch_function_invoked","ilo_start");}catch(e2){}break;}}}'
-        . 'if(!started&&iloSt.phase<=3&&(n%6===0)){iloSt.clicks++;if(iloSt.clicks<=8){for(var k=0;k<ctx.length;k++){if(clickHtml5Anchor(ctx[k],false)){started=true;kvmTouchProgress(iloSt);try{_kvmDbg("ilo_launch_function_invoked","click");}catch(e3){}break;}}}}'
-        . 'if(!started&&iloSt.phase<=4&&shell&&(n%10===0)&&iloSt.navAttempts<3){iloSt.navAttempts++;if(ensureIloRcPageLoaded(shell)){iloSt.phase=4;kvmTouchProgress(iloSt);try{_kvmDbg("ilo_rc_info_navigation","phase");}catch(e4){}}}}'
-        . 'if(!rcReady&&iloSt.phase===0&&n<=16){var dtEarly=getIloDirectTopRenderer(window);if(dtEarly){_kvmDbg("ilo_direct_renderer_attempt",1);if(callStart(dtEarly)){iloSt.phase=1;kvmTouchProgress(iloSt);try{_kvmDbg("ilo_launch_function_invoked","direct_early");}catch(e5){}}}}'
-        . 'if(!iloSt.stall&&(kvmNow()-iloSt.lastProgress)>KVM_TMO){iloSt.stall=true;try{_kvmDbg("ilo_console_stalled",{ticks:n,phase:iloSt.phase,clicks:iloSt.clicks,no_transport:!iloSt.reported.trans});}catch(es){}}'
+        . 'if(iloSt.lastVerdict!==iloSt.prevVerdict){iloSt.prevVerdict=iloSt.lastVerdict;try{var _ltf=(iloSt.anyLaunchAction||rcPage||btnFound)?1:0;var _lat=(iloSt.discTriggered||iloSt.discNavTriggered)?1:0;_kvmDbg("ilo_console_readiness_verdict",{verdict:iloSt.lastVerdict,ws:wsNow?1:0,transport_evidence:wsNow?1:0,transport_started:wsNow?1:0,load:ldNow?1:0,loading_persisted:(ldNow&&ldMs>12000)?1:0,loading_ms:ldNow?ldMs:0,rContainer:rAny?1:0,renderer_container:rAny?1:0,session_ready_evidence:iloSt.reported.sessR?1:0,sess:iloSt.reported.sessR?1:0,speculative_shell:iloSt.specShell?1:0,launch_discovery_started:iloSt.discoveryStarted?1:0,launch_target_found:_ltf,launch_action_triggered:_lat,launch_discovery:iloSt.discoveryStarted?1:0,any_launch_action:iloSt.anyLaunchAction?1:0,clicks:iloSt.clicks,disc_nav:iloSt.discNavTriggered?1:0,final_discovery_verdict:iloSt.lastVerdict});}catch(ev){}}'
         . 'if(iloSt.stall){return;}'
-        . 'if(n>=max){try{_kvmDbg("ilo_console_stalled",{ticks:n,reason:"max_ticks"});}catch(em){}return;}'
+        . 'if(hitMax){try{_kvmDbg("ilo_console_stalled",{ticks:n,reason:"max_ticks",launch_discovery_failed:iloSt.launchDiscoveryFailed?1:0,no_transport:!iloSt.reported.trans?1:0});if(iloSt.launchDiscoveryFailed){_kvmDbg("ilo_console_readiness_verdict",{verdict:"launch_discovery_failed",reason:"max_ticks",transport_started:wsNow?1:0,launch_target_found:(iloSt.anyLaunchAction||rcPage||btnFound)?1:0,launch_action_triggered:(iloSt.discTriggered||iloSt.discNavTriggered)?1:0});}catch(em){}return;}'
         . 'setTimeout(tick,250);'
         . '})();'
         . 'return;'
@@ -999,6 +1020,7 @@ function ipmiProxyInjectKvmAutoLaunchPatch(string $html, string $token, $session
         'console_capability' => (string) ($plan['console_capability'] ?? ''),
         'native_launch_viable' => !empty($plan['native_launch_viable']),
         'autolaunch_suppression_detail' => (string) ($plan['autolaunch_suppression_detail'] ?? ''),
+        'speculative_shell_autolaunch' => ((string) ($plan['launch_strategy'] ?? '')) === 'ilo_speculative_shell_autolaunch',
     ];
     $familyJs = json_encode((string) ($plan['vendor_family'] ?? 'generic'), JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_SLASHES);
     $planJs = json_encode($planLite, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_SLASHES);
@@ -2228,6 +2250,7 @@ function ipmiProxyIloConsoleReadinessVerdict(array $state): string
 function ipmiProxyIloConsoleReadinessDebugSnapshot(array $session): array
 {
     $st = ipmiProxyIloConsoleReadinessStateLoad($session);
+    $ld = ipmiProxyIloLaunchDiscoveryStateLoad($session);
 
     return [
         'verdict_server'           => ipmiProxyIloFinalizeConsoleStartupStatus($st),
@@ -2237,6 +2260,10 @@ function ipmiProxyIloConsoleReadinessDebugSnapshot(array $session): array
         'helper_last'            => (string) ($st['helper_last_path'] ?? ''),
         'transport_proxy_hint'   => ipmiProxyIloHasTransportEvidence($st) ? 1 : 0,
         'session_ready_proxy_hint' => ipmiProxyIloHasSessionReadyEvidence($st) ? 1 : 0,
+        'launch_discovery_verdict' => ipmiProxyIloLaunchDiscoveryVerdict($ld),
+        'launch_helper_seen'     => (int) ($ld['helper_seen'] ?? 0),
+        'launch_helper_ok'       => (int) ($ld['helper_ok'] ?? 0),
+        'speculative_shell_hint' => (int) ($ld['speculative_shell_hint'] ?? 0),
     ];
 }
 
@@ -2345,6 +2372,176 @@ function ipmiProxyIloEscalateStuckLoadingOnce(array $readinessState): array
 function ipmiProxyIloRecordStuckLoadingEscalation(array $readinessState): array
 {
     return ipmiProxyIloEscalateStuckLoadingOnce($readinessState);
+}
+
+/**
+ * Shell→console launch discovery (server-side correlation; browser events are authoritative).
+ *
+ * @return array<string, mixed>
+ */
+function ipmiProxyIloLaunchDiscoveryDefaults(): array
+{
+    return [
+        'v'                        => 1,
+        'updated_ts'               => 0,
+        'helper_seen'              => 0,
+        'helper_ok'                => 0,
+        'helper_fail'              => 0,
+        'helper_last_path'         => '',
+        'launch_discovery_esc'     => 0,
+        'speculative_shell_hint'   => 0,
+    ];
+}
+
+/**
+ * @return array<string, mixed>
+ */
+function ipmiProxyIloLaunchDiscoveryStateLoad(array $session): array
+{
+    $raw = $session['session_meta']['ilo_launch_discovery'] ?? null;
+    if (!is_array($raw) || (int) ($raw['v'] ?? 0) < 1) {
+        return ipmiProxyIloLaunchDiscoveryDefaults();
+    }
+
+    return array_merge(ipmiProxyIloLaunchDiscoveryDefaults(), $raw);
+}
+
+function ipmiProxyIloLaunchDiscoveryStateStore(mysqli $mysqli, string $token, array &$session, array $state, string $traceId): void
+{
+    if (!preg_match('/^[a-f0-9]{64}$/', $token)) {
+        return;
+    }
+    $state['updated_ts'] = time();
+    ipmiWebSessionMetaMutate($mysqli, $token, static function (array &$meta) use ($state): void {
+        $meta['ilo_launch_discovery'] = $state;
+    });
+    if (!isset($session['session_meta']) || !is_array($session['session_meta'])) {
+        $session['session_meta'] = [];
+    }
+    $session['session_meta']['ilo_launch_discovery'] = $state;
+    if (ipmiProxyDebugEnabled() && $traceId !== '') {
+        ipmiProxyDebugLog('ilo_launch_discovery_server_updated', [
+            'trace'   => $traceId,
+            'verdict' => ipmiProxyIloLaunchDiscoveryVerdict($state),
+        ]);
+    }
+}
+
+/**
+ * @param array<string, mixed> $event
+ * @return array<string, mixed>
+ */
+function ipmiProxyIloLaunchDiscoveryUpdate(array $state, array $event): array
+{
+    $s = $state;
+    $t = (string) ($event['type'] ?? '');
+    if ($t === 'launch_helper') {
+        $s['helper_seen'] = (int) ($s['helper_seen'] ?? 0) + 1;
+        $s['helper_last_path'] = (string) ($event['path'] ?? '');
+        if (!empty($event['ok'])) {
+            $s['helper_ok'] = (int) ($s['helper_ok'] ?? 0) + 1;
+        } else {
+            $s['helper_fail'] = (int) ($s['helper_fail'] ?? 0) + 1;
+        }
+    }
+
+    return $s;
+}
+
+function ipmiProxyIloLaunchDiscoveryVerdict(array $state): string
+{
+    $seen = (int) ($state['helper_seen'] ?? 0);
+    $ok = (int) ($state['helper_ok'] ?? 0);
+    $fail = (int) ($state['helper_fail'] ?? 0);
+    if ($seen >= 1 && $ok === 0 && $fail >= 1) {
+        return 'launch_helper_seen_but_no_http_ok';
+    }
+    if ($ok >= 1) {
+        return 'launch_helper_http_observed';
+    }
+
+    return 'launch_discovery_unknown';
+}
+
+/**
+ * @return array<string, mixed>
+ */
+function ipmiProxyIloRegisterLaunchHelperSignal(array $state, string $bmcPath, bool $ok, string $outcome): array
+{
+    if (!ipmiProxyIloLooksLikeSecondaryConsoleHelper($bmcPath)) {
+        return $state;
+    }
+
+    return ipmiProxyIloLaunchDiscoveryUpdate($state, [
+        'type'    => 'launch_helper',
+        'path'    => $bmcPath,
+        'ok'      => $ok,
+        'outcome' => $outcome,
+    ]);
+}
+
+function ipmiProxyIloNoLaunchTargetFound(array $browserHints): bool
+{
+    return !empty($browserHints['launch_discovery_failed']) || !empty($browserHints['no_launch_target']);
+}
+
+function ipmiProxyIloFinalizeDiscoveryFailure(string $reason, array $browserHints = []): array
+{
+    return [
+        'verdict'       => 'launch_discovery_failed',
+        'reason'        => $reason,
+        'browser_hints' => $browserHints,
+    ];
+}
+
+function ipmiProxyIloCanEscalateLaunchDiscovery(array $state): bool
+{
+    return (int) ($state['launch_discovery_esc'] ?? 0) < 1;
+}
+
+/**
+ * @return array<string, mixed>
+ */
+function ipmiProxyIloEscalateLaunchDiscoveryOnce(array $state): array
+{
+    if (!ipmiProxyIloCanEscalateLaunchDiscovery($state)) {
+        return $state;
+    }
+    $state['launch_discovery_esc'] = 1;
+
+    return $state;
+}
+
+/**
+ * @return array<string, mixed>
+ */
+function ipmiProxyIloRecordLaunchDiscoveryEscalation(array $state): array
+{
+    return ipmiProxyIloEscalateLaunchDiscoveryOnce($state);
+}
+
+function ipmiProxyIloHelperPathAidedLaunchDiscovery(array $session): bool
+{
+    $s = ipmiProxyIloLaunchDiscoveryStateLoad($session);
+
+    return (int) ($s['helper_ok'] ?? 0) >= 1;
+}
+
+/**
+ * @param array<string, mixed> $readiness
+ * @param array<string, mixed> $discovery
+ */
+function ipmiProxyIloFinalizeReadinessFromDiscovery(array $readiness, array $discovery): string
+{
+    $d = ipmiProxyIloLaunchDiscoveryVerdict($discovery);
+    if ($d === 'launch_helper_seen_but_no_http_ok') {
+        return 'launch_helper_seen_but_no_target_found';
+    }
+    if ($d === 'launch_helper_http_observed') {
+        return 'launch_helper_aided_pending_browser';
+    }
+
+    return ipmiProxyIloConsoleReadinessVerdict($readiness);
 }
 
 /**
@@ -3625,6 +3822,40 @@ function ipmiProxyIloBootstrapTrackBufferedResponse(
     }
     if ($csrChanged) {
         ipmiProxyIloConsoleReadinessStateStore($mysqli, $token, $session, $csr, $traceId);
+    }
+    $ld = ipmiProxyIloLaunchDiscoveryStateLoad($session);
+    $ldChanged = false;
+    if (ipmiProxyIloLooksLikeSecondaryConsoleHelper($bmcPath)) {
+        $ld = ipmiProxyIloRegisterLaunchHelperSignal($ld, $bmcPath, $ok, $outcome);
+        $ldChanged = true;
+        $planStrat = (string) (ipmiProxyIloKvmPlanFromSession($session)['launch_strategy'] ?? '');
+        if ($planStrat === 'ilo_speculative_shell_autolaunch') {
+            $ld['speculative_shell_hint'] = 1;
+        }
+        if (ipmiProxyDebugEnabled() && $traceId !== '') {
+            ipmiProxyDebugLog('ilo_launch_helper_seen', [
+                'trace'   => $traceId,
+                'bmcPath' => $bmcPath,
+                'ok'      => $ok ? 1 : 0,
+                'strategy'=> $planStrat,
+            ]);
+            if ($ok) {
+                ipmiProxyDebugLog('ilo_launch_helper_aided_discovery', [
+                    'trace'   => $traceId,
+                    'bmcPath' => $bmcPath,
+                ]);
+            } elseif ($planStrat === 'ilo_speculative_shell_autolaunch') {
+                ipmiProxyDebugLog('ilo_launch_helper_seen_but_no_target_found', [
+                    'trace'   => $traceId,
+                    'bmcPath' => $bmcPath,
+                    'outcome' => $outcome,
+                    'hint'    => 'http_failed_or_soft_auth_shell_discovery_may_still_fail',
+                ]);
+            }
+        }
+    }
+    if ($ldChanged) {
+        ipmiProxyIloLaunchDiscoveryStateStore($mysqli, $token, $session, $ld, $traceId);
     }
     if (ipmiProxyDebugEnabled()) {
         if (ipmiProxyIloLooksLikeSecondaryConsoleHelper($bmcPath)) {
