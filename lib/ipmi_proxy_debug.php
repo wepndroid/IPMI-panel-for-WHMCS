@@ -53,11 +53,17 @@
  * ilo_console_startup_helper_{seen,ok,failed}.
  * iLO /index.html speculative shell launch discovery: speculative_shell_autolaunch in PLAN, ilo_shell_autolaunch_allowed,
  * ilo_launch_discovery_started, ilo_launch_menu_expanded, ilo_launch_function_found, ilo_launch_control_found (deep_scan),
- * ilo_launch_triggered, ilo_launch_navigation_triggered, ilo_launch_discovery_escalation_{allowed,skipped},
- * ilo_console_frame_candidate_{detected,followed}, ilo_frame_contains_launch_surface,
+ * ilo_launch_triggered, ilo_launch_navigation_triggered, ilo_launch_discovery_escalation_{allowed,attempted,failed,skipped},
+ * ilo_launch_frame_candidate_found, ilo_console_frame_candidate_{detected,followed,rejected}, ilo_frame_contains_launch_surface,
+ * ilo_frame_subdocument_launch_control (clickable control found inside same-origin iframe),
  * ilo_no_launch_target_found, ilo_launch_discovery_failed, ilo_stalled_before_transport (discovery:1),
  * ilo_console_readiness_reclassified, ilo_console_start_failed_no_launch_target,
  * ilo_launch_helper_{seen,aided_discovery,seen_but_no_target_found}, ilo_launch_discovery_server_updated.
+ * iLO strict native-console confirmation (capability vs reach vs session vs live display): ilo_confirmation_signals_collected,
+ * ilo_confirmation_{weak_only,reached_not_ready,strong}, ilo_confirmation_failed_{shell_only,loading_only},
+ * ilo_live_display_evidence_detected, ilo_console_{canvas_active,viewport_active},
+ * ilo_loading_only_state_{present,cleared}, ilo_user_visible_console_success (strong confirmation only).
+ * Session _m.ilo_native_console_confirmation: tier, final_debug_verdict, confidence, evidence buckets (server; live display browser-authoritative until optional beacon).
  * iLO secondary native-console helpers (e.g. jnlp_template during proven HTML5): ilo_secondary_helper_context_check (verdict/strategy/family/phase),
  * ilo_secondary_helper_context_active, ilo_secondary_console_helper_detected, ilo_jnlp_template_promoted (incl. native_ctx_match),
  * ilo_path_role_classified adds native_console_context for helper paths post-upstream,

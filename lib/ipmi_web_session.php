@@ -11,6 +11,7 @@
  *   window.roles_ok (distinct critical roles that succeeded in the short window), and observed.paths — bounded per-session
  *   hints (hit counts, promotion flags, ~600s TTL) for firmware-specific helper routes; no secrets.
  *   ilo_console_capability (v1, TTL ~280s): classified native HTML5 vs legacy/shell-only evidence from path probes + /index.html shell sample.
+ *   ilo_native_console_confirmation (v1): strict tier model — capability vs reach vs session vs interactive/live display (browser subset optional under ['browser']).
  *   ilo_ui_blockers: masthead_fragment_ok from preflight (auth vs SPA assembly).
  *   ilo_native_launch_failures: bounded client/server launch failure reasons (no secrets).
  *   created_ip, user_agent,
@@ -5930,4 +5931,233 @@ function ipmiWebRewriteHtmlRelativeToDocument(string $html, string $tokenPrefix,
         },
         $html
     ) ?? $html;
+}
+
+/**
+ * Server-side BMC path heuristic: management shell / overview (not native console SPA/IRC routes).
+ */
+function ipmiWebIloLooksLikeManagementShellPath(?string $bmcPath): bool
+{
+    $p = strtolower((string) (parse_url((string) $bmcPath, PHP_URL_PATH) ?? ''));
+    if (str_contains($p, '/html/application.html')) {
+        return false;
+    }
+    if (str_contains($p, '/html/rc_info') || str_contains($p, '/html/irc')) {
+        return false;
+    }
+
+    return $p === '' || $p === '/' || str_contains($p, '/index.html') || str_contains($p, '/restgui/');
+}
+
+/**
+ * @param array<string, mixed> $meta session _m
+ * @return array<string, mixed> normalized signals for ipmiWebIloNativeConsoleTierEvaluate()
+ */
+function ipmiWebIloNativeConsoleSignalsFromSessionMeta(array $meta): array
+{
+    $capWrap = $meta['ilo_console_capability'] ?? null;
+    $cap = is_array($capWrap['data'] ?? null) ? $capWrap['data'] : [];
+    $rdy = is_array($meta['ilo_console_readiness'] ?? null) ? $meta['ilo_console_readiness'] : [];
+    $boot = is_array($meta['ilo_bootstrap'] ?? null) ? $meta['ilo_bootstrap'] : [];
+    $prevConf = is_array($meta['ilo_native_console_confirmation'] ?? null) ? $meta['ilo_native_console_confirmation'] : [];
+    $browser = is_array($prevConf['browser'] ?? null) ? $prevConf['browser'] : [];
+
+    $capStr = strtolower((string) ($cap['capability'] ?? ''));
+    $capDeclared = $capStr !== '' && $capStr !== 'unknown' && $capStr !== 'undetermined';
+
+    $transportSrv = !empty($rdy['proxy_transport_hint']);
+    $sessionSrv = ((int) ($rdy['helper_ok'] ?? 0) >= 1) || !empty($rdy['proxy_session_hint']);
+    $appHtmlOk = (int) ($rdy['application_html_ok'] ?? 0) >= 1;
+    $shellAuth = ((int) ($boot['shell_ts'] ?? 0) > 0) || ($boot['phase'] ?? '') !== '';
+
+    $signals = [
+        'shell_authenticated'        => $shellAuth,
+        'capability_declared_by_ui'  => $capDeclared,
+        'capability_probed'          => is_array($capWrap),
+        'launch_path_reached_server' => $appHtmlOk,
+        'transport_started_server'   => $transportSrv,
+        'session_ready_server'       => $sessionSrv,
+        'bootstrap_helper_ok'        => $sessionSrv,
+    ];
+
+    foreach ($browser as $k => $v) {
+        $signals[$k] = $v;
+    }
+
+    return $signals;
+}
+
+/**
+ * Strict native KVM confirmation tiers. Does not collapse capability with per-attempt success.
+ *
+ * Evidence classes (explicit):
+ * - Weak: shell auth, index/shell load, launch-surface heuristics, generic iframe/renderer hints, “IRC” text in shell.
+ * - Medium: native console route reached, bootstrap/helper flow OK, launch action triggered, console-specific frames/runtime (browser).
+ * - Strong: relay transport observed, session-ready, visible live display (canvas/video/irc window) with loading cleared.
+ *
+ * @param array<string, mixed> $s signals (server + optional browser overlay)
+ * @return array<string, mixed>
+ */
+function ipmiWebIloNativeConsoleTierEvaluate(array $s): array
+{
+    $weak = [];
+    $medium = [];
+    $strong = [];
+    $reasons = [];
+    $blockers = [];
+
+    $shellAuth = !empty($s['shell_authenticated']);
+    $capDecl = !empty($s['capability_declared_by_ui']);
+    $capProbe = !empty($s['capability_probed']);
+    $idxLoad = !empty($s['index_or_shell_load']);
+    $launchSurf = !empty($s['launch_surface_heuristic']);
+    $rContainer = !empty($s['renderer_container']);
+    $interLikely = !empty($s['interactive_likely']);
+    $nativeRoute = !empty($s['native_route_reached']) || !empty($s['launch_path_reached_server']);
+    $launchAct = !empty($s['launch_action_triggered']);
+    $helperOk = !empty($s['bootstrap_helper_ok']);
+    $transport = !empty($s['transport_started']) || !empty($s['transport_started_server']);
+    $sessReady = !empty($s['session_ready']) || !empty($s['session_ready_server']);
+    $liveDisp = !empty($s['live_display']) || !empty($s['live_display_confirmed']);
+    $shellOnly = !empty($s['shell_only_ui']);
+    $loading = !empty($s['loading_only']) || !empty($s['loading_only_persisted']);
+    $loadingCleared = !empty($s['loading_cleared_after_console']);
+
+    if ($shellAuth) {
+        $weak[] = 'shell_authenticated';
+    }
+    if ($idxLoad) {
+        $weak[] = 'index_shell_load';
+    }
+    if ($launchSurf) {
+        $weak[] = 'launch_surface_heuristic';
+    }
+    if ($rContainer) {
+        $weak[] = 'renderer_container';
+    }
+    if ($interLikely) {
+        $weak[] = 'interactive_likely';
+    }
+
+    if ($nativeRoute) {
+        $medium[] = 'native_route_or_app_html';
+    }
+    if ($launchAct) {
+        $medium[] = 'launch_action_triggered';
+    }
+    if ($helperOk) {
+        $medium[] = 'bootstrap_helper_ok';
+    }
+
+    if ($transport) {
+        $strong[] = 'transport_started';
+    }
+    if ($sessReady) {
+        $strong[] = 'session_ready_signal';
+    }
+    if ($liveDisp) {
+        $strong[] = 'live_display';
+    }
+
+    if ($shellOnly && !$nativeRoute && !$transport && !$liveDisp) {
+        $blockers[] = 'shell_only_no_console_surface';
+    }
+    if ($loading && !$liveDisp && !$loadingCleared) {
+        $blockers[] = 'loading_only_not_success';
+    }
+
+    $tier = 'not_confirmed';
+    if ($capDecl || $capProbe) {
+        $tier = 'feature_declared';
+        $reasons[] = 'capability_probe_or_declared';
+    }
+    if ($shellAuth || $idxLoad || $launchSurf || $rContainer) {
+        $tier = 'feature_likely_present';
+    }
+    if ($medium !== []) {
+        $tier = 'feature_reached';
+        $reasons[] = 'medium_evidence';
+    }
+    if ($transport) {
+        $tier = 'session_started';
+        $reasons[] = 'transport';
+    }
+    if ($sessReady && $medium !== []) {
+        $tier = 'session_ready';
+        $reasons[] = 'session_ready';
+    }
+
+    // Strong confirmation: never infer from capability or shell alone; requires both transport and live display signals.
+    $strongInteractive = $transport && $liveDisp && !$loading;
+    if ($strongInteractive) {
+        $tier = 'interactive_confirmed';
+        $reasons[] = 'transport_live_display_no_loading';
+    }
+
+    if ($shellOnly && $medium === [] && !$transport) {
+        $tier = 'failed_before_reach';
+    }
+
+    $confidence = 5;
+    $confidence += min(25, count($weak) * 5);
+    $confidence += min(35, count($medium) * 12);
+    $confidence += min(40, count($strong) * 15);
+    if ($blockers !== []) {
+        $confidence = max(0, $confidence - 20 * count($blockers));
+    }
+    $confidence = min(100, $confidence);
+
+    $final = 'native_console_not_confirmed';
+    if ($tier === 'interactive_confirmed' && $strongInteractive) {
+        $final = 'native_console_strongly_confirmed';
+    } elseif ($tier === 'session_ready' || $tier === 'session_started') {
+        $final = $tier === 'session_ready' ? 'native_console_session_ready' : 'native_console_session_started';
+    } elseif ($tier === 'feature_reached' || $tier === 'failed_after_reach') {
+        $final = 'native_console_reached_not_ready';
+    } elseif ($tier === 'feature_likely_present' || $tier === 'feature_declared' || $tier === 'failed_before_reach') {
+        $final = 'native_console_weakly_indicated';
+    }
+
+    return [
+        'v'                         => 1,
+        'tier'                      => $tier,
+        'confidence'                => $confidence,
+        'final_debug_verdict' => $final,
+        'capability_declared_by_ui' => $capDecl,
+        'capability_probed'         => $capProbe,
+        'launch_path_reached'       => $nativeRoute,
+        'console_surface_found'     => $launchSurf || $rContainer,
+        'transport_started'         => $transport,
+        'session_ready'             => $sessReady,
+        'interactive_confirmed'     => $tier === 'interactive_confirmed',
+        'live_display_confirmed'    => $liveDisp,
+        'shell_only_signal'        => $shellOnly,
+        'loading_only_signal'       => $loading && !$liveDisp,
+        'reasons'                   => $reasons,
+        'blockers'                  => $blockers,
+        'weak_evidence'             => $weak,
+        'medium_evidence'           => $medium,
+        'strong_evidence'           => $strong,
+    ];
+}
+
+/**
+ * Merge session metadata with optional per-request/browser overlay into the strict confirmation model.
+ *
+ * @param array{session_meta?: array<string, mixed>} $session
+ * @param array<string, mixed> $state overlay (browser signals, request hints)
+ * @return array<string, mixed>
+ */
+function ipmiWebIloNativeConsoleConfirmation(array $session, array $state = []): array
+{
+    $meta = $session['session_meta'] ?? [];
+    if (!is_array($meta)) {
+        $meta = [];
+    }
+    $signals = ipmiWebIloNativeConsoleSignalsFromSessionMeta($meta);
+    foreach ($state as $k => $v) {
+        $signals[$k] = $v;
+    }
+
+    return ipmiWebIloNativeConsoleTierEvaluate($signals);
 }
