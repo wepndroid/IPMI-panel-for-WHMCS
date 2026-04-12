@@ -742,12 +742,46 @@ function ipmiProxyBuildKvmRuntimeProgressHelpersJs(): string
         . 'var L=collectContexts();for(var i=0;i<L.length;i++){try{var d=L[i].document;if(d&&kvmVisibleCanvasLike(d))return true;}catch(e2){}}'
         . '}catch(e3){}return false;}'
         . 'function kvmIloRendererDetected(ctx){try{return !!(consoleVisible(ctx)||(ctx&&ctx.renderer&&ctx.renderer.connected));}catch(e){return false;}}'
-        . 'function kvmIloTransportDetected(){return kvmWsRelaySeen()||kvmIloRendererDetected(window);}'
+        . 'function kvmIloWsTransportEvidence(){return kvmWsRelaySeen();}'
+        . 'function kvmIloTransportDetected(){return kvmIloWsTransportEvidence();}'
+        . 'function kvmIloRendererOrContainerPresent(ctx){try{'
+        . 'if(kvmIloRendererDetected(ctx))return true;'
+        . 'var L=collectContexts();for(var i=0;i<L.length;i++){try{'
+        . 'if(rcWindowVisible(L[i]))return true;'
+        . 'if(L[i].document&&L[i].document.getElementById&&L[i].document.getElementById("ircWindow"))return true;'
+        . '}catch(e0){}}'
+        . '}catch(e){}return false;}'
+        . 'function kvmIloLoadingPleaseWaitAny(){try{'
+        . 'var L=collectContexts();'
+        . 'for(var i=0;i<L.length;i++){try{'
+        . 'var d=L[i].document;if(!d||!d.body)continue;'
+        . 'var t=String((d.body.innerText||d.body.textContent||"")).toLowerCase();'
+        . 'if(t.indexOf("please wait")>=0&&t.indexOf("loading")>=0)return true;'
+        . 'if(t.indexOf("loading, please wait")>=0)return true;'
+        . 'if(t.indexOf("loading")>=0&&t.indexOf("wait")>=0&&t.length<4200)return true;'
+        . '}catch(e1){}}'
+        . '}catch(e){}return false;}'
+        . 'function kvmIloRcWindowAny(){try{var L=collectContexts();for(var i=0;i<L.length;i++){try{if(rcWindowVisible(L[i]))return true;}catch(e2){}}}catch(e){}return false;}'
+        . 'function kvmIloSessionReadyEvidence(ctx){'
+        . 'try{'
+        . 'if(kvmAnyFrameCanvas(ctx))return true;'
+        . 'if(kvmIloRcWindowAny()&&!kvmIloLoadingPleaseWaitAny())return true;'
+        . '}catch(e){}return false;}'
         . 'function kvmIloInteractiveLikely(ctx){'
         . 'if(kvmIloRendererDetected(ctx))return true;'
         . 'try{if(rcWindowVisible(ctx))return true;}catch(e0){}'
         . 'return kvmAnyFrameCanvas(ctx);'
         . '}'
+        . 'function kvmIloReadyToFinalize(ctx,st){'
+        . 'var ws=kvmIloWsTransportEvidence();'
+        . 'var load=kvmIloLoadingPleaseWaitAny();'
+        . 'var canvas=kvmAnyFrameCanvas(ctx);'
+        . 'var rcW=kvmIloRcWindowAny();'
+        . 'if(load&&!ws&&!canvas)return {ok:false,why:"loading_no_transport_yet"};'
+        . 'if(!ws)return {ok:false,why:"no_relay_transport"};'
+        . 'if(ws&&(canvas||rcW)){if(load)return {ok:false,why:"transport_but_loading_text"};st.finStable=(st.finStable||0)+1;if(st.finStable>=2)return {ok:true,why:"ws_plus_visible_no_loading"};return {ok:false,why:"stabilizing"};}'
+        . 'st.finStable=0;'
+        . 'return {ok:false,why:"pending"};}'
         . 'function kvmHookWsRelayProbe(){try{'
         . 'if(!window.WebSocket||window.__ipmi_kvm_ws_progress_hook)return;'
         . 'window.__ipmi_kvm_ws_progress_hook=true;var W0=window.WebSocket;'
@@ -775,7 +809,7 @@ function ipmiProxyBuildIloKvmScript(): string
         . 'var pl=pathLower();'
         . 'if(pl.indexOf("/html/rc_info.html")!==-1&&!hasIloRendererHost(window)&&(!window.parent||window.parent===window)){go("/html/application.html?ipmi_kvm_auto=1");return;}'
         . 'var n=0,max=Math.max(220,Math.ceil(KVM_TMO/220));'
-        . 'var iloSt={phase:0,lastProgress:kvmNow(),clicks:0,navAttempts:0,reported:{boot:false,launch:false,trans:false,inter:false},stall:false};'
+        . 'var iloSt={phase:0,lastProgress:kvmNow(),clicks:0,navAttempts:0,reported:{boot:false,launch:false,trans:false,inter:false,rContainer:false,rDetected:false,wsEv:false,sessR:false,bootstrap:false,fin:false,stuck:false,noTrans:false,noSess:false,stuckEsc:false,stuckFin:false,interWhileLoad:false},finStable:0,ldSince:0,ldDbg:false,ldPerDbg:false,esc:0,stall:false,lastVerdict:"console_starting",prevVerdict:"",corrDbg:false};'
         . '(function tick(){'
         . 'n++;'
         . 'var ctx=collectContexts();'
@@ -786,11 +820,37 @@ function ipmiProxyBuildIloKvmScript(): string
         . 'if(shell){if(!shell.__ipmi_dbg_shell){try{shell.__ipmi_dbg_shell=1;kvmTouchProgress(iloSt);_kvmDbg("ilo_shell_detected",1);}catch(ds){}}forceSameTabOpen(shell);ensureIloFrameResizeShim(shell);ensureIloStartPatched(shell);ensureIloGlobalStartPatched(shell);wireIloAppFrame(shell);ensureIloShellLoaded(shell);ensureIloRcPageLoaded(shell);if((n%8)===0){clearIloStaleRenderer(shell);}}'
         . 'var rcPage=false,btnFound=false;'
         . 'for(var ri=0;ri<ctx.length;ri++){if(hasIloRcPage(ctx[ri])){rcPage=true;}if(findIloHtml5Button(ctx[ri])){btnFound=true;}}'
-        . 'if(rcPage&&!iloSt.reported.boot){iloSt.reported.boot=true;kvmTouchProgress(iloSt);try{_kvmDbg("ilo_bootstrap_route_ready",1);}catch(eb){}}'
+        . 'if(rcPage&&!iloSt.reported.boot){iloSt.reported.boot=true;kvmTouchProgress(iloSt);try{_kvmDbg("ilo_bootstrap_route_ready",1);_kvmDbg("ilo_console_bootstrap_started",1);}catch(eb){}}'
         . 'if(btnFound&&!iloSt.reported.launch){iloSt.reported.launch=true;kvmTouchProgress(iloSt);try{_kvmDbg("ilo_launch_control_found",1);}catch(el){}}'
         . 'for(var i=0;i<ctx.length;i++){forceSameTabOpen(ctx[i]);ensureIloFrameResizeShim(ctx[i]);ensureIloStartPatched(ctx[i]);ensureIloGlobalStartPatched(ctx[i]);wireIloAppFrame(ctx[i]);ensureIloRcButtonPatched(ctx[i]);if((n%8)===0){clearIloStaleRenderer(ctx[i]);}'
-        . 'if(kvmIloInteractiveLikely(ctx[i])){if(!iloSt.reported.inter){iloSt.reported.inter=true;try{_kvmDbg("ilo_console_interactive_likely",1);}catch(ei){}}kvmTouchProgress(iloSt);_kvmDbg("ilo_renderer_detected",1);markDone();return;}}'
-        . 'if(kvmIloTransportDetected()&&!iloSt.reported.trans){iloSt.reported.trans=true;kvmTouchProgress(iloSt);try{_kvmDbg("ilo_transport_detected",1);}catch(et){}}'
+        . 'try{'
+        . 'if(kvmIloRendererOrContainerPresent(ctx[i])&&!iloSt.reported.rContainer){iloSt.reported.rContainer=true;kvmTouchProgress(iloSt);_kvmDbg("ilo_renderer_container_detected",1);}'
+        . 'if(kvmIloRendererDetected(ctx[i])&&!iloSt.reported.rDetected){iloSt.reported.rDetected=true;kvmTouchProgress(iloSt);try{var _ldR=kvmIloLoadingPleaseWaitAny();_kvmDbg("ilo_renderer_detected",{loading:_ldR?1:0,hint:_ldR?"not_console_success":""});}catch(edr){_kvmDbg("ilo_renderer_detected",1);}}'
+        . 'if(kvmIloInteractiveLikely(ctx[i])){if(!iloSt.reported.inter){iloSt.reported.inter=true;try{var _ldH=kvmIloLoadingPleaseWaitAny();_kvmDbg("ilo_console_interactive_likely",{loading:_ldH?1:0,hint:_ldH?"not_final_success":""});if(_ldH&&!iloSt.reported.interWhileLoad){iloSt.reported.interWhileLoad=true;_kvmDbg("ilo_console_interactive_likely_while_loading",{note:"shell_only_not_interactive_ready"});}}catch(eilh){_kvmDbg("ilo_console_interactive_likely",1);}}kvmTouchProgress(iloSt);}'
+        . '}catch(eic){}}'
+        . 'var wsNow=kvmIloWsTransportEvidence();'
+        . 'if(wsNow){kvmTouchProgress(iloSt);if(!iloSt.reported.wsEv){iloSt.reported.wsEv=true;iloSt.reported.trans=true;try{_kvmDbg("ilo_transport_evidence_detected",1);_kvmDbg("ilo_console_transport_started",1);_kvmDbg("ilo_transport_detected",1);}catch(et0){}}}'
+        . 'if(kvmIloSessionReadyEvidence(window)&&!iloSt.reported.sessR){iloSt.reported.sessR=true;kvmTouchProgress(iloSt);try{_kvmDbg("ilo_session_ready_evidence_detected",1);_kvmDbg("ilo_console_session_ready",1);}catch(es0){}}'
+        . 'var ldNow=kvmIloLoadingPleaseWaitAny(),rAny=iloSt.reported.rContainer,ldMs=iloSt.ldSince?(kvmNow()-iloSt.ldSince):0;'
+        . 'if(ldNow){if(!iloSt.ldSince)iloSt.ldSince=kvmNow();ldMs=kvmNow()-iloSt.ldSince;if(!iloSt.ldDbg&&ldMs>6000){iloSt.ldDbg=true;try{_kvmDbg("ilo_loading_state_detected",{ms:ldMs});}catch(eld0){}}if(ldMs>12000&&!iloSt.ldPerDbg){iloSt.ldPerDbg=true;try{_kvmDbg("ilo_loading_state_persisted",{ms:ldMs});_kvmDbg("ilo_loading_spinner_persisted",{ms:ldMs});}catch(eld1){}}}'
+        . 'else{iloSt.ldSince=0;iloSt.ldDbg=false;iloSt.ldPerDbg=false;}'
+        . 'if(rAny&&ldNow&&!wsNow&&ldMs>14000&&!iloSt.reported.noTrans){iloSt.reported.noTrans=true;try{_kvmDbg("ilo_renderer_without_transport",{ms:ldMs});}catch(et1){}}'
+        . 'if(rAny&&ldNow&&!iloSt.reported.sessR&&ldMs>18000&&!iloSt.reported.noSess){iloSt.reported.noSess=true;try{_kvmDbg("ilo_renderer_without_session_ready",{ms:ldMs});}catch(es1){}}'
+        . 'if(rAny&&ldNow&&!wsNow&&iloSt.ldSince&&(ldMs)>26000&&iloSt.esc===0){iloSt.esc=1;try{_kvmDbg("ilo_stuck_loading_escalation_allowed",{reason:"no_ws_long_loading"});if(shell){clearIloStaleRenderer(shell);forceSameTabOpen(shell);}for(var ei=0;ei<ctx.length;ei++){try{clearIloStaleRenderer(ctx[ei]);}catch(ec0){}}_kvmDbg("ilo_stuck_loading_escalation_attempted",{n:1});}catch(eesc){}}'
+        . 'else if(rAny&&ldNow&&!wsNow&&iloSt.ldSince&&(ldMs)>26000&&iloSt.esc>0&&!iloSt.reported.stuckEsc){iloSt.reported.stuckEsc=true;try{_kvmDbg("ilo_stuck_loading_escalation_skipped",{reason:"already_escalated_once"});}catch(eskip){}}'
+        . 'if(rAny&&ldNow&&!wsNow&&iloSt.ldSince&&(ldMs)>36000&&!iloSt.corrDbg){iloSt.corrDbg=true;try{_kvmDbg("ilo_console_startup_stall_correlated",{reason:"prolonged_loading_no_transport",ms:ldMs});}catch(ec2){}}'
+        . 'if(rAny&&ldNow&&iloSt.ldSince&&(ldMs)>40000&&!iloSt.reported.stuck){iloSt.reported.stuck=true;iloSt.lastVerdict="console_stuck_loading";try{if(!wsNow){_kvmDbg("ilo_console_stuck_loading",{reason:"prolonged_loading_no_transport",ms:ldMs});_kvmDbg("ilo_console_readiness_verdict",{verdict:"console_start_failed_no_transport",detail:"no_ws_after_renderer",ms:ldMs});}else{_kvmDbg("ilo_console_stuck_loading",{reason:"prolonged_loading_with_transport",ms:ldMs,session_ready:iloSt.reported.sessR?1:0});_kvmDbg("ilo_console_readiness_verdict",{verdict:"console_stuck_loading",detail:"loading_with_ws_or_session_stall",ms:ldMs});}_kvmDbg("ilo_loading_state_escalated",{ms:ldMs,esc:iloSt.esc});if(iloSt.esc>=1){_kvmDbg("ilo_stuck_loading_finalized",{esc:iloSt.esc,verdict:"console_stuck_loading"});}}catch(est){}}'
+        . 'var rf=kvmIloReadyToFinalize(window,iloSt);'
+        . 'if(rf.ok&&!iloSt.reported.fin){iloSt.reported.fin=true;iloSt.lastVerdict="console_interactive_confirmed";try{_kvmDbg("ilo_console_interactive_confirmed",rf);_kvmDbg("ilo_console_readiness_verdict",{verdict:"console_interactive_confirmed",why:rf.why||""});markDone();return;}catch(emf){}}'
+        . 'var vNext="console_starting";'
+        . 'if(iloSt.reported.stuck)vNext="console_stuck_loading";'
+        . 'else if(iloSt.reported.fin)vNext="console_interactive_confirmed";'
+        . 'else if(rAny&&ldNow&&!wsNow)vNext="console_transport_pending";'
+        . 'else if(wsNow&&!iloSt.reported.sessR)vNext="console_transport_pending";'
+        . 'else if(iloSt.reported.sessR&&!iloSt.reported.fin)vNext="console_session_ready";'
+        . 'else if(rAny&&wsNow)vNext="console_transport_pending";'
+        . 'iloSt.lastVerdict=vNext;'
+        . 'if(iloSt.lastVerdict!==iloSt.prevVerdict){iloSt.prevVerdict=iloSt.lastVerdict;try{_kvmDbg("ilo_console_readiness_verdict",{verdict:iloSt.lastVerdict,ws:wsNow?1:0,transport_evidence:wsNow?1:0,load:ldNow?1:0,loading_persisted:(ldNow&&ldMs>12000)?1:0,loading_ms:ldNow?ldMs:0,rContainer:rAny?1:0,renderer_container:rAny?1:0,session_ready_evidence:iloSt.reported.sessR?1:0,sess:iloSt.reported.sessR?1:0});}catch(ev){}}'
         . 'var started=false,rcReady=rcPage||btnFound;'
         . 'if(rcReady){'
         . 'if(iloSt.phase===0){var directTop=getIloDirectTopRenderer(window);if(directTop){_kvmDbg("ilo_direct_renderer_attempt",1);if(callStart(directTop)){started=true;iloSt.phase=1;kvmTouchProgress(iloSt);try{_kvmDbg("ilo_launch_function_invoked","direct");}catch(e0){}}}}'
@@ -2065,6 +2125,229 @@ function ipmiProxyIloBootstrapRegisterSecondarySignal(array $window, string $out
 }
 
 /**
+ * Default iLO final-stage console readiness bucket (server-side proxy observations only; browser is authoritative for transport).
+ *
+ * @return array<string, mixed>
+ */
+function ipmiProxyIloConsoleReadinessDefaults(): array
+{
+    return [
+        'v'                       => 1,
+        'updated_ts'              => 0,
+        'helper_seen'             => 0,
+        'helper_ok'               => 0,
+        'helper_fail'             => 0,
+        'helper_last_path'        => '',
+        'helper_last_outcome'     => '',
+        'application_html_ok'     => 0,
+        'stuck_escalation_count'  => 0,
+        'stuck_escalation_ts'     => 0,
+        'proxy_transport_hint'    => 0,
+        'proxy_session_hint'      => 0,
+    ];
+}
+
+/**
+ * @return array<string, mixed>
+ */
+function ipmiProxyIloConsoleReadinessStateLoad(array $session): array
+{
+    $raw = $session['session_meta']['ilo_console_readiness'] ?? null;
+    if (!is_array($raw) || (int) ($raw['v'] ?? 0) < 1) {
+        return ipmiProxyIloConsoleReadinessDefaults();
+    }
+
+    return array_merge(ipmiProxyIloConsoleReadinessDefaults(), $raw);
+}
+
+function ipmiProxyIloConsoleReadinessStateStore(mysqli $mysqli, string $token, array &$session, array $state, string $traceId): void
+{
+    if (!preg_match('/^[a-f0-9]{64}$/', $token)) {
+        return;
+    }
+    $state['updated_ts'] = time();
+    ipmiWebSessionMetaMutate($mysqli, $token, static function (array &$meta) use ($state): void {
+        $meta['ilo_console_readiness'] = $state;
+    });
+    if (!isset($session['session_meta']) || !is_array($session['session_meta'])) {
+        $session['session_meta'] = [];
+    }
+    $session['session_meta']['ilo_console_readiness'] = $state;
+    if (ipmiProxyDebugEnabled() && $traceId !== '') {
+        ipmiProxyDebugLog('ilo_console_readiness_server_updated', [
+            'trace'   => $traceId,
+            'verdict' => ipmiProxyIloConsoleReadinessVerdict($state),
+        ]);
+    }
+}
+
+/**
+ * @param array<string, mixed> $event types: startup_helper, application_html
+ * @return array<string, mixed>
+ */
+function ipmiProxyIloConsoleReadinessUpdate(array $state, array $event): array
+{
+    $s = $state;
+    $t = (string) ($event['type'] ?? '');
+    if ($t === 'startup_helper') {
+        $s['helper_seen'] = (int) ($s['helper_seen'] ?? 0) + 1;
+        $s['helper_last_path'] = (string) ($event['path'] ?? '');
+        $s['helper_last_outcome'] = (string) ($event['outcome'] ?? '');
+        if (!empty($event['ok'])) {
+            $s['helper_ok'] = (int) ($s['helper_ok'] ?? 0) + 1;
+            $s['proxy_session_hint'] = 1;
+        } else {
+            $s['helper_fail'] = (int) ($s['helper_fail'] ?? 0) + 1;
+        }
+    }
+    if ($t === 'application_html') {
+        $s['application_html_ok'] = !empty($event['ok']) ? 1 : 0;
+    }
+
+    return $s;
+}
+
+function ipmiProxyIloConsoleReadinessVerdict(array $state): string
+{
+    $hok = (int) ($state['helper_ok'] ?? 0);
+    $hfail = (int) ($state['helper_fail'] ?? 0);
+    $seen = (int) ($state['helper_seen'] ?? 0);
+    if ($hfail >= 1 && $hok === 0 && $seen >= 1) {
+        return 'console_start_failed_no_session_ready';
+    }
+    if ($hok >= 1) {
+        return 'startup_helper_http_ok';
+    }
+
+    return 'console_starting';
+}
+
+/**
+ * @return array<string, mixed>
+ */
+function ipmiProxyIloConsoleReadinessDebugSnapshot(array $session): array
+{
+    $st = ipmiProxyIloConsoleReadinessStateLoad($session);
+
+    return [
+        'verdict_server'           => ipmiProxyIloFinalizeConsoleStartupStatus($st),
+        'helper_seen'            => (int) ($st['helper_seen'] ?? 0),
+        'helper_ok'              => (int) ($st['helper_ok'] ?? 0),
+        'helper_fail'            => (int) ($st['helper_fail'] ?? 0),
+        'helper_last'            => (string) ($st['helper_last_path'] ?? ''),
+        'transport_proxy_hint'   => ipmiProxyIloHasTransportEvidence($st) ? 1 : 0,
+        'session_ready_proxy_hint' => ipmiProxyIloHasSessionReadyEvidence($st) ? 1 : 0,
+    ];
+}
+
+function ipmiProxyIloConsoleStartupRequestRole(string $bmcPath): string
+{
+    $p = strtolower((string) parse_url($bmcPath, PHP_URL_PATH));
+    if ($p === '/html/jnlp_template.html') {
+        return 'console_startup_helper';
+    }
+
+    return 'other';
+}
+
+/**
+ * Server-side hints only (browser WebSocket / canvas signals are authoritative).
+ *
+ * @param array<string, mixed> $readinessState
+ */
+function ipmiProxyIloHasTransportEvidence(array $readinessState): bool
+{
+    return !empty($readinessState['proxy_transport_hint']);
+}
+
+/**
+ * @param array<string, mixed> $readinessState
+ */
+function ipmiProxyIloHasSessionReadyEvidence(array $readinessState): bool
+{
+    return (int) ($readinessState['helper_ok'] ?? 0) >= 1
+        || !empty($readinessState['proxy_session_hint']);
+}
+
+function ipmiProxyIloFinalizeConsoleStartupStatus(array $state): string
+{
+    return ipmiProxyIloConsoleReadinessVerdict($state);
+}
+
+/**
+ * @return array<string, mixed>
+ */
+function ipmiProxyIloRegisterConsoleStartupSignal(array $state, string $bmcPath, bool $ok, string $outcome): array
+{
+    if (ipmiProxyIloConsoleStartupRequestRole($bmcPath) !== 'console_startup_helper') {
+        return $state;
+    }
+
+    return ipmiProxyIloConsoleReadinessUpdate($state, [
+        'type'    => 'startup_helper',
+        'path'    => $bmcPath,
+        'ok'      => $ok,
+        'outcome' => $outcome,
+    ]);
+}
+
+/** @param array<string, mixed> $browserReport */
+function ipmiProxyIloLoadingStateDetected(array $browserReport): bool
+{
+    return !empty($browserReport['loading_text'])
+        || !empty($browserReport['loading_spinner'])
+        || !empty($browserReport['loading_dom']);
+}
+
+function ipmiProxyIloLoadingStateTooLong(int $sinceMs, int $thresholdMs = 12000): bool
+{
+    return $sinceMs >= $thresholdMs;
+}
+
+/**
+ * @param array<string, mixed> $readinessState
+ */
+function ipmiProxyIloShouldEscalateStuckLoading(array $readinessState, bool $rendererSeen, bool $transportSeen, int $loadingMs): bool
+{
+    return $rendererSeen
+        && !$transportSeen
+        && $loadingMs >= 28000
+        && ipmiProxyIloCanEscalateStuckLoading($readinessState);
+}
+
+/**
+ * @param array<string, mixed> $readinessState
+ */
+function ipmiProxyIloCanEscalateStuckLoading(array $readinessState): bool
+{
+    return (int) ($readinessState['stuck_escalation_count'] ?? 0) < 1;
+}
+
+/**
+ * @param array<string, mixed> $readinessState
+ * @return array<string, mixed>
+ */
+function ipmiProxyIloEscalateStuckLoadingOnce(array $readinessState): array
+{
+    if (!ipmiProxyIloCanEscalateStuckLoading($readinessState)) {
+        return $readinessState;
+    }
+    $readinessState['stuck_escalation_count'] = 1;
+    $readinessState['stuck_escalation_ts'] = time();
+
+    return $readinessState;
+}
+
+/**
+ * @param array<string, mixed> $readinessState
+ * @return array<string, mixed>
+ */
+function ipmiProxyIloRecordStuckLoadingEscalation(array $readinessState): array
+{
+    return ipmiProxyIloEscalateStuckLoadingOnce($readinessState);
+}
+
+/**
  * Promote a narrow set of transport-shaped /html routes when native HTML5 is already proven — not bootstrap-critical.
  *
  * @param array<string, mixed> $final role row from ipmiProxyClassifyIloPathRole + contextualize
@@ -3306,7 +3589,55 @@ function ipmiProxyIloBootstrapTrackBufferedResponse(
         ]);
     }
     ipmiProxyIloBootstrapStatePersist($mysqli, $token, $session, $state, $traceId, 'ilo_bootstrap_state_updated_from_role');
+    $csr = ipmiProxyIloConsoleReadinessStateLoad($session);
+    $csrChanged = false;
+    $pathOnly = strtolower((string) parse_url($bmcPath, PHP_URL_PATH));
+    if (str_contains($pathOnly, 'application.html') && $httpCode >= 200 && $httpCode < 400 && $ok) {
+        $csr = ipmiProxyIloConsoleReadinessUpdate($csr, [
+            'type' => 'application_html',
+            'ok'   => true,
+        ]);
+        $csrChanged = true;
+    }
+    if (ipmiProxyIloLooksLikeSecondaryConsoleHelper($bmcPath)) {
+        $csr = ipmiProxyIloRegisterConsoleStartupSignal($csr, $bmcPath, $ok, $outcome);
+        $csrChanged = true;
+        if (ipmiProxyDebugEnabled() && $traceId !== '') {
+            ipmiProxyDebugLog('ilo_console_startup_helper_seen', [
+                'trace'   => $traceId,
+                'bmcPath' => $bmcPath,
+                'role'    => (string) ($pathRole['role'] ?? ''),
+                'ok'      => $ok ? 1 : 0,
+            ]);
+            if ($ok) {
+                ipmiProxyDebugLog('ilo_console_startup_helper_ok', [
+                    'trace'   => $traceId,
+                    'bmcPath' => $bmcPath,
+                ]);
+            } else {
+                ipmiProxyDebugLog('ilo_console_startup_helper_failed', [
+                    'trace'   => $traceId,
+                    'bmcPath' => $bmcPath,
+                    'outcome' => $outcome,
+                ]);
+            }
+        }
+    }
+    if ($csrChanged) {
+        ipmiProxyIloConsoleReadinessStateStore($mysqli, $token, $session, $csr, $traceId);
+    }
     if (ipmiProxyDebugEnabled()) {
+        if (ipmiProxyIloLooksLikeSecondaryConsoleHelper($bmcPath)) {
+            $ctxDetail = ipmiProxyIloActiveNativeConsoleContextDetail($session, $state);
+            if (!$ok && $ctxDetail['active'] && (string) ($state['phase'] ?? '') !== 'stalled') {
+                ipmiProxyDebugLog('ilo_console_startup_stall_correlated', [
+                    'trace'   => $traceId,
+                    'bmcPath' => $bmcPath,
+                    'reason'  => 'helper_failed_while_native_flow_active',
+                    'outcome' => $outcome,
+                ]);
+            }
+        }
         if (($pathRole['role'] ?? '') === 'secondary_console_helper') {
             ipmiProxyDebugLog('ilo_secondary_console_helper_contributed', [
                 'trace'    => $traceId,
@@ -6482,6 +6813,7 @@ if (ipmiProxyDebugEnabled()) {
     $iloDbgExtra = [];
     if (ipmiWebIsNormalizedIloType($bmcTypeNorm)) {
         $iloDbgExtra['ilo_bootstrap'] = ipmiProxyIloBootstrapDebugSnapshot($session);
+        $iloDbgExtra['ilo_console_readiness_server'] = ipmiProxyIloConsoleReadinessDebugSnapshot($session);
         $iloPrFinal = ipmiProxyClassifyIloPathRoleForSession($mysqli, $token, $session, $bmcPath, $method, $ipmiTraceId);
         $iloDbgExtra['ilo_path_role'] = (string) ($iloPrFinal['role'] ?? '');
         $iloDbgExtra['ilo_path_role_base'] = (string) ($iloPrFinal['base_role'] ?? $iloDbgExtra['ilo_path_role']);

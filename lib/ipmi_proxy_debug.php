@@ -44,6 +44,13 @@
  * ilo_observed_path_promotion_skipped, ilo_path_promoted_by_observation, ilo_bootstrap_recovery_guardrail_applied,
  * ilo_fragment_{shape_unexpected,returned_full_shell}, ilo_api_response_bootstrap_broken,
  * ilo_bootstrap_state_updated_from_role, ilo_path_contributed_to_bootstrap_health, ilo_bootstrap_recovery_role_used.
+ * iLO final-stage console readiness (browser + server correlation): ilo_console_readiness_verdict, ilo_console_readiness_server_updated,
+ * ilo_transport_evidence_detected, ilo_console_transport_started, ilo_session_ready_evidence_detected, ilo_console_session_ready,
+ * ilo_renderer_container_detected (vs renderer_detected), ilo_loading_state_{detected,persisted}, ilo_loading_spinner_persisted,
+ * ilo_renderer_without_{transport,session_ready}, ilo_console_stuck_loading, ilo_console_startup_stall_correlated,
+ * ilo_stuck_loading_escalation_{allowed,attempted,skipped}, ilo_stuck_loading_finalized, ilo_console_interactive_confirmed,
+ * ilo_console_interactive_likely_while_loading (heuristic only, not success),
+ * ilo_console_startup_helper_{seen,ok,failed}.
  * iLO secondary native-console helpers (e.g. jnlp_template during proven HTML5): ilo_secondary_helper_context_check (verdict/strategy/family/phase),
  * ilo_secondary_helper_context_active, ilo_secondary_console_helper_detected, ilo_jnlp_template_promoted (incl. native_ctx_match),
  * ilo_path_role_classified adds native_console_context for helper paths post-upstream,
