@@ -36,6 +36,12 @@ if (!$session) {
 }
 
 $panelUserId = $_SESSION['user_id'] ?? null;
+
+// Release PHP session lock immediately — the relay loop can run for hours and
+// a held session file lock blocks every other request sharing the same PHPSESSID
+// (including parallel WebSocket connections the iLO console needs for video/input/control).
+session_write_close();
+
 if (!$panelUserId) {
     $createdIp = (string)($session['created_ip'] ?? '');
     $createdUa = (string)($session['user_agent'] ?? '');
@@ -174,12 +180,21 @@ $ctx = stream_context_create([
         'verify_peer'       => false,
         'verify_peer_name'  => false,
         'allow_self_signed' => true,
+        'security_level'    => 0,
+        'ciphers'           => 'DEFAULT:@SECLEVEL=0',
     ],
 ]);
 
 $connectSpec = $useTls
     ? 'ssl://' . $bmcIp . ':' . $bmcPort
     : 'tcp://' . $bmcIp . ':' . $bmcPort;
+
+// All DB work is done — close MySQL before the potentially hours-long relay loop
+// to avoid holding a connection from the pool.
+if (isset($mysqli) && $mysqli instanceof mysqli) {
+    @$mysqli->close();
+    unset($mysqli);
+}
 
 if (function_exists('ipmiProxyDebugEnabled') && ipmiProxyDebugEnabled()) {
     $cookiePresent = $cookieHeader !== '' ? 1 : 0;
