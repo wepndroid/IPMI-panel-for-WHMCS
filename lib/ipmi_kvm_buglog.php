@@ -221,19 +221,8 @@ function ipmiKvmBugLogStartRun(array $ctx): string
         '',
         '[BUG]',
         '',
-        '[FINAL]',
-        'verdict: pending',
-        'strong_confirmation: no',
-        'application_path_loaded: unknown',
-        'shell_path_abandoned: unknown',
-        'launch_attempted: unknown',
-        'browser_ws_handshake_ok: unknown',
-        'upstream_ws_ok: unknown',
-        'frame_pump_active: unknown',
-        'transport_healthy: no',
-        'session_ready: no',
-        'live_display: no',
-        'ended_at_utc: ',
+        '[NOTE]',
+        'event: final_summary_written_only_at_run_end | note: [FINAL] appended after aggregate merge; not provisional',
         '',
         '==================================================',
         'KVM RUN END (in progress)',
@@ -375,15 +364,195 @@ function ipmiKvmBugLogIngestBrowserEvent(mysqli $mysqli, array $payload): array
         ipmiKvmShellAbandonPersist($mysqli, $token, 'SHELL_LAUNCH_NO_EFFECT');
     }
     if ($ev === 'kvm_final_summary') {
-        ipmiKvmBugLogPatchFinalBlock($payload);
+        ipmiKvmBugLogUpdateFinalSummary($payload);
     }
 
     return ['ok' => true];
 }
 
 /**
- * Update [FINAL] block in bugs.txt when browser sends kvm_final_summary (best-effort rewrite).
+ * Scan full bugs.txt for relay/browser signals (aggregate over the whole run, not first snapshot).
  *
+ * @return array<string, mixed>
+ */
+function ipmiKvmBugLogComputeAggregateFromRaw(string $raw): array
+{
+    $agg = [
+        'browser_ws_handshake_ok'       => false,
+        'upstream_tls_ok'               => false,
+        'upstream_ws_ok'                => false,
+        'frame_pump_started'            => false,
+        'first_frame_observed'          => false,
+        'sustained_frame_flow_observed' => false,
+        'idle_timeout_observed'         => false,
+        'upstream_ws_fail_count'        => 0,
+        'upstream_tls_fail_count'         => 0,
+        'relay_pump_starts'             => 0,
+        'relay_closed_events'           => 0,
+        'application_path_signal'       => false,
+        'shell_abandon_signal'          => false,
+        'launch_attempt_signal'         => false,
+    ];
+    if ($raw === '') {
+        return $agg;
+    }
+    $agg['browser_ws_handshake_ok'] = str_contains($raw, 'ipmi_ws_relay_browser_handshake_succeeded')
+        || (bool) preg_match('/\[BROWSER\][^\n]*browser_ws_handshake_succeeded/', $raw)
+        || (bool) preg_match('/\[TRANSPORT\][^\n]*browser_ws_handshake_succeeded/', $raw);
+    $agg['upstream_tls_ok'] = str_contains($raw, 'ipmi_ws_relay_upstream_tls_connected')
+        || str_contains($raw, 'ipmi_ws_relay_upstream_tcp_connected');
+    $agg['upstream_ws_ok'] = str_contains($raw, 'ipmi_ws_relay_upstream_ws_handshake_succeeded');
+    $agg['frame_pump_started'] = str_contains($raw, 'ipmi_ws_relay_frame_pump_started');
+    $agg['first_frame_observed'] = str_contains($raw, 'ipmi_ws_relay_first_frame_observed');
+    $agg['sustained_frame_flow_observed'] = str_contains($raw, 'ipmi_ws_relay_sustained_frame_flow_observed');
+    $agg['idle_timeout_observed'] = str_contains($raw, 'ipmi_ws_relay_frame_pump_idle_timeout');
+    $agg['upstream_ws_fail_count'] = substr_count($raw, 'ipmi_ws_relay_upstream_ws_handshake_failed');
+    $agg['upstream_tls_fail_count'] = substr_count($raw, 'ipmi_ws_relay_upstream_tls_failed')
+        + substr_count($raw, 'ipmi_ws_relay_upstream_tcp_failed');
+    $agg['relay_pump_starts'] = substr_count($raw, 'ipmi_ws_relay_frame_pump_started');
+    $agg['relay_closed_events'] = substr_count($raw, 'ipmi_ws_relay_closed');
+    $agg['application_path_signal'] = (bool) preg_match('/event:\s*application_path_loaded\b/', $raw);
+    $agg['shell_abandon_signal'] = str_contains($raw, 'shell_path_abandoned_for_application')
+        || str_contains($raw, 'SHELL_SSE_403')
+        || str_contains($raw, 'SHELL_SESSION_INFO_403')
+        || str_contains($raw, 'code: SHELL_LAUNCH_NO_EFFECT');
+    $agg['launch_attempt_signal'] = (bool) preg_match(
+        '/event:\s*(ilo_launch_triggered|ilo_html5_console_launch_attempted|shell_escalation_console_href|application_path_loaded|shell_launch_no_effect|shell_path_abandon_flag_loaded)\b/',
+        $raw
+    );
+    $agg['session_ready_signal'] = (bool) preg_match('/event:\s*session_ready_heuristic\b/', $raw);
+
+    return $agg;
+}
+
+/** @return array<string, mixed> */
+function ipmiKvmBugLogComputeAggregateFinalState(string $raw): array
+{
+    return ipmiKvmBugLogComputeAggregateFromRaw($raw);
+}
+
+/**
+ * Remove all [FINAL] sections (legacy mid-file or trailing).
+ */
+function ipmiKvmBugLogStripFinalSections(string $raw): string
+{
+    for ($i = 0; $i < 8; $i++) {
+        $next = preg_replace('#\n\[FINAL\][\s\S]*?\n==================================================\nKVM RUN END#', "\n==================================================\nKVM RUN END", $raw, 1);
+        if (!is_string($next) || $next === $raw) {
+            break;
+        }
+        $raw = $next;
+    }
+    $raw = preg_replace('#\n\[FINAL\][\s\S]*$#', '', $raw);
+
+    return is_string($raw) ? (rtrim($raw) . "\n") : '';
+}
+
+/**
+ * Merge browser snapshot with file aggregates (OR for "ever true" positives).
+ *
+ * @param array<string, mixed> $agg
+ * @param array<string, mixed> $detail
+ * @return array<string, mixed>
+ */
+function ipmiKvmBugLogMergeFinalDetailWithAggregate(array $agg, array $detail): array
+{
+    $pickYes = static function (bool $fileSig, $d): string {
+        $detTrue = ($d === true || $d === 1 || $d === '1' || $d === 'yes');
+        $detFalse = ($d === false || $d === 0 || $d === '0' || $d === 'no');
+        if ($fileSig || $detTrue) {
+            return 'yes';
+        }
+        if ($detFalse) {
+            return 'no';
+        }
+
+        return 'unknown';
+    };
+
+    $merged = $detail;
+    $merged['application_path_loaded'] = $pickYes($agg['application_path_signal'], $detail['application_path_loaded'] ?? null);
+    $merged['shell_path_abandoned'] = $pickYes($agg['shell_abandon_signal'], $detail['shell_path_abandoned'] ?? null);
+    $merged['launch_attempted'] = $pickYes($agg['launch_attempt_signal'], $detail['launch_attempted'] ?? null);
+    $merged['browser_ws_handshake_ok'] = $pickYes($agg['browser_ws_handshake_ok'], $detail['browser_ws_handshake_ok'] ?? null);
+    $merged['upstream_tls_ok'] = $pickYes($agg['upstream_tls_ok'], $detail['upstream_tls_ok'] ?? null);
+    $merged['upstream_ws_ok'] = $pickYes($agg['upstream_ws_ok'], $detail['upstream_ws_ok'] ?? null);
+    $merged['frame_pump_started'] = $pickYes($agg['frame_pump_started'], $detail['frame_pump_started'] ?? null);
+    $merged['first_frame_observed'] = $pickYes($agg['first_frame_observed'], $detail['first_frame_observed'] ?? null);
+    $merged['sustained_frame_flow_observed'] = $pickYes($agg['sustained_frame_flow_observed'], $detail['sustained_frame_flow_observed'] ?? null);
+    $merged['frame_pump_active'] = $pickYes(
+        $agg['frame_pump_started'] || $agg['first_frame_observed'],
+        $detail['frame_pump_active'] ?? null
+    );
+    $merged['session_ready_merged'] = $pickYes($agg['session_ready_signal'], $detail['session_ready'] ?? null);
+
+    return $merged;
+}
+
+/**
+ * Strict transport health for [FINAL]: sustained flow wins; idle / repeat upstream failures degrade.
+ *
+ * @param array<string, mixed> $agg
+ * @param array<string, mixed> $merged
+ */
+function ipmiKvmBugLogDeriveFinalTransportHealthy(array $agg, array $merged, string $verdict): bool
+{
+    $badVerdict = in_array($verdict, [
+        'transport_unhealthy_console_not_confirmed',
+        'transport_unstable_console_not_confirmed',
+        'console_transport_healthy',
+        'relay_browser_handshake_failed',
+        'relay_upstream_tls_failed',
+        'relay_upstream_ws_failed',
+        'launch_discovery_failed',
+        'launch_action_no_effect',
+        'launch_reached_renderer_only',
+    ], true);
+    if ($badVerdict) {
+        return false;
+    }
+    $sustAgg = !empty($agg['sustained_frame_flow_observed']);
+    $sustBrowser = !empty($merged['sustained_transport_ok'])
+        || ($merged['sustained_frame_flow_observed'] ?? '') === 'yes';
+    $sust = $sustAgg || $sustBrowser;
+    $idle = !empty($agg['idle_timeout_observed']);
+    $pumps = (int) ($agg['relay_pump_starts'] ?? 0);
+    $upFails = (int) ($agg['upstream_ws_fail_count'] ?? 0);
+
+    if (!$sust) {
+        return false;
+    }
+    $tlsFails = (int) ($agg['upstream_tls_fail_count'] ?? 0);
+    if ($tlsFails >= 2) {
+        return false;
+    }
+    if ($tlsFails >= 1 && empty($agg['upstream_tls_ok'])) {
+        return false;
+    }
+    if ($idle) {
+        return false;
+    }
+    if ($pumps >= 2 && $upFails >= 1) {
+        return false;
+    }
+    if ($upFails >= 2) {
+        return false;
+    }
+
+    return true;
+}
+
+/**
+ * Write [FINAL] at end of bugs.txt from browser payload + full-file aggregates (authoritative).
+ *
+ * @param array<string, mixed> $payload
+ */
+function ipmiKvmBugLogUpdateFinalSummary(array $payload): void
+{
+    ipmiKvmBugLogPatchFinalBlock($payload);
+}
+
+/**
  * @param array<string, mixed> $payload
  */
 function ipmiKvmBugLogPatchFinalBlock(array $payload): void
@@ -398,51 +567,48 @@ function ipmiKvmBugLogPatchFinalBlock(array $payload): void
     if ($raw === false || $raw === '') {
         return;
     }
+    $agg = ipmiKvmBugLogComputeAggregateFromRaw($raw);
+    $merged = ipmiKvmBugLogMergeFinalDetailWithAggregate($agg, $detail);
+    $transportHealthy = ipmiKvmBugLogDeriveFinalTransportHealthy($agg, $merged, $verdict);
     $ended = gmdate('c') . 'Z';
-    $yn = static function ($key) use ($detail): string {
-        if (!array_key_exists($key, $detail)) {
-            return 'unknown';
+    $failureReason = trim((string) ($detail['final_failure_reason'] ?? $detail['reason'] ?? $detail['transport_why'] ?? ''));
+    if ($failureReason === '') {
+        if (!$transportHealthy && $verdict === 'transport_unhealthy_console_not_confirmed') {
+            $failureReason = 'no_sustained_relay_frame_flow_or_transport_unstable';
         }
-        $v = $detail[$key];
-        if ($v === null || $v === 'unknown') {
-            return 'unknown';
-        }
-        if ($v === true || $v === 1 || $v === '1' || $v === 'yes') {
-            return 'yes';
-        }
-        if ($v === false || $v === 0 || $v === '0' || $v === 'no') {
-            return 'no';
-        }
+    }
+    $failureReason = substr($failureReason, 0, 400);
 
-        return 'unknown';
+    $line = static function (string $k, string $v): string {
+        return $k . ': ' . $v . "\n";
     };
-    $repl = '[FINAL]' . "\n"
-        . 'verdict: ' . ($verdict !== '' ? $verdict : 'pending') . "\n"
-        . 'strong_confirmation: ' . (!empty($detail['strong_confirmation']) ? 'yes' : 'no') . "\n"
-        . 'application_path_loaded: ' . $yn('application_path_loaded') . "\n"
-        . 'shell_path_abandoned: ' . $yn('shell_path_abandoned') . "\n"
-        . 'launch_attempted: ' . $yn('launch_attempted') . "\n"
-        . 'browser_ws_handshake_ok: ' . $yn('browser_ws_handshake_ok') . "\n"
-        . 'upstream_ws_ok: ' . $yn('upstream_ws_ok') . "\n"
-        . 'frame_pump_active: ' . $yn('frame_pump_active') . "\n"
-        . 'transport_healthy: ' . (!empty($detail['transport_healthy']) ? 'yes' : 'no') . "\n"
-        . 'session_ready: ' . (!empty($detail['session_ready']) ? 'yes' : 'no') . "\n"
-        . 'live_display: ' . (!empty($detail['live_display']) ? 'yes' : 'no') . "\n"
-        . 'ended_at_utc: ' . $ended . "\n";
-    if (!preg_match('/\[FINAL\][\s\S]*?(?=\n==================================================\nKVM RUN END)/', $raw)) {
-        ipmiKvmBugLogAppendSection('FINAL', 'event: kvm_final_summary | verdict: ' . $verdict);
 
-        return;
-    }
-    $new = preg_replace(
-        '/\[FINAL\][\s\S]*?(?=\n==================================================\nKVM RUN END)/',
-        $repl,
-        $raw,
-        1
-    );
-    if (!is_string($new)) {
-        return;
-    }
+    $finalBody = '[FINAL]' . "\n"
+        . $line('verdict', $verdict !== '' ? $verdict : 'pending')
+        . $line('strong_confirmation', !empty($detail['strong_confirmation']) ? 'yes' : 'no')
+        . $line('application_path_loaded', (string) ($merged['application_path_loaded'] ?? 'unknown'))
+        . $line('shell_path_abandoned', (string) ($merged['shell_path_abandoned'] ?? 'unknown'))
+        . $line('launch_attempted', (string) ($merged['launch_attempted'] ?? 'unknown'))
+        . $line('browser_ws_handshake_ok', (string) ($merged['browser_ws_handshake_ok'] ?? 'unknown'))
+        . $line('upstream_tls_ok', (string) ($merged['upstream_tls_ok'] ?? 'unknown'))
+        . $line('upstream_ws_ok', (string) ($merged['upstream_ws_ok'] ?? 'unknown'))
+        . $line('frame_pump_started', (string) ($merged['frame_pump_started'] ?? 'unknown'))
+        . $line('first_frame_observed', (string) ($merged['first_frame_observed'] ?? 'unknown'))
+        . $line('sustained_frame_flow_observed', (string) ($merged['sustained_frame_flow_observed'] ?? 'unknown'))
+        . $line('idle_timeout_observed', !empty($agg['idle_timeout_observed']) ? 'yes' : 'no')
+        . $line('upstream_ws_handshake_failures', (string) ((int) ($agg['upstream_ws_fail_count'] ?? 0)))
+        . $line('relay_pump_sessions', (string) ((int) ($agg['relay_pump_starts'] ?? 0)))
+        . $line('frame_pump_active', (string) ($merged['frame_pump_active'] ?? 'unknown'))
+        . $line('transport_healthy', $transportHealthy ? 'yes' : 'no')
+        . $line('session_ready', (string) ($merged['session_ready_merged'] ?? 'unknown'))
+        . $line('live_display', !empty($detail['live_display']) ? 'yes' : 'no')
+        . $line('final_failure_reason', $failureReason !== '' ? $failureReason : 'none')
+        . $line('ended_at_utc', $ended)
+        . $line('aggregate_source', 'full_file_scan_plus_last_browser_snapshot');
+
+    $stripped = ipmiKvmBugLogStripFinalSections($raw);
+    $out = rtrim($stripped) . "\n\n" . $finalBody;
+
     $fp = @fopen($path, 'cb');
     if ($fp === false) {
         return;
@@ -453,7 +619,7 @@ function ipmiKvmBugLogPatchFinalBlock(array $payload): void
         return;
     }
     ftruncate($fp, 0);
-    fwrite($fp, $new);
+    fwrite($fp, $out);
     fflush($fp);
     flock($fp, LOCK_UN);
     fclose($fp);
@@ -552,7 +718,6 @@ function ipmiProxyIloObserveFrameFlowState(mysqli $mysqli, string $token, bool $
     $patch = ['frame_pump_active' => $active ? 1 : 0];
     if ($observed) {
         $patch['frame_flow_observed'] = 1;
-        $patch['transport_healthy'] = 1;
     }
     ipmiProxyIloTransportHealthStateStore($mysqli, $token, $patch);
 }

@@ -538,6 +538,10 @@ $lastActivityTs  = microtime(true);
 $idleTimeoutSec  = 300;
 $pumpErrors      = 0;
 $firstFrameSeen  = false;
+$idleExit        = false;
+$sustainedFlowObserved = false;
+$sustainedMinBmcBytes    = 4096;
+$sustainedMinBmcFrames   = 12;
 
 ipmiWsRelayDebugEvent('ipmi_ws_relay_frame_pump_started', [
     'sapi'         => PHP_SAPI,
@@ -562,8 +566,12 @@ while (!feof($remote) && time() < $deadline) {
 
     if ($changed === 0) {
         if ((microtime(true) - $lastActivityTs) > $idleTimeoutSec) {
+            $idleExit = true;
             ipmiWsRelayDebugEvent('ipmi_ws_relay_frame_pump_idle_timeout', [
                 'idle_sec' => round(microtime(true) - $lastActivityTs),
+                'bmc_bytes' => $bytesFromBmc,
+                'bmc_frames' => $framesBmc,
+                'sustained_prior' => $sustainedFlowObserved ? '1' : '0',
             ]);
             break;
         }
@@ -591,6 +599,14 @@ while (!feof($remote) && time() < $deadline) {
                 ipmiWsRelayDebugEvent('ipmi_ws_relay_first_frame_observed', [
                     'from'  => 'bmc',
                     'bytes' => strlen($data),
+                ]);
+            }
+            if (!$sustainedFlowObserved && $bytesFromBmc >= $sustainedMinBmcBytes && $framesBmc >= $sustainedMinBmcFrames) {
+                $sustainedFlowObserved = true;
+                ipmiWsRelayDebugEvent('ipmi_ws_relay_sustained_frame_flow_observed', [
+                    'bytes_from_bmc' => $bytesFromBmc,
+                    'frames_bmc'     => $framesBmc,
+                    'elapsed_sec'    => round(microtime(true) - $relayStartTs, 2),
                 ]);
             }
             $written = @fwrite($clientOut, $data);
@@ -621,17 +637,20 @@ while (!feof($remote) && time() < $deadline) {
 // 12. Cleanup and final log
 // ---------------------------------------------------------------------------
 $elapsed = round(microtime(true) - $relayStartTs, 2);
-$healthy = ($bytesFromBmc > 0 && $bytesFromClient > 0);
+$healthy = $sustainedFlowObserved && ($bytesFromBmc > 0 && $bytesFromClient > 0) && !$idleExit;
 
 ipmiWsRelayDebugEvent('ipmi_ws_relay_closed', [
-    'elapsed_sec'      => $elapsed,
-    'bytes_from_bmc'   => $bytesFromBmc,
-    'bytes_from_client' => $bytesFromClient,
-    'frames_bmc'       => $framesBmc,
-    'frames_client'    => $framesClient,
-    'pump_errors'      => $pumpErrors,
-    'transport_healthy' => $healthy,
-    'sapi'             => PHP_SAPI,
+    'elapsed_sec'               => $elapsed,
+    'bytes_from_bmc'            => $bytesFromBmc,
+    'bytes_from_client'         => $bytesFromClient,
+    'frames_bmc'                => $framesBmc,
+    'frames_client'             => $framesClient,
+    'pump_errors'               => $pumpErrors,
+    'idle_exit'                 => $idleExit ? '1' : '0',
+    'first_frame_seen'          => $firstFrameSeen ? '1' : '0',
+    'sustained_flow_observed'   => $sustainedFlowObserved ? '1' : '0',
+    'transport_healthy_session' => $healthy ? '1' : '0',
+    'sapi'                      => PHP_SAPI,
 ]);
 
 @fclose($clientIn);
