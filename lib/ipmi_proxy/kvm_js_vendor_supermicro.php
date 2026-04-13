@@ -1,0 +1,42 @@
+﻿<?php
+
+function ipmiProxyBuildSupermicroKvmScript(): string
+{
+    return 'if(FAMILY==="supermicro"){'
+        . 'var wantSm=(PLAN&&PLAN.kvm_entry_path)?String(PLAN.kvm_entry_path):"/cgi/url_redirect.cgi?url_name=ikvm&url_type=html5";'
+        . 'var _smN=0,_smSt={lastProgress:kvmNow(),clicks:0,reported:{boot:false,trans:false},stall:false};'
+        . 'try{'
+        . 'var _smBody=String(document.body&&document.body.innerText||"").toLowerCase();'
+        . 'if(_smBody.indexOf("supermicro")>=0||_smBody.indexOf("topmenu")>=0||location.href.indexOf("topmenu")>=0){'
+        . 'if(!window.__ipmi_sm_shell_tp){window.__ipmi_sm_shell_tp=1;kvmTouchProgress(_smSt);}'
+        . '_kvmDbg("supermicro_shell_detected",1);}'
+        . '_kvmDbg("supermicro_html5_route_selected",wantSm);'
+        . 'if(window.sessionStorage&&!sessionStorage.getItem("_ipmi_sm_autonav")){'
+        . 'sessionStorage.setItem("_ipmi_sm_autonav","1");'
+        . 'var _p=String(location.pathname||"").toLowerCase(),_q=String(location.search||"").toLowerCase();'
+        . 'if(_p.indexOf("ikvm")<0&&_q.indexOf("ikvm")<0&&wantSm){if(wantSm.charAt(0)!=="/")wantSm="/"+wantSm;'
+        . 'var curFullSm=location.pathname+(location.search||"");'
+        . 'if(wantSm!==curFullSm){go(wantSm);}'
+        . '}'
+        . '}'
+        . '}catch(_sm0){}'
+        . '(function _smTick(){_smN++;'
+        . 'try{'
+        . 'if(String(location.search||"").toLowerCase().indexOf("html5")>=0||String(location.pathname||"").toLowerCase().indexOf("ikvm")>=0){if(!_smSt.reported.boot){_smSt.reported.boot=true;kvmTouchProgress(_smSt);_kvmDbg("supermicro_bootstrap_detected",1);}}'
+        . 'if(kvmWsRelaySeen()&&!_smSt.reported.trans){_smSt.reported.trans=true;kvmTouchProgress(_smSt);_kvmDbg("supermicro_transport_detected",1);}'
+        . 'if(kvmSupermicroInteractiveLikely()){_kvmDbg("supermicro_console_interactive_likely",1);markDone();return;}'
+        . 'var _L2=document.querySelectorAll("a[href],button,[role=button],input[type=button],area[href]");'
+        . 'for(var _j=0;_j<_L2.length;_j++){'
+        . 'var _e2=_L2[_j],_h2=String(_e2.getAttribute("href")||"").toLowerCase(),_x2=String(_e2.textContent||"").toLowerCase();'
+        . 'if(_h2.indexOf("ikvm")>=0||_h2.indexOf("kvm")>=0||_x2.indexOf("ikvm")>=0||(_x2.indexOf("kvm")>=0&&(_x2.indexOf("launch")>=0||_x2.indexOf("remote")>=0))){'
+        . 'if(_smN%5===0&&_smSt.clicks<7){_smSt.clicks++;kvmTouchProgress(_smSt);_kvmDbg("supermicro_click_candidate_found",_h2||_x2);try{_e2.click();}catch(ec2){}}'
+        . '}'
+        . '}'
+        . '}catch(_sm1){}'
+        . 'if(!_smSt.stall&&(kvmNow()-_smSt.lastProgress)>KVM_TMO){_smSt.stall=true;_kvmDbg("supermicro_console_stalled",{ticks:_smN,clicks:_smSt.clicks});return;}'
+        . 'if(_smN>=110){_kvmDbg("supermicro_console_stalled",{ticks:_smN,reason:"max_ticks"});return;}'
+        . 'setTimeout(_smTick,420);'
+        . '})();'
+        . 'return;}';
+
+}

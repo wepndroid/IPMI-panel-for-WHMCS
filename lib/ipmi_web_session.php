@@ -202,7 +202,7 @@ function ipmiWebLoadSessionMetaFromRow(string $rawCookies): array
 
 /**
  * Cheap bootstrap viability view from session metadata only (no BMC I/O).
- * Live probes and auth refresh live in ipmi_proxy.php (ipmiProxyMaybeIloRuntimePreflight).
+ * Live probes and auth refresh live in lib/ipmi_proxy/ilo_bootstrap_and_http.php (ipmiProxyMaybeIloRuntimePreflight).
  *
  * @param array<string, mixed> $sessionMeta
  * @return array{phase: string, preflight_age_sec: int|null, preflight_bootstrap_ok: bool|null}
