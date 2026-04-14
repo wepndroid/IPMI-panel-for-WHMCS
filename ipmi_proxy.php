@@ -475,7 +475,7 @@ function ipmiProxyKvmBuglogClientCoreJs(): string
 }
 
 /**
- * Full browser console capture (bugs.txt [BROWSER_CONSOLE]) + MutationObserver.observe guard for vendor iLO bundles.
+ * Full browser console capture (per-run bugs/bugsN.txt [BROWSER_CONSOLE]) + MutationObserver.observe guard for vendor iLO bundles.
  */
 function ipmiProxyKvmConsoleCaptureAndDomGuardJs(): string
 {
@@ -1904,10 +1904,12 @@ function ipmiProxyInjectKvmAutoLaunchPatch(string $html, string $token, $session
                 'shell_runtime_forbidden'  => !empty($plan['shell_runtime_forbidden']) ? 1 : 0,
             ]);
         }
-        if (ipmiKvmBugLogTokenMatchesActiveRun($token)) {
+        if ($persistKvmPlanMysqli instanceof mysqli && ipmiKvmBugLogTokenMatchesActiveRun($token, $persistKvmPlanMysqli)) {
             ipmiKvmBugLogAppendSection(
                 'SERVER',
-                'event: ilo_main_runtime_injected | patch_mode: shell_exit_stub | page_type: ' . $pageType
+                'event: ilo_main_runtime_injected | patch_mode: shell_exit_stub | page_type: ' . $pageType,
+                $persistKvmPlanMysqli,
+                strtolower($token)
             );
         }
         if ($persistKvmPlanMysqli instanceof mysqli && preg_match('/^[a-f0-9]{64}$/i', $token)) {
@@ -1940,8 +1942,8 @@ function ipmiProxyInjectKvmAutoLaunchPatch(string $html, string $token, $session
                 'bytes' => strlen($helperBody),
             ]);
         }
-        if (ipmiKvmBugLogTokenMatchesActiveRun($token)) {
-            ipmiKvmBugLogAppendSection('SERVER', 'event: ilo_helper_runtime_injected | patch_mode: helper_minimal | page_type: ' . $pageType);
+        if ($persistKvmPlanMysqli instanceof mysqli && ipmiKvmBugLogTokenMatchesActiveRun($token, $persistKvmPlanMysqli)) {
+            ipmiKvmBugLogAppendSection('SERVER', 'event: ilo_helper_runtime_injected | patch_mode: helper_minimal | page_type: ' . $pageType, $persistKvmPlanMysqli, strtolower($token));
         }
 
         return ipmiProxyInjectIntoHtmlHeadOrBody($html, $patch);
@@ -1976,11 +1978,13 @@ function ipmiProxyInjectKvmAutoLaunchPatch(string $html, string $token, $session
                 'effective_kvm_entry_path' => (string) ($plan['effective_kvm_entry_path'] ?? $plan['kvm_entry_path'] ?? ''),
             ]);
         }
-        if (ipmiKvmBugLogTokenMatchesActiveRun($token)) {
+        if ($persistKvmPlanMysqli instanceof mysqli && ipmiKvmBugLogTokenMatchesActiveRun($token, $persistKvmPlanMysqli)) {
             ipmiKvmBugLogAppendSection(
                 'SERVER',
                 'event: ilo_shell_loop_break_minimal_injected | patch_mode: no_runtime | page_type: ' . $pageType
-                    . ' | note: application_promotion_single_client_nav_after_stub_cap'
+                    . ' | note: application_promotion_single_client_nav_after_stub_cap',
+                $persistKvmPlanMysqli,
+                strtolower($token)
             );
         }
         if ($persistKvmPlanMysqli instanceof mysqli && preg_match('/^[a-f0-9]{64}$/i', $token)) {
@@ -2077,8 +2081,8 @@ function ipmiProxyInjectKvmAutoLaunchPatch(string $html, string $token, $session
             'shell_runtime_forbidden'  => !empty($plan['shell_runtime_forbidden']) ? 1 : 0,
         ]);
     }
-    if (ipmiKvmBugLogTokenMatchesActiveRun($token)) {
-        ipmiKvmBugLogAppendSection('SERVER', 'event: ilo_main_runtime_injected | patch_mode: ' . $patchMode . ' | page_type: ' . $pageType);
+    if ($persistKvmPlanMysqli instanceof mysqli && ipmiKvmBugLogTokenMatchesActiveRun($token, $persistKvmPlanMysqli)) {
+        ipmiKvmBugLogAppendSection('SERVER', 'event: ilo_main_runtime_injected | patch_mode: ' . $patchMode . ' | page_type: ' . $pageType, $persistKvmPlanMysqli, strtolower($token));
     }
     if (
         $persistKvmPlanMysqli instanceof mysqli
@@ -2089,7 +2093,7 @@ function ipmiProxyInjectKvmAutoLaunchPatch(string $html, string $token, $session
             'path_state'                  => 'application_path_active',
             'application_html_served_ts'  => time(),
         ]);
-        if (ipmiKvmBugLogTokenMatchesActiveRun($token)) {
+        if (ipmiKvmBugLogTokenMatchesActiveRun($token, $persistKvmPlanMysqli)) {
             ipmiKvmBugLogAppendOncePerRun(
                 $persistKvmPlanMysqli,
                 $token,

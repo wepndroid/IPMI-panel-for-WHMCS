@@ -1,189 +1,114 @@
 <?php
 /**
- * Project-local KVM run diagnostic log (bugs.txt in project root).
- * One canonical file: reset on each KVM button click, append with LOCK_EX for the active run.
+ * Project-local KVM run diagnostic logs under bugs/bugsN.txt (monotonic per click).
+ * Each panel KVM launch creates a new file; historical runs are never truncated or reused.
  */
 
 declare(strict_types=1);
 
 require_once __DIR__ . '/ipmi_web_session.php';
 
-/**
- * Absolute path to bugs.txt (project root).
- */
-function ipmiKvmBugLogRootPath(): string
+/** Project root (parent of lib/). */
+function ipmiKvmBugProjectRoot(): string
 {
-    return dirname(__DIR__) . DIRECTORY_SEPARATOR . 'bugs.txt';
+    return dirname(__DIR__);
+}
+
+/** Absolute path to bugs/ directory. */
+function ipmiKvmBugFolderPath(): string
+{
+    return ipmiKvmBugProjectRoot() . DIRECTORY_SEPARATOR . 'bugs';
 }
 
 /**
- * Mask a secret for logging: keep last 8 chars when long enough.
+ * Ensure bugs/ exists (0755).
  */
-function ipmiKvmBugLogMaskSecrets(?string $s, int $tailKeep = 8): string
+function ipmiKvmBugFolderEnsureExists(): bool
 {
-    $s = trim((string) $s);
-    if ($s === '') {
-        return '';
-    }
-    $len = strlen($s);
-    if ($len <= $tailKeep) {
-        return '****';
+    $dir = ipmiKvmBugFolderPath();
+    if (is_dir($dir)) {
+        return true;
     }
 
-    return '****' . substr($s, -$tailKeep);
+    return @mkdir($dir, 0755, true);
 }
 
 /**
- * Truncate bugs.txt (used internally by start run).
- */
-function ipmiKvmBugLogResetFile(): void
-{
-    $path = ipmiKvmBugLogRootPath();
-    $fp = @fopen($path, 'cb');
-    if ($fp === false) {
-        return;
-    }
-    if (!flock($fp, LOCK_EX)) {
-        fclose($fp);
-
-        return;
-    }
-    ftruncate($fp, 0);
-    fflush($fp);
-    flock($fp, LOCK_UN);
-    fclose($fp);
-}
-
-/**
- * Reset bugs.txt at the start of every panel KVM attempt (after session row exists).
- * Replaced entirely by ipmiKvmBugLogStartRun() when the launch plan succeeds.
- */
-function ipmiKvmBugLogBeginPanelAttempt(int $serverId): void
-{
-    $path = ipmiKvmBugLogRootPath();
-    $fp = @fopen($path, 'cb');
-    if ($fp === false) {
-        return;
-    }
-    if (!flock($fp, LOCK_EX)) {
-        fclose($fp);
-
-        return;
-    }
-    ftruncate($fp, 0);
-    $t = gmdate('c') . 'Z';
-    $body = "==================================================\n"
-        . "KVM PANEL ATTEMPT\n"
-        . 'started_at_utc: ' . $t . "\n"
-        . 'service_id: ' . max(0, $serverId) . "\n"
-        . "note: one reset per KVM click; KVM RUN START overwrites this after launch plan ok\n"
-        . "==================================================\n\n";
-    fwrite($fp, $body);
-    fflush($fp);
-    flock($fp, LOCK_UN);
-    fclose($fp);
-}
-
-/**
- * Append one UTF-8 line (caller supplies trailing \n if needed).
- */
-function ipmiKvmBugLogAppend(string $line): void
-{
-    $path = ipmiKvmBugLogRootPath();
-    $line = str_replace(["\r", "\n"], ' ', $line);
-    $line = rtrim($line) . "\n";
-    $fp = @fopen($path, 'ab');
-    if ($fp === false) {
-        return;
-    }
-    if (!flock($fp, LOCK_EX)) {
-        fclose($fp);
-
-        return;
-    }
-    fwrite($fp, $line);
-    fflush($fp);
-    flock($fp, LOCK_UN);
-    fclose($fp);
-}
-
-/**
- * Read active run_id from bugs.txt header (LOCK_SH).
- */
-function ipmiKvmBugLogCurrentRunId(): ?string
-{
-    $path = ipmiKvmBugLogRootPath();
-    if (!is_readable($path)) {
-        return null;
-    }
-    $fp = @fopen($path, 'rb');
-    if ($fp === false) {
-        return null;
-    }
-    flock($fp, LOCK_SH);
-    $head = '';
-    for ($i = 0; $i < 48 && !feof($fp); $i++) {
-        $head .= (string) fgets($fp, 4096);
-    }
-    flock($fp, LOCK_UN);
-    fclose($fp);
-    if (preg_match('/^run_id:\s*(\S+)/m', $head, $m)) {
-        return trim($m[1]);
-    }
-
-    return null;
-}
-
-/**
- * Read token_suffix from header for relay/ingest correlation.
- */
-function ipmiKvmBugLogReadTokenSuffixFromHeader(): ?string
-{
-    $path = ipmiKvmBugLogRootPath();
-    if (!is_readable($path)) {
-        return null;
-    }
-    $fp = @fopen($path, 'rb');
-    if ($fp === false) {
-        return null;
-    }
-    flock($fp, LOCK_SH);
-    $head = '';
-    for ($i = 0; $i < 48 && !feof($fp); $i++) {
-        $head .= (string) fgets($fp, 4096);
-    }
-    flock($fp, LOCK_UN);
-    fclose($fp);
-    if (preg_match('/^token_suffix:\s*(\S+)/m', $head, $m)) {
-        return strtolower(trim($m[1]));
-    }
-
-    return null;
-}
-
-/**
- * Start a new KVM run: reset file, write header + plan block, return run_id.
+ * Sorted list of numeric indexes N for existing bugsN.txt files.
  *
- * @param array<string, mixed> $ctx
+ * @return list<int>
  */
-function ipmiKvmBugLogStartRun(array $ctx): string
+function ipmiKvmBugFileListExisting(): array
+{
+    $dir = ipmiKvmBugFolderPath();
+    $out = [];
+    if (!is_dir($dir)) {
+        return $out;
+    }
+    foreach (scandir($dir) ?: [] as $fn) {
+        if (preg_match('/^bugs(\d+)\.txt$/i', $fn, $m)) {
+            $out[] = (int) $m[1];
+        }
+    }
+    sort($out, SORT_NUMERIC);
+
+    return $out;
+}
+
+/**
+ * Next file index: max(existing) + 1, or 1 if none (gaps are not reused).
+ */
+function ipmiKvmBugFileNextIndex(): int
+{
+    $list = ipmiKvmBugFileListExisting();
+    if ($list === []) {
+        return 1;
+    }
+
+    return max($list) + 1;
+}
+
+/** Absolute path for bugs/bugs{N}.txt */
+function ipmiKvmBugFilePathForIndex(int $index): string
+{
+    return ipmiKvmBugFolderPath() . DIRECTORY_SEPARATOR . 'bugs' . max(1, $index) . '.txt';
+}
+
+/** Relative path from project root: bugs/bugs{N}.txt */
+function ipmiKvmBugFileRelForIndex(int $index): string
+{
+    return 'bugs/bugs' . max(1, $index) . '.txt';
+}
+
+/**
+ * Create a new empty run file and write the initial template. Does not touch other files.
+ *
+ * @param array<string, mixed> $ctx Same context as ipmiKvmBugLogStartRun
+ * @return array{run_id: string, bug_file_rel: string, bug_file_index: int, abs_path: string}
+ */
+function ipmiKvmBugFileCreateForRun(array $ctx): array
 {
     $runId = bin2hex(random_bytes(8));
     $started = gmdate('c') . 'Z';
     $token = strtolower(trim((string) ($ctx['token'] ?? '')));
     $suffix = (strlen($token) === 64) ? substr($token, -8) : '';
-    $path = ipmiKvmBugLogRootPath();
 
-    $fp = @fopen($path, 'cb');
-    if ($fp === false) {
-        return $runId;
+    if (!ipmiKvmBugFolderEnsureExists()) {
+        return [
+            'run_id'         => $runId,
+            'bug_file_rel'   => '',
+            'bug_file_index' => 0,
+            'abs_path'       => '',
+        ];
     }
-    if (!flock($fp, LOCK_EX)) {
-        fclose($fp);
 
-        return $runId;
+    $idx = ipmiKvmBugFileNextIndex();
+    $path = ipmiKvmBugFilePathForIndex($idx);
+    while (is_file($path) && @filesize($path) > 0) {
+        $idx++;
+        $path = ipmiKvmBugFilePathForIndex($idx);
     }
-    ftruncate($fp, 0);
+    $rel = ipmiKvmBugFileRelForIndex($idx);
 
     $bmcHostMasked = ipmiKvmBugLogMaskSecrets((string) ($ctx['bmc_host'] ?? ''), 12);
     $tokenMasked = ipmiKvmBugLogMaskSecrets($token, 8);
@@ -192,6 +117,8 @@ function ipmiKvmBugLogStartRun(array $ctx): string
         '==================================================',
         'KVM RUN START',
         'run_id: ' . $runId,
+        'bug_file_rel: ' . $rel,
+        'bug_file_index: ' . (string) $idx,
         'started_at_utc: ' . $started,
         'panel_entry: ' . trim((string) ($ctx['panel_entry'] ?? 'ipmi_kvm.php')),
         'service_id: ' . trim((string) ($ctx['service_id'] ?? '')),
@@ -232,69 +159,255 @@ function ipmiKvmBugLogStartRun(array $ctx): string
         '===========',
         '',
     ];
-    fwrite($fp, implode("\n", $lines));
+    $body = implode("\n", $lines);
+    $fp = @fopen($path, 'cb');
+    if ($fp === false) {
+        return [
+            'run_id'         => $runId,
+            'bug_file_rel'   => '',
+            'bug_file_index' => 0,
+            'abs_path'       => '',
+        ];
+    }
+    if (!flock($fp, LOCK_EX)) {
+        fclose($fp);
+
+        return [
+            'run_id'         => $runId,
+            'bug_file_rel'   => '',
+            'bug_file_index' => 0,
+            'abs_path'       => '',
+        ];
+    }
+    ftruncate($fp, 0);
+    fwrite($fp, $body);
     fflush($fp);
     flock($fp, LOCK_UN);
     fclose($fp);
 
-    return $runId;
+    return [
+        'run_id'         => $runId,
+        'bug_file_rel'   => $rel,
+        'bug_file_index' => $idx,
+        'abs_path'       => $path,
+    ];
 }
 
-function ipmiKvmBugLogAppendSection(string $section, string $bodyLine): void
+/**
+ * Absolute path for the active run file from session meta (token-bound).
+ */
+function ipmiKvmBugFilePathForRun(mysqli $mysqli, string $token): ?string
+{
+    if (!preg_match('/^[a-f0-9]{64}$/', strtolower($token))) {
+        return null;
+    }
+    $session = ipmiWebLoadSession($mysqli, strtolower($token));
+    if (!$session) {
+        return null;
+    }
+    $meta = is_array($session['session_meta'] ?? null) ? $session['session_meta'] : [];
+    $br = is_array($meta['kvm_buglog_run'] ?? null) ? $meta['kvm_buglog_run'] : [];
+    $rel = trim((string) ($br['bug_file_rel'] ?? ''));
+    if ($rel === '' || str_contains($rel, '..') || str_starts_with($rel, '/')) {
+        return null;
+    }
+    $abs = ipmiKvmBugProjectRoot() . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $rel);
+
+    return $abs;
+}
+
+/**
+ * @deprecated Legacy singleton bugs.txt path; do not use for writes. Kept for one-off tooling only.
+ */
+function ipmiKvmBugLogRootPath(): string
+{
+    return ipmiKvmBugProjectRoot() . DIRECTORY_SEPARATOR . 'bugs.txt';
+}
+
+/**
+ * Mask a secret for logging: keep last 8 chars when long enough.
+ */
+function ipmiKvmBugLogMaskSecrets(?string $s, int $tailKeep = 8): string
+{
+    $s = trim((string) $s);
+    if ($s === '') {
+        return '';
+    }
+    $len = strlen($s);
+    if ($len <= $tailKeep) {
+        return '****';
+    }
+
+    return '****' . substr($s, -$tailKeep);
+}
+
+/**
+ * @deprecated Per-run files: nothing to reset globally.
+ */
+function ipmiKvmBugLogResetFile(): void
+{
+}
+
+/**
+ * Historical: previously reset singleton bugs.txt. Per-run logs use bugs/bugsN.txt only.
+ */
+function ipmiKvmBugLogBeginPanelAttempt(int $serverId): void
+{
+    unset($serverId);
+}
+
+/**
+ * Append one UTF-8 line to the token-bound run file only.
+ */
+function ipmiKvmBugLogAppend(string $line, mysqli $mysqli, string $token): void
+{
+    $path = ipmiKvmBugFilePathForRun($mysqli, $token);
+    if ($path === null || $path === '') {
+        return;
+    }
+    $line = str_replace(["\r", "\n"], ' ', $line);
+    $line = rtrim($line) . "\n";
+    $fp = @fopen($path, 'ab');
+    if ($fp === false) {
+        return;
+    }
+    if (!flock($fp, LOCK_EX)) {
+        fclose($fp);
+
+        return;
+    }
+    fwrite($fp, $line);
+    fflush($fp);
+    flock($fp, LOCK_UN);
+    fclose($fp);
+}
+
+/**
+ * Active run_id for this token (session meta; authoritative for ingest).
+ */
+function ipmiKvmBugLogCurrentRunIdForToken(mysqli $mysqli, string $token): ?string
+{
+    if (!preg_match('/^[a-f0-9]{64}$/', strtolower($token))) {
+        return null;
+    }
+    $session = ipmiWebLoadSession($mysqli, strtolower($token));
+    if (!$session) {
+        return null;
+    }
+    $br = is_array($session['session_meta']['kvm_buglog_run'] ?? null) ? $session['session_meta']['kvm_buglog_run'] : [];
+    $rid = trim((string) ($br['run_id'] ?? ''));
+
+    return $rid !== '' ? $rid : null;
+}
+
+/** @deprecated Use ipmiKvmBugLogCurrentRunIdForToken($mysqli, $token) */
+function ipmiKvmBugLogCurrentRunId(): ?string
+{
+    return null;
+}
+
+function ipmiKvmBugLogTokenSuffixFromSession(array $session): ?string
+{
+    $br = is_array($session['session_meta']['kvm_buglog_run'] ?? null) ? $session['session_meta']['kvm_buglog_run'] : [];
+    $s = strtolower(trim((string) ($br['token_suffix'] ?? '')));
+
+    return $s !== '' ? $s : null;
+}
+
+/**
+ * Read token_suffix from session (replaces legacy header read from singleton file).
+ */
+function ipmiKvmBugLogReadTokenSuffixFromHeader(): ?string
+{
+    return null;
+}
+
+/**
+ * Start a new KVM run: create bugs/bugsN.txt only; return run_id and file metadata.
+ *
+ * @param array<string, mixed> $ctx
+ * @return array{run_id: string, bug_file_rel: string, bug_file_index: int}
+ */
+function ipmiKvmBugLogStartRun(array $ctx): array
+{
+    $created = ipmiKvmBugFileCreateForRun($ctx);
+
+    return [
+        'run_id'         => $created['run_id'],
+        'bug_file_rel'   => $created['bug_file_rel'],
+        'bug_file_index' => (int) ($created['bug_file_index'] ?? 0),
+    ];
+}
+
+function ipmiKvmBugLogAppendSection(string $section, string $bodyLine, mysqli $mysqli, string $token): void
 {
     $section = strtoupper(trim($section));
     if ($section === '') {
         $section = 'NOTE';
     }
-    ipmiKvmBugLogAppend('[' . $section . '] ' . $bodyLine);
+    ipmiKvmBugLogAppend('[' . $section . '] ' . $bodyLine, $mysqli, strtolower($token));
 }
 
-function ipmiKvmBugLogAppendBug(string $code, string $summary, string $detail = ''): void
+function ipmiKvmBugLogAppendBug(string $code, string $summary, mysqli $mysqli, string $token, string $detail = ''): void
 {
     $detail = trim($detail);
     if ($detail !== '') {
         $detail = ' | detail: ' . ipmiKvmBugLogMaskSecrets($detail, 24);
     }
-    ipmiKvmBugLogAppend('[BUG] code: ' . trim($code) . ' | summary: ' . trim($summary) . $detail);
+    ipmiKvmBugLogAppend('[BUG] code: ' . trim($code) . ' | summary: ' . trim($summary) . $detail, $mysqli, strtolower($token));
 }
 
 /**
- * Verify token belongs to active run (suffix match against bugs.txt header).
+ * Verify token belongs to active KVM buglog run for this session row.
  */
-function ipmiKvmBugLogTokenMatchesActiveRun(string $token): bool
+function ipmiKvmBugLogTokenMatchesActiveRun(string $token, mysqli $mysqli): bool
 {
     if (!preg_match('/^[a-f0-9]{64}$/', strtolower($token))) {
         return false;
     }
-    $want = strtolower(substr($token, -8));
-    $got = ipmiKvmBugLogReadTokenSuffixFromHeader();
+    $tok = strtolower($token);
+    $session = ipmiWebLoadSession($mysqli, $tok);
+    if (!$session) {
+        return false;
+    }
+    $want = substr($tok, -8);
+    $got = ipmiKvmBugLogTokenSuffixFromSession($session);
 
     return $got !== null && $got !== '' && hash_equals($got, $want);
 }
 
 /**
- * True when bugs.txt represents an in-progress KVM run (header present, file non-empty).
+ * True when this token has an open bug run file binding and the run is not marked closed in session.
  */
-function ipmiKvmBugLogHasOpenRun(): bool
+function ipmiKvmBugLogHasOpenRun(mysqli $mysqli, string $token): bool
 {
-    $id = ipmiKvmBugLogCurrentRunId();
+    if (!preg_match('/^[a-f0-9]{64}$/', strtolower($token))) {
+        return false;
+    }
+    $session = ipmiWebLoadSession($mysqli, strtolower($token));
+    if (!$session) {
+        return false;
+    }
+    $br = is_array($session['session_meta']['kvm_buglog_run'] ?? null) ? $session['session_meta']['kvm_buglog_run'] : [];
+    $rid = trim((string) ($br['run_id'] ?? ''));
+    $rel = trim((string) ($br['bug_file_rel'] ?? ''));
 
-    return $id !== null && $id !== '';
+    return $rid !== '' && $rel !== '';
 }
 
 /**
  * Whether a [FINAL] block may be written (active run + token matches when provided).
  */
-function ipmiKvmBugLogCanFinalizeRun(string $token): bool
+function ipmiKvmBugLogCanFinalizeRun(mysqli $mysqli, string $token): bool
 {
-    if (!ipmiKvmBugLogHasOpenRun()) {
+    if (!ipmiKvmBugLogHasOpenRun($mysqli, $token)) {
         return false;
     }
     if (!preg_match('/^[a-f0-9]{64}$/', strtolower($token))) {
         return true;
     }
 
-    return ipmiKvmBugLogTokenMatchesActiveRun($token);
+    return ipmiKvmBugLogTokenMatchesActiveRun($token, $mysqli);
 }
 
 /**
@@ -362,8 +475,8 @@ function ipmiKvmBugLogMaybeRefreshFinalAfterRelayEvent(mysqli $mysqli, string $t
     if ($pri < 1) {
         return;
     }
-    $path = ipmiKvmBugLogRootPath();
-    if (!is_readable($path)) {
+    $path = ipmiKvmBugFilePathForRun($mysqli, $token);
+    if ($path === null || $path === '' || !is_readable($path)) {
         return;
     }
     $raw = @file_get_contents($path);
@@ -403,7 +516,7 @@ function ipmiKvmBugLogMaybeRefreshFinalAfterRelayEvent(mysqli $mysqli, string $t
         });
         $payload = $stored;
         $payload['token'] = strtolower($token);
-        $rid = ipmiKvmBugLogCurrentRunId();
+        $rid = ipmiKvmBugLogCurrentRunIdForToken($mysqli, $token);
         if ($rid !== null && $rid !== '') {
             $payload['run_id'] = $rid;
         }
@@ -427,7 +540,7 @@ function ipmiKvmBugLogFinalizeRun(mysqli $mysqli, string $token, array $payload)
  */
 function ipmiKvmBugLogRelayDebugEvent(string $token, string $event, array $detail = [], ?mysqli $mysqli = null): void
 {
-    if (!ipmiKvmBugLogTokenMatchesActiveRun($token)) {
+    if (!$mysqli instanceof mysqli || !ipmiKvmBugLogTokenMatchesActiveRun($token, $mysqli)) {
         return;
     }
     $parts = [$event];
@@ -449,7 +562,7 @@ function ipmiKvmBugLogRelayDebugEvent(string $token, string $event, array $detai
         }
         $parts[] = $k . '=' . $v;
     }
-    ipmiKvmBugLogAppendSection('TRANSPORT', 'event: ' . implode(' ', $parts));
+    ipmiKvmBugLogAppendSection('TRANSPORT', 'event: ' . implode(' ', $parts), $mysqli, $token);
     if ($mysqli instanceof mysqli) {
         ipmiKvmBugLogTouchMeaningfulEvent($mysqli, $token);
         ipmiKvmBugLogMaybeRefreshFinalAfterRelayEvent($mysqli, $token, $event);
@@ -502,7 +615,7 @@ function ipmiKvmBugLogAppendBrowserConsoleLine(
     string $eventText,
     $detailMsg
 ): void {
-    if (!ipmiKvmBugLogTokenMatchesActiveRun($token)) {
+    if (!$mysqli instanceof mysqli || !ipmiKvmBugLogTokenMatchesActiveRun($token, $mysqli)) {
         return;
     }
     $level = strtolower(preg_replace('/[^a-z]/', '', $level) ?? '');
@@ -533,7 +646,7 @@ function ipmiKvmBugLogAppendBrowserConsoleLine(
         . ' | source: ' . ($source !== '' ? $source : 'browser')
         . ' | event: ' . ($eventText !== '' ? $eventText : 'line')
         . ' | detail: ' . ($detailStr !== '' ? $detailStr : '-');
-    ipmiKvmBugLogAppendSection('BROWSER_CONSOLE', $line);
+    ipmiKvmBugLogAppendSection('BROWSER_CONSOLE', $line, $mysqli, $token);
     if ($mysqli instanceof mysqli) {
         ipmiKvmBugLogTouchMeaningfulEvent($mysqli, $token);
     }
@@ -720,7 +833,7 @@ function ipmiKvmBugLogPatchFinalFromSessionOrMinimal(mysqli $mysqli, string $tok
         return;
     }
     $stored = $session['session_meta']['kvm_buglog_last_final_payload'] ?? null;
-    $runId = (string) (ipmiKvmBugLogCurrentRunId() ?? '');
+    $runId = (string) (ipmiKvmBugLogCurrentRunIdForToken($mysqli, $token) ?? '');
     if (!is_array($stored) || empty($stored['detail'])) {
         $payload = [
             'token'   => strtolower($token),
@@ -747,10 +860,10 @@ function ipmiKvmBugLogPatchFinalFromSessionOrMinimal(mysqli $mysqli, string $tok
  */
 function ipmiKvmBugLogMarkRunClosed(mysqli $mysqli, string $token): void
 {
-    if (!ipmiKvmBugLogCanFinalizeRun($token)) {
+    if (!ipmiKvmBugLogCanFinalizeRun($mysqli, $token)) {
         return;
     }
-    ipmiKvmBugLogAppendSection('NOTE', 'event: kvm_run_closed | note: server_marked_run_closed_flush_final');
+    ipmiKvmBugLogAppendSection('NOTE', 'event: kvm_run_closed | note: server_marked_run_closed_flush_final', $mysqli, $token);
     ipmiKvmBugLogPatchFinalFromSessionOrMinimal($mysqli, $token);
 }
 
@@ -797,11 +910,11 @@ function ipmiKvmBugLogIngestBrowserEvent(mysqli $mysqli, array $payload): array
     if (!$session) {
         return ['ok' => false, 'error' => 'session_invalid'];
     }
-    $active = ipmiKvmBugLogCurrentRunId();
+    $active = ipmiKvmBugLogCurrentRunIdForToken($mysqli, $token);
     if ($active === null || $active === '' || !hash_equals($active, $runId)) {
         return ['ok' => false, 'error' => 'run_mismatch'];
     }
-    if (!ipmiKvmBugLogTokenMatchesActiveRun($token)) {
+    if (!ipmiKvmBugLogTokenMatchesActiveRun($token, $mysqli)) {
         return ['ok' => false, 'error' => 'token_suffix_mismatch'];
     }
     $section = (string) ($payload['section'] ?? 'BROWSER');
@@ -848,11 +961,11 @@ function ipmiKvmBugLogIngestBrowserEvent(mysqli $mysqli, array $payload): array
             || $reason === 'max_ticks'
             || str_contains($reason, 'mark_run_closed');
         if (!$bypassSettle && !ipmiKvmRunStateCanFinalize($mysqli, $token, ['quiet_seconds' => 12])) {
-            ipmiKvmBugLogAppendSection('NOTE', 'event: kvm_run_finalize_deferred | note: settle_window_not_quiet_since_last_meaningful_browser_relay_or_console_event');
+            ipmiKvmBugLogAppendSection('NOTE', 'event: kvm_run_finalize_deferred | note: settle_window_not_quiet_since_last_meaningful_browser_relay_or_console_event', $mysqli, $token);
 
             return ['ok' => true];
         }
-        ipmiKvmBugLogAppendSection('NOTE', 'event: kvm_run_finalize_received | note: flush deferred [FINAL] (browser unload, settle passed, or force_finalize)');
+        ipmiKvmBugLogAppendSection('NOTE', 'event: kvm_run_finalize_received | note: flush deferred [FINAL] (browser unload, settle passed, or force_finalize)', $mysqli, $token);
         ipmiKvmBugLogPatchFinalFromSessionOrMinimal($mysqli, $token);
         ipmiKvmRunStateAdvance($mysqli, $token, 'run_finalized', []);
 
@@ -870,7 +983,7 @@ function ipmiKvmBugLogIngestBrowserEvent(mysqli $mysqli, array $payload): array
     $dedupeKey = $noise['noise'] ? $noise['key'] : '';
     $skipLine = $dedupeKey !== '' && isset($evDedupe[$dedupeKey]);
     if (!$skipLine) {
-        ipmiKvmBugLogAppendSection($section, $line);
+        ipmiKvmBugLogAppendSection($section, $line, $mysqli, $token);
     }
     if ($dedupeKey !== '') {
         ipmiKvmBrowserLogRecordNoiseStats($mysqli, $token, $dedupeKey, $skipLine, $detail);
@@ -1573,7 +1686,7 @@ function ipmiKvmBugLogAppendOncePerRun(mysqli $mysqli, string $token, string $on
         $ref['go'] = true;
     });
     if (!empty($ref['go'])) {
-        ipmiKvmBugLogAppendSection($section, $lineBody);
+        ipmiKvmBugLogAppendSection($section, $lineBody, $mysqli, $token);
     }
 }
 
@@ -1644,7 +1757,7 @@ function ipmiKvmRunStateAdvance(mysqli $mysqli, string $token, string $phase, ar
  */
 function ipmiKvmRunStateCanFinalize(mysqli $mysqli, string $token, array $opts = []): bool
 {
-    if (!ipmiKvmBugLogCanFinalizeRun($token)) {
+    if (!ipmiKvmBugLogCanFinalizeRun($mysqli, $token)) {
         return false;
     }
     if (!empty($opts['force']) || !empty($opts['bypass_settle'])) {
@@ -1669,9 +1782,9 @@ function ipmiKvmRecordShellAbandonReason(mysqli $mysqli, string $token, string $
     $ev0 = is_array($me['kvm_buglog_dedupe']['events'] ?? null) ? $me['kvm_buglog_dedupe']['events'] : [];
     if (!isset($ev0[$bugKey])) {
         if ($reasonCode === 'SHELL_LAUNCH_NO_EFFECT') {
-            ipmiKvmBugLogAppendBug('SHELL_LAUNCH_NO_EFFECT', 'Shell HTML5 launch left DOM/transport unchanged', $detailMaterial);
+            ipmiKvmBugLogAppendBug('SHELL_LAUNCH_NO_EFFECT', 'Shell HTML5 launch left DOM/transport unchanged', $mysqli, $token, $detailMaterial);
         } else {
-            ipmiKvmBugLogAppendBug($reasonCode, 'Shell abandon reason recorded', $detailMaterial);
+            ipmiKvmBugLogAppendBug($reasonCode, 'Shell abandon reason recorded', $mysqli, $token, $detailMaterial);
         }
     }
     ipmiWebSessionMetaMutate($mysqli, $token, static function (array &$meta) use ($bugKey): void {
@@ -1772,8 +1885,12 @@ function ipmiKvmBugLogPatchFinalBlock(array $payload, ?mysqli $mysqli = null): v
 {
     $detail = is_array($payload['detail'] ?? null) ? $payload['detail'] : [];
     $verdict = trim((string) ($detail['verdict'] ?? 'pending'));
-    $path = ipmiKvmBugLogRootPath();
-    if (!is_readable($path)) {
+    $tok = strtolower(trim((string) ($payload['token'] ?? '')));
+    $path = null;
+    if ($mysqli instanceof mysqli && preg_match('/^[a-f0-9]{64}$/', $tok)) {
+        $path = ipmiKvmBugFilePathForRun($mysqli, $tok);
+    }
+    if ($path === null || $path === '' || !is_readable($path)) {
         return;
     }
     $raw = file_get_contents($path);
@@ -1827,7 +1944,6 @@ function ipmiKvmBugLogPatchFinalBlock(array $payload, ?mysqli $mysqli = null): v
 
     $refreshCount = 0;
     $noiseSummary = 'none';
-    $tok = strtolower(trim((string) ($payload['token'] ?? '')));
     if ($mysqli instanceof mysqli && preg_match('/^[a-f0-9]{64}$/', $tok)) {
         $sess = ipmiWebLoadSession($mysqli, $tok);
         if ($sess) {
@@ -1932,7 +2048,7 @@ function ipmiKvmBugLogPatchFinalBlock(array $payload, ?mysqli $mysqli = null): v
         . $line('transport_verdict_snapshot', ($merged['transport_verdict_snapshot'] ?? '') !== '' ? (string) $merged['transport_verdict_snapshot'] : 'unknown')
         . $line('final_failure_reason', $failureReason !== '' ? $failureReason : 'none')
         . $line('ended_at_utc', $ended)
-        . $line('aggregate_source', 'full_bugs_txt_scan_relay_transport_browser_browser_console_transcript_helper_server_plus_last_kvm_final_summary_snapshot | final_refresh_count=' . (string) $refreshCount)
+        . $line('aggregate_source', 'per_run_bug_file_full_scan_relay_transport_browser_console_transcript_helper_server_plus_last_kvm_final_summary_snapshot | final_refresh_count=' . (string) $refreshCount)
         . "==================================================\n"
         . "KVM RUN END\n";
 
@@ -2139,13 +2255,15 @@ function ipmiProxyIloAbandonShellPath(mysqli $mysqli, string $token, string $bug
     $me = is_array($session['session_meta'] ?? null) ? $session['session_meta'] : [];
     $ev0 = is_array($me['kvm_buglog_dedupe']['events'] ?? null) ? $me['kvm_buglog_dedupe']['events'] : [];
     if (!isset($ev0[$bugKey])) {
-        ipmiKvmBugLogAppendBug($bugCode, 'Shell KVM path abandoned', $bmcPath);
+        ipmiKvmBugLogAppendBug($bugCode, 'Shell KVM path abandoned', $mysqli, $token, $bmcPath);
     }
     if (!isset($ev0[$srvKey])) {
         ipmiKvmBugLogAppendSection(
             'SERVER',
             'event: shell_path_abandoned_for_application | code: ' . $bugCode
-                . ($bmcPath !== '' ? ' | bmc_path: ' . substr($bmcPath, 0, 120) : '')
+                . ($bmcPath !== '' ? ' | bmc_path: ' . substr($bmcPath, 0, 120) : ''),
+            $mysqli,
+            $token
         );
     }
     ipmiWebSessionMetaMutate($mysqli, $token, static function (array &$meta) use ($bugKey, $srvKey): void {
@@ -2190,7 +2308,7 @@ function ipmiKvmBrowserLogNormalize(array $row): string
     return ipmiKvmBugLogNormalizeBrowserEvent($row);
 }
 
-function ipmiKvmBrowserLogAppend(string $section, string $event, $detail = null): void
+function ipmiKvmBrowserLogAppend(mysqli $mysqli, string $token, string $section, string $event, $detail = null): void
 {
     ipmiKvmBugLogAppendSection(
         $section,
@@ -2198,7 +2316,9 @@ function ipmiKvmBrowserLogAppend(string $section, string $event, $detail = null)
             'section' => $section,
             'event'   => $event,
             'detail'  => $detail,
-        ])
+        ]),
+        $mysqli,
+        strtolower($token)
     );
 }
 
@@ -2265,9 +2385,17 @@ function ipmiProxyIloRejectHeuristicOnlySuccess(array $browserSnapshot): bool
         || !empty($browserSnapshot['renderer_only']);
 }
 
-function ipmiProxyIloFinalizeStrongConfirmation(string $verdict): void
+function ipmiProxyIloFinalizeStrongConfirmation(mysqli $mysqli, string $token, string $verdict): void
 {
-    ipmiKvmBugLogAppendSection('FINAL', 'event: finalize_marker | verdict: ' . substr(trim($verdict), 0, 120));
+    if (!preg_match('/^[a-f0-9]{64}$/', strtolower($token))) {
+        return;
+    }
+    ipmiKvmBugLogAppendSection(
+        'FINAL',
+        'event: finalize_marker | verdict: ' . substr(trim($verdict), 0, 120),
+        $mysqli,
+        strtolower($token)
+    );
 }
 
 function ipmiProxyIloStopShellPollingAfterPromotion(mysqli $mysqli, string $token): void

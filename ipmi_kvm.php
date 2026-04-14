@@ -31,7 +31,8 @@ $error = '';
 $launchUrl = null;
 $launchPath = null;
 $launchPlan = null;
-$kvmBugAttemptBegan = false;
+$tok = null;
+$bugStart = null;
 
 try {
     if ($serverId <= 0) {
@@ -43,8 +44,6 @@ try {
 
     ipmiWebCleanupExpiredSessions($mysqli);
     $sessionData = ipmiWebCreateSession($mysqli, $serverId, $userId, $role, 7200);
-    ipmiKvmBugLogBeginPanelAttempt($serverId);
-    $kvmBugAttemptBegan = true;
 
     $launchPlan = ipmiWebResolveKvmLaunchPlan($sessionData, $mysqli);
     if ((string) ($launchPlan['delivery_tier'] ?? '') === 'kvm_unavailable'
@@ -55,7 +54,7 @@ try {
     $launchPath = (string) ($launchPlan['kvm_entry_path'] ?? '/');
     $launchUrl = ipmiWebBuildProxyUrlWithDelivery((string) $sessionData['token'], $launchPath, $launchPlan);
     $tok = strtolower((string) $sessionData['token']);
-    $runId = ipmiKvmBugLogStartRun([
+    $bugStart = ipmiKvmBugLogStartRun([
         'token'            => $tok,
         'panel_entry'      => 'ipmi_kvm.php?id=' . $serverId,
         'service_id'       => (string) $serverId,
@@ -69,20 +68,30 @@ try {
         'delivery_tier'    => (string) ($launchPlan['delivery_tier'] ?? ''),
         'user_facing_mode' => (string) ($launchPlan['user_facing_kvm_mode'] ?? ''),
     ]);
+    if (trim((string) ($bugStart['bug_file_rel'] ?? '')) === '') {
+        throw new Exception('KVM diagnostic log could not be created (check that the bugs/ directory is writable).');
+    }
+    $runId = (string) ($bugStart['run_id'] ?? '');
     $runStartTs = time();
-    ipmiWebSessionMetaMutate($mysqli, $tok, static function (array &$meta) use ($runId, $tok, $runStartTs): void {
+    ipmiWebSessionMetaMutate($mysqli, $tok, static function (array &$meta) use ($runId, $tok, $runStartTs, $bugStart): void {
         $meta['kvm_buglog_run'] = [
-            'v'            => 1,
-            'run_id'       => $runId,
-            'token_suffix' => substr($tok, -8),
-            'started_utc'  => gmdate('c') . 'Z',
+            'v'               => 1,
+            'run_id'          => $runId,
+            'bug_file_rel'    => (string) ($bugStart['bug_file_rel'] ?? ''),
+            'bug_file_index'  => (int) ($bugStart['bug_file_index'] ?? 0),
+            'token_suffix'    => substr($tok, -8),
+            'started_utc'     => gmdate('c') . 'Z',
         ];
         $meta['kvm_buglog_last_meaningful_event_ts'] = $runStartTs;
         $meta['kvm_buglog_console_seq'] = 0;
     });
+    ipmiKvmRunStateAdvance($mysqli, $tok, 'bug_file_created', [
+        'run_initialized'   => 1,
+        'kvm_buglog_run_id'   => $runId,
+        'bug_file_rel'        => (string) ($bugStart['bug_file_rel'] ?? ''),
+        'bug_file_index'      => (int) ($bugStart['bug_file_index'] ?? 0),
+    ]);
     ipmiKvmRunStateAdvance($mysqli, $tok, 'plan_selected', [
-        'run_initialized'        => 1,
-        'kvm_buglog_run_id'      => $runId,
         'plan_kvm_entry_path'    => $launchPath,
         'plan_launch_strategy'   => (string) ($launchPlan['launch_strategy'] ?? ''),
         'plan_vendor_family'     => (string) ($launchPlan['vendor_family'] ?? ''),
@@ -99,12 +108,19 @@ try {
     }
 } catch (Throwable $e) {
     $error = $e->getMessage();
-    if ($kvmBugAttemptBegan) {
+    if ($tok !== null
+        && preg_match('/^[a-f0-9]{64}$/', $tok)
+        && ipmiKvmBugLogHasOpenRun($mysqli, $tok)) {
         $enc = json_encode(
             ['message' => substr($error, 0, 400)],
             JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE
         );
-        ipmiKvmBugLogAppendSection('SERVER', 'event: kvm_panel_launch_failed | detail: ' . (is_string($enc) ? $enc : '{}'));
+        ipmiKvmBugLogAppendSection(
+            'SERVER',
+            'event: kvm_panel_launch_failed | detail: ' . (is_string($enc) ? $enc : '{}'),
+            $mysqli,
+            $tok
+        );
     }
 }
 
