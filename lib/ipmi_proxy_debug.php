@@ -78,6 +78,7 @@
  * Browser KVM transport health: ipmi_ws_relay_client_open, ipmi_ws_relay_handshake_ok, ipmi_ws_relay_handshake_error, ipmi_ws_relay_first_frame,
  * ilo_transport_health_{provisional,confirmed,failed}, ilo_transport_{handshake_ok,handshake_failed,frame_flow_started},
  * ilo_strong_confirmation_rejected_transport_unhealthy, ilo_native_console_strongly_confirmed (strong success only after relay frame flow).
+ * KVM bugs.txt [FINAL] rewrite: kvm_buglog_final_transport_matrix (aggregate + merged browser snapshot; mirrors transport_* lines when proxy debug on).
  * iLO strict native-console confirmation (capability vs reach vs session vs live display): ilo_confirmation_signals_collected,
  * ilo_confirmation_{weak_only,reached_not_ready,strong}, ilo_confirmation_failed_{shell_only,loading_only},
  * ilo_runtime_js_generation_{started,validated,invalid,fixed} (brace / tail sanity on injected autolaunch; fixed emitted when validation passes;

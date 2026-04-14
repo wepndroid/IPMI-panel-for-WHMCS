@@ -16,6 +16,28 @@ require_once __DIR__ . '/lib/ipmi_proxy_debug.php';
 require_once __DIR__ . '/lib/ipmi_kvm_buglog.php';
 
 // ---------------------------------------------------------------------------
+// Sustained frame-flow thresholds (must match bugs.txt aggregate semantics).
+// ---------------------------------------------------------------------------
+/** @return array{min_bmc_bytes: int, min_bmc_frames: int} */
+function ipmiWsRelaySustainedFlowThresholds(): array
+{
+    return ['min_bmc_bytes' => 4096, 'min_bmc_frames' => 12];
+}
+
+/**
+ * True once BMC→browser bytes/frames cross bounded sustained-flow thresholds.
+ */
+function ipmiWsRelayObserveSustainedFrameFlow(int $bytesFromBmc, int $framesBmc, bool $alreadyObserved): bool
+{
+    if ($alreadyObserved) {
+        return true;
+    }
+    $t = ipmiWsRelaySustainedFlowThresholds();
+
+    return $bytesFromBmc >= $t['min_bmc_bytes'] && $framesBmc >= $t['min_bmc_frames'];
+}
+
+// ---------------------------------------------------------------------------
 // Helper: structured debug log
 // ---------------------------------------------------------------------------
 function ipmiWsRelayDebugEvent(string $event, array $detail = []): void
@@ -31,8 +53,9 @@ function ipmiWsRelayDebugEvent(string $event, array $detail = []): void
         error_log(implode(' ', $parts));
     }
     $tok = $GLOBALS['__ipmi_ws_relay_buglog_token'] ?? null;
+    global $mysqli;
     if (is_string($tok) && preg_match('/^[a-f0-9]{64}$/', $tok) && function_exists('ipmiKvmBugLogRelayDebugEvent')) {
-        ipmiKvmBugLogRelayDebugEvent($tok, $event, $detail);
+        ipmiKvmBugLogRelayDebugEvent($tok, $event, $detail, $mysqli instanceof mysqli ? $mysqli : null);
     }
 }
 
@@ -540,13 +563,16 @@ $pumpErrors      = 0;
 $firstFrameSeen  = false;
 $idleExit        = false;
 $sustainedFlowObserved = false;
-$sustainedMinBmcBytes    = 4096;
-$sustainedMinBmcFrames   = 12;
+$sustainedThresholds = ipmiWsRelaySustainedFlowThresholds();
+$sustainedMinBmcBytes = $sustainedThresholds['min_bmc_bytes'];
+$sustainedMinBmcFrames = $sustainedThresholds['min_bmc_frames'];
 
 ipmiWsRelayDebugEvent('ipmi_ws_relay_frame_pump_started', [
-    'sapi'         => PHP_SAPI,
-    'deadline_sec' => 7200,
-    'idle_timeout' => $idleTimeoutSec,
+    'sapi'                      => PHP_SAPI,
+    'deadline_sec'              => 7200,
+    'idle_timeout'              => $idleTimeoutSec,
+    'sustained_min_bmc_bytes'   => $sustainedMinBmcBytes,
+    'sustained_min_bmc_frames'  => $sustainedMinBmcFrames,
 ]);
 
 while (!feof($remote) && time() < $deadline) {
@@ -601,7 +627,7 @@ while (!feof($remote) && time() < $deadline) {
                     'bytes' => strlen($data),
                 ]);
             }
-            if (!$sustainedFlowObserved && $bytesFromBmc >= $sustainedMinBmcBytes && $framesBmc >= $sustainedMinBmcFrames) {
+            if (!$sustainedFlowObserved && ipmiWsRelayObserveSustainedFrameFlow($bytesFromBmc, $framesBmc, false)) {
                 $sustainedFlowObserved = true;
                 ipmiWsRelayDebugEvent('ipmi_ws_relay_sustained_frame_flow_observed', [
                     'bytes_from_bmc' => $bytesFromBmc,
