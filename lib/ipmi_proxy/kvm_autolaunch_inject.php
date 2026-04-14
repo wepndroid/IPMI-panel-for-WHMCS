@@ -63,7 +63,31 @@ function ipmiProxyInjectKvmAutoLaunchPatch(string $html, string $token, $session
         'client_visible_kvm_state' => (string) ($plan['client_visible_kvm_state'] ?? ''),
         'speculative_shell_abandoned' => !empty($plan['speculative_shell_abandoned']) ? 1 : 0,
         'preferred_native_path' => (string) ($plan['preferred_native_path'] ?? ''),
+        'shell_runtime_forbidden' => !empty($plan['shell_runtime_forbidden']) ? 1 : 0,
+        'kvm_forced_application_path' => !empty($plan['kvm_forced_application_path']) ? 1 : 0,
+        'effective_kvm_entry_path' => (string) ($plan['effective_kvm_entry_path'] ?? $plan['kvm_entry_path'] ?? '/'),
+        'effective_launch_strategy' => (string) ($plan['effective_launch_strategy'] ?? $plan['launch_strategy'] ?? ''),
+        'run_initial_kvm_entry_path' => (string) ($plan['run_initial_kvm_entry_path'] ?? ''),
+        'run_initial_launch_strategy' => (string) ($plan['run_initial_launch_strategy'] ?? ''),
+        'kvm_run_path_state_snapshot' => is_array($plan['kvm_run_path_state_snapshot'] ?? null) ? $plan['kvm_run_path_state_snapshot'] : [],
     ];
+    $metaLite = is_array($session['session_meta'] ?? null) ? $session['session_meta'] : [];
+    if (
+        !empty($metaLite['kvm_buglog_run'])
+        && is_array($metaLite['kvm_buglog_run'])
+        && (string) ($metaLite['kvm_buglog_run']['run_id'] ?? '') !== ''
+    ) {
+        $planLite['kvm_buglog'] = [
+            'run_id'        => (string) $metaLite['kvm_buglog_run']['run_id'],
+            'ingest'        => '/ipmi_kvm_buglog_ingest.php',
+            'token_suffix'  => (string) ($metaLite['kvm_buglog_run']['token_suffix'] ?? ''),
+        ];
+    } else {
+        $planLite['kvm_buglog'] = null;
+    }
+    $planLite['kvm_shell_abandon'] = (isset($metaLite['kvm_shell_abandon']) && is_array($metaLite['kvm_shell_abandon']))
+        ? $metaLite['kvm_shell_abandon']
+        : null;
     $familyJs = json_encode((string) ($plan['vendor_family'] ?? 'generic'), JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_SLASHES);
     $planJs = json_encode($planLite, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_SLASHES);
     $px = '/ipmi_proxy.php/' . rawurlencode($token);

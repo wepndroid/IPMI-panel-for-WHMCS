@@ -215,6 +215,9 @@ function ipmiKvmBugLogStartRun(array $ctx): string
         '',
         '[BROWSER]',
         '',
+        '[BROWSER_CONSOLE]',
+        'note: ordered_transcript_appended_during_run_via_browser_ingest',
+        '',
         '[HELPER]',
         '',
         '[TRANSPORT]',
@@ -844,13 +847,14 @@ function ipmiKvmBugLogIngestBrowserEvent(mysqli $mysqli, array $payload): array
             || $reason === 'unload'
             || $reason === 'max_ticks'
             || str_contains($reason, 'mark_run_closed');
-        if (!$bypassSettle && !ipmiKvmBugLogSettleWindowPassed($mysqli, $token, 12)) {
+        if (!$bypassSettle && !ipmiKvmRunStateCanFinalize($mysqli, $token, ['quiet_seconds' => 12])) {
             ipmiKvmBugLogAppendSection('NOTE', 'event: kvm_run_finalize_deferred | note: settle_window_not_quiet_since_last_meaningful_browser_relay_or_console_event');
 
             return ['ok' => true];
         }
         ipmiKvmBugLogAppendSection('NOTE', 'event: kvm_run_finalize_received | note: flush deferred [FINAL] (browser unload, settle passed, or force_finalize)');
         ipmiKvmBugLogPatchFinalFromSessionOrMinimal($mysqli, $token);
+        ipmiKvmRunStateAdvance($mysqli, $token, 'run_finalized', []);
 
         return ['ok' => true];
     }
@@ -903,6 +907,9 @@ function ipmiKvmBugLogIngestBrowserEvent(mysqli $mysqli, array $payload): array
     ];
     if ($mysqli instanceof mysqli && isset($browserFinalPri[$ev])) {
         ipmiKvmBugLogMaybeRefreshFinalAfterRelayEvent($mysqli, $token, $browserFinalPri[$ev]);
+    }
+    if ($mysqli instanceof mysqli && $ev === 'browser_ws_attempted' && $detail !== []) {
+        ipmiKvmBrowserRelayCorrelationStore($mysqli, $token, $detail);
     }
 
     ipmiKvmBugLogTouchMeaningfulEvent($mysqli, $token);
@@ -1104,6 +1111,9 @@ function ipmiKvmBugLogAugmentAggregateFromTranscript(string $raw, array $agg): a
             }
             if (str_contains($low, 'ilo_console_stalled') || (str_contains($low, 'max_ticks') && str_contains($low, 'reason'))) {
                 $agg['browser_stalled_max_ticks_count']++;
+            }
+            if (str_contains($low, "reading 'children'") || str_contains($low, 'reading "children"') || str_contains($low, "cannot read properties of null")) {
+                $agg['browser_null_children_access_count']++;
             }
         }
     }
@@ -1477,6 +1487,7 @@ function ipmiKvmBugLogDeriveFinalTransportHealthy(array $agg, array $merged, str
         'launch_discovery_failed',
         'launch_action_no_effect',
         'launch_reached_renderer_only',
+        'native_console_strongly_rejected_incomplete_evidence',
     ], true);
     if ($badVerdict) {
         return false;
@@ -1587,6 +1598,60 @@ function ipmiKvmRunStateStore(mysqli $mysqli, string $token, array $patch): void
         $prev = is_array($meta['kvm_run_path_state'] ?? null) ? $meta['kvm_run_path_state'] : [];
         $meta['kvm_run_path_state'] = array_merge($prev, $patch + ['v' => 1]);
     });
+}
+
+/**
+ * Bump shell exit-stub injection counter (bounded promotion loop breaker).
+ */
+function ipmiKvmRunStateBumpShellExitStub(mysqli $mysqli, string $token): void
+{
+    if (!preg_match('/^[a-f0-9]{64}$/', strtolower($token))) {
+        return;
+    }
+    $tok = strtolower($token);
+    ipmiWebSessionMetaMutate($mysqli, $tok, static function (array &$meta): void {
+        $st = is_array($meta['kvm_run_path_state'] ?? null) ? $meta['kvm_run_path_state'] : [];
+        $st['shell_exit_stub_inject_count'] = (int) ($st['shell_exit_stub_inject_count'] ?? 0) + 1;
+        $st['v'] = 1;
+        $meta['kvm_run_path_state'] = $st;
+    });
+}
+
+/**
+ * Advance run-scoped KVM lifecycle / FSM markers (session meta).
+ *
+ * @param array<string, mixed> $extra Merged into kvm_run_path_state
+ */
+function ipmiKvmRunStateAdvance(mysqli $mysqli, string $token, string $phase, array $extra = []): void
+{
+    if (!preg_match('/^[a-f0-9]{64}$/', strtolower($token))) {
+        return;
+    }
+    $phase = substr(preg_replace('/[^a-z0-9_]/i', '_', $phase), 0, 48);
+    if ($phase === '') {
+        return;
+    }
+    ipmiKvmRunStateStore($mysqli, strtolower($token), array_merge([
+        'lifecycle_current' => $phase,
+        'lifecycle_ts'      => time(),
+    ], $extra));
+}
+
+/**
+ * Finalize allowed: active run + token + optional settle window (or force / bypass).
+ *
+ * @param array<string, mixed> $opts force|bypass_settle|quiet_seconds
+ */
+function ipmiKvmRunStateCanFinalize(mysqli $mysqli, string $token, array $opts = []): bool
+{
+    if (!ipmiKvmBugLogCanFinalizeRun($token)) {
+        return false;
+    }
+    if (!empty($opts['force']) || !empty($opts['bypass_settle'])) {
+        return true;
+    }
+
+    return ipmiKvmBugLogSettleWindowPassed($mysqli, $token, (int) ($opts['quiet_seconds'] ?? 12));
 }
 
 /**
@@ -1792,8 +1857,23 @@ function ipmiKvmBugLogPatchFinalBlock(array $payload, ?mysqli $mysqli = null): v
     $transportUnstable = !empty($agg['transport_unstable']) ? 'yes' : 'no';
     $transportFailed = !empty($agg['transport_failed']) ? 'yes' : 'no';
 
+    if ($verdict === 'native_console_strongly_confirmed') {
+        if ($appLoaded !== 'yes'
+            || $promotionCommitted !== 'yes'
+            || !$transportHealthy
+            || $reinjectAfterAbandon === 'yes'
+            || $transportUnstable === 'yes') {
+            $verdict = 'native_console_strongly_rejected_incomplete_evidence';
+            $resolved['source'] = 'aggregate_transport_gate';
+            if ($failureReason === '' || strtolower($failureReason) === 'none') {
+                $failureReason = 'strong_confirmation_rejected_missing_application_transport_or_unstable';
+            }
+        }
+    }
+
     $finalBody = '[FINAL]' . "\n"
         . $line('verdict', $verdict !== '' ? $verdict : 'pending')
+        . $line('final_verdict', $verdict !== '' ? $verdict : 'pending')
         . $line('verdict_source', (string) ($resolved['source'] ?? 'browser'))
         . $line('shell_loop_metrics', (string) ($resolved['shell_loop_metrics'] ?? ''))
         . $line('plan_initial_selected_path', $initialPlanPath !== '' ? $initialPlanPath : 'unknown')
@@ -1821,6 +1901,8 @@ function ipmiKvmBugLogPatchFinalBlock(array $payload, ?mysqli $mysqli = null): v
         . $line('browser_console_info_count', (string) ((int) ($agg['browser_console_info_count'] ?? 0)))
         . $line('browser_console_debug_count', (string) ((int) ($agg['browser_console_debug_count'] ?? 0)))
         . $line('browser_dom_exception_count', (string) ((int) ($agg['browser_dom_exception_count'] ?? 0)))
+        . $line('browser_null_children_access_count', (string) ((int) ($agg['browser_null_children_access_count'] ?? 0)))
+        . $line('browser_fetch_502_count', (string) ((int) ($agg['browser_fetch_502_count'] ?? 0)))
         . $line('browser_unhandled_exception_count', (string) ((int) ($agg['browser_unhandled_exception_count'] ?? 0)))
         . $line('browser_unhandled_rejection_count', (string) ((int) ($agg['browser_unhandled_rejection_count'] ?? 0)))
         . $line('browser_transport_verdict_tick_count', (string) ((int) ($agg['browser_transport_verdict_tick_count'] ?? 0)))
@@ -2219,7 +2301,23 @@ function ipmiKvmTransportAttemptIdPropagate(string $attemptId): string
  */
 function ipmiKvmBrowserRelayCorrelationStore(mysqli $mysqli, string $token, array $row): void
 {
-    unset($mysqli, $token, $row);
+    if (!preg_match('/^[a-f0-9]{64}$/', strtolower($token))) {
+        return;
+    }
+    $tok = strtolower($token);
+    $aid = trim((string) ($row['attempt_id'] ?? ''));
+    if ($aid === '' || strcasecmp($aid, 'none') === 0) {
+        return;
+    }
+    $aid = substr(preg_replace('/[^a-zA-Z0-9_.-]/', '', $aid), 0, 64);
+    if ($aid === '') {
+        return;
+    }
+    ipmiWebSessionMetaMutate($mysqli, $tok, static function (array &$meta) use ($aid): void {
+        $ids = is_array($meta['kvm_browser_ws_attempt_ids'] ?? null) ? $meta['kvm_browser_ws_attempt_ids'] : [];
+        $ids[] = $aid;
+        $meta['kvm_browser_ws_attempt_ids'] = array_slice(array_values(array_unique($ids)), -32);
+    });
 }
 
 /**

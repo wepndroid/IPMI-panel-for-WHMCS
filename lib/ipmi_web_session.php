@@ -3930,12 +3930,10 @@ function ipmiWebKvmApplyRunScopedShellAbandonOverride(array $plan, array $sessio
         $plan['run_initial_kvm_entry_path'] = $prePath;
         $plan['run_initial_launch_strategy'] = $preStrat;
     }
-    $forceHtml5 = !empty($plan['html5_markers']);
-    $appPath = $forceHtml5
-        ? '/html/application.html?ipmi_kvm_auto=1&ipmi_kvm_force_html5=1'
-        : '/html/application.html?ipmi_kvm_auto=1';
+    // Authoritative promotion: always target native HTML5 application route for the run (panel-proxied).
+    $appPath = '/html/application.html?ipmi_kvm_auto=1&ipmi_kvm_force_html5=1';
     $plan['kvm_entry_path'] = $appPath;
-    $plan['launch_strategy'] = $forceHtml5 ? 'ilo_application_force_html5' : 'ilo_application_autolaunch';
+    $plan['launch_strategy'] = 'ilo_application_force_html5';
     $plan['effective_kvm_entry_path'] = $appPath;
     $plan['effective_launch_strategy'] = (string) $plan['launch_strategy'];
     $plan['shell_runtime_forbidden'] = true;

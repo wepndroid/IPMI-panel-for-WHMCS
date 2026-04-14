@@ -493,6 +493,7 @@ function ipmiProxyKvmConsoleCaptureAndDomGuardJs(): string
         . 'if(!window.__ipmi_kvm_oep){window.__ipmi_kvm_oep=1;var _oe0=window.onerror;window.onerror=function(m,u,l,col,err){try{_emit("error",String(u||"window")+":"+String(l||0),"browser_unhandled_exception",{msg:String(m||""),col:col,stack:err&&err.stack?String(err.stack).substring(0,500):""});}catch(e){}if(typeof _oe0==="function")return _oe0.apply(this,arguments);return false;};}'
         . 'try{window.addEventListener("unhandledrejection",function(ev){try{var r=ev&&ev.reason;_emit("error","window","browser_unhandled_rejection",{msg:r&&r.stack?String(r.stack).substring(0,600):String(r)});}catch(e){}});}catch(e){}'
         . 'try{if(typeof window.fetch==="function"&&!window.fetch.__ipmi_k){var _f0=window.fetch;window.fetch=function(inp,init){return _f0.apply(this,arguments).then(function(resp){try{if(resp&&(!resp.ok)&&resp.status>=400){var u="";try{u=(typeof inp==="string")?inp:(inp&&inp.url)||"";}catch(e){}u=String(u).substring(0,220);_emit("error","fetch","browser_fetch_"+String(resp.status),{url:u,status:resp.status});if(resp.status===502)_emit("error","fetch","browser_fetch_502",{url:u});}}catch(e){}return resp;},function(err){try{_emit("error","fetch","browser_fetch_rejected",{msg:String(err&&err.message||err)});}catch(e){}throw err;});};window.fetch.__ipmi_k=1;}}catch(e){}'
+        . 'try{if(window.XMLHttpRequest&&XMLHttpRequest.prototype&&!XMLHttpRequest.prototype.__ipmi_kxhr){var _xo=XMLHttpRequest.prototype.open;var _xs=XMLHttpRequest.prototype.send;XMLHttpRequest.prototype.open=function(m,u){try{this.__ipmi_xhr_u=u;}catch(e){}return _xo.apply(this,arguments);};XMLHttpRequest.prototype.send=function(){try{var self=this;if(!self.__ipmi_kxhr_le){self.__ipmi_kxhr_le=1;self.addEventListener("loadend",function(){try{var st=self.status|0;if(st>=400){var u="";try{u=String(self.__ipmi_xhr_u||self.responseURL||"");}catch(e2){}u=u.substring(0,220);_emit("error","xhr","browser_fetch_"+String(st),{url:u,status:st});if(st===502)_emit("error","xhr","browser_fetch_502",{url:u});}}catch(e3){}});}}catch(e4){}return _xs.apply(this,arguments);};XMLHttpRequest.prototype.__ipmi_kxhr=1;}}catch(e5){}'
         . 'try{if(typeof MutationObserver!=="undefined"&&MutationObserver.prototype&&!MutationObserver.prototype.__ipmi_kmo){var _m0=MutationObserver.prototype.observe;MutationObserver.prototype.__ipmi_kmo=1;MutationObserver.prototype.observe=function(t,opts){try{if(t==null||!(t instanceof Node)){_emit("error","mutation_observer.patch","browser_mutation_observer_invalid_target",{why:"not_a_node"});return;}return _m0.call(this,t,opts);}catch(ex){_emit("error","mutation_observer.patch","browser_mutation_observer_observe_threw",{msg:String(ex&&ex.message||ex)});throw ex;}};}}catch(e){}'
         . '})();}catch(e){}';
 }
@@ -989,7 +990,7 @@ function ipmiProxyBuildKvmRuntimeProgressHelpersJs(): string
         . 'function kvmHookWsRelayOnWindow(w){try{'
         . 'if(!w||!w.WebSocket||w.__ipmi_kvm_ws_progress_hook)return;'
         . 'w.__ipmi_kvm_ws_progress_hook=true;var W0=w.WebSocket;'
-        . 'w.WebSocket=function(u,p){var urlStr=(typeof u==="string")?u:String(u||"");var low=urlStr.toLowerCase();var isRelay=(low.indexOf("ipmi_ws_relay")>=0);var sock,aug=u,attemptId="";if(isRelay){try{kvmBugSyncTokenGlobally();}catch(_s0){}attemptId=ipmiKvmTransportAttemptIdCreate();try{aug=ipmiKvmBrowserRelayCorrelationAugmentUrl(urlStr,attemptId);}catch(_a0){aug=u;}}'
+        . 'w.WebSocket=function(u,p){var urlStr=(typeof u==="string")?u:String(u||"");var low=urlStr.toLowerCase();var isRelay=(low.indexOf("ipmi_ws_relay")>=0||low.indexOf("/wss/")>=0||low.indexOf("/ws/")>=0);var sock,aug=u,attemptId="";if(isRelay){try{kvmBugSyncTokenGlobally();}catch(_s0){}attemptId=ipmiKvmTransportAttemptIdCreate();try{aug=ipmiKvmBrowserRelayCorrelationAugmentUrl(urlStr,attemptId);}catch(_a0){aug=u;}}'
         . 'try{sock=new W0(aug,p);}catch(ce){if(isRelay){try{ipmiKvmWsBump("__ipmi_kvm_ws_construct_failed",1);ipmiKvmWsBump("__ipmi_kvm_ws_handshake_failed",1);window.__ipmi_kvm_ws_last_error=String(ce.message||"").substring(0,200);var n0=ipmiKvmBrowserSocketNormalizeUrl(urlStr);_kvmDbg("ipmi_ws_relay_construct_error",{relay_url_norm:n0.relay_url_norm,err:String(ce.message||"").substring(0,120),attempt_id:attemptId});try{kvmBugSend("BROWSER","browser_ws_failed_connect",{attempt_id:attemptId,phase:"construct",err:String(ce.message||"").substring(0,120),relay_url_norm:n0.relay_url_norm,target_host_masked:n0.target_host_masked,target_path_masked:n0.target_path_masked,token_suffix:n0.token_suffix});}catch(_k1){}try{_kvmConEmit("error","browser_ws_failed_connect",{phase:"construct",attempt_id:attemptId,relay_url_norm:n0.relay_url_norm,err:String(ce.message||"").substring(0,160)});}catch(_k1b){}try{kvmBugSend("TRANSPORT","browser_ws_construct_failed",{attempt_id:attemptId,err:String(ce.message||"").substring(0,120),relay_url_norm:n0.relay_url_norm});}catch(_k2){}}catch(_ce){}}throw ce;}'
         . 'var opened=0;if(isRelay){try{var n1=ipmiKvmBrowserSocketNormalizeUrl(urlStr);try{kvmBugSend("BROWSER","browser_ws_attempted",{attempt_id:attemptId,relay_url_norm:n1.relay_url_norm,target_host_masked:n1.target_host_masked,target_path_masked:n1.target_path_masked,token_suffix:n1.token_suffix,run_id:String((KVM_BUGLOG&&KVM_BUGLOG.run_id)||"")});}catch(_ba){}try{_kvmConEmit("info","browser_ws_attempted",{attempt_id:attemptId,relay_url_norm:n1.relay_url_norm,target_host_masked:n1.target_host_masked});}catch(_bab){}try{var Tt=ipmiKvmWsTop();Tt.__ipmi_kvm_ws_relay_ts=kvmNow();w.__ipmi_kvm_ws_relay_ts=kvmNow();}catch(_ts0){}ipmiKvmWsBump("__ipmi_kvm_ws_connect_attempted",1);_kvmDbg("ipmi_ws_relay_client_open",{attempt_id:attemptId,attempt_n:window.__ipmi_kvm_ws_connect_attempted||1,relay_url_norm:n1.relay_url_norm});try{kvmBugSend("TRANSPORT","browser_ws_relay_connect_attempted",{attempt_id:attemptId,attempt_n:window.__ipmi_kvm_ws_connect_attempted||1,relay_url_norm:n1.relay_url_norm});}catch(_kbc){}}catch(_ts){}}'
         . 'try{sock.addEventListener("open",function(){try{opened=1;window.__ipmi_kvm_ws_last_msg_ts=kvmNow();ipmiKvmWsBump("__ipmi_kvm_ws_handshake_ok",1);window.__ipmi_kvm_ws_open_ts=kvmNow();var nh=ipmiKvmBrowserSocketNormalizeUrl(urlStr);_kvmDbg("ipmi_ws_relay_handshake_ok",{attempt_id:attemptId,ok_count:window.__ipmi_kvm_ws_handshake_ok||1});try{kvmBugSend("TRANSPORT","browser_ws_handshake_succeeded",{attempt_id:attemptId,relay_url_norm:nh.relay_url_norm});}catch(_o1){}}catch(_o){}});}catch(_ol){}'
@@ -1559,13 +1560,22 @@ function ipmiProxyClassifyIloHtmlDocument(string $bmcPath, string $html = ''): s
  *
  * @return string One of: main_runtime, shell_runtime, shell_exit_stub, helper_runtime_minimal, no_runtime, debug_stub_only.
  */
-function ipmiProxyDetermineIloPatchMode(string $pageType, ?array $plan = null): string
+function ipmiProxyDetermineIloPatchMode(string $pageType, ?array $plan = null, ?array $session = null): string
 {
     switch ($pageType) {
         case 'ilo_main_application_page':
             return 'main_runtime';
         case 'ilo_shell_page':
             if (!empty($plan['shell_runtime_forbidden'])) {
+                $stubCount = 0;
+                if (is_array($session)) {
+                    $st = ipmiKvmRunStateLoad($session);
+                    $stubCount = (int) ($st['shell_exit_stub_inject_count'] ?? 0);
+                }
+                if ($stubCount >= 14) {
+                    return 'no_runtime';
+                }
+
                 return 'shell_exit_stub';
             }
 
@@ -1654,6 +1664,67 @@ function ipmiProxyBuildIloShellExitStubJs(string $exitProxyUrlJsLiteral): string
         . 'if(typeof location.replace==="function"){location.replace(U);}else{location.href=U;}'
         . '}catch(e){}'
         . '})();';
+}
+
+/**
+ * After bounded shell_exit_stub injections, avoid full shell runtime: buglog + console + single promotion navigation.
+ * SessionStorage ensures at most one client-side navigation per tab (PHP no_runtime stops further exit stubs).
+ */
+function ipmiProxyBuildIloShellLoopBreakerMinimalJs(string $pxJs, string $dbgLit, string $exitProxyUrlJsLiteral, ?array $kvmBuglog = null): string
+{
+    $je = JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_SLASHES;
+    $kbJs = json_encode($kvmBuglog, $je);
+    if ($kbJs === false) {
+        $kbJs = 'null';
+    }
+
+    return '(function(){'
+        . 'var P=' . $pxJs . ';var DBG=' . $dbgLit . ';var U=' . $exitProxyUrlJsLiteral . ';var KVM_BUGLOG=' . $kbJs . ';'
+        . 'try{if(KVM_BUGLOG&&KVM_BUGLOG.run_id){window.__ipmi_kvm_buglog_plan=KVM_BUGLOG;try{if(window.top)window.top.__ipmi_kvm_buglog_plan=KVM_BUGLOG;}catch(_hk){}}}catch(_hj){}'
+        . ipmiProxyKvmBuglogClientCoreJs()
+        . 'try{kvmBugSyncTokenGlobally();}catch(_hbst){}'
+        . ipmiProxyKvmConsoleCaptureAndDomGuardJs()
+        . 'try{if(typeof window.addEventListener==="function"){window.addEventListener("pagehide",function(){try{kvmBugSyncTokenGlobally();kvmBugFinalizeRun({reason:"shell_loop_break_pagehide",force_finalize:1});}catch(_phh){}},true);}}catch(_pehh){}'
+        . 'function _kvmDbg(ev,extra){try{if(!DBG)return;if(window.console&&console.info)console.info("[ipmi-kvm]",ev,extra!=null?extra:"");}catch(e){}}'
+        . 'try{_kvmDbg("ilo_shell_loop_break_minimal",{note:"php_no_runtime_after_stub_cap"});}catch(_e0){}'
+        . 'try{kvmBugSend("BROWSER","shell_loop_break_minimal_client",{note:"bounded_stub_cap_client_nav_once"});}catch(_e1){}'
+        . 'try{'
+        . 'var p=String(location.pathname||"").toLowerCase();'
+        . 'if(p.indexOf("application.html")>=0)return;'
+        . 'if(!window.sessionStorage)return;'
+        . 'if(sessionStorage.getItem("_ipmi_kvm_loop_break_nav_done")==="1")return;'
+        . 'sessionStorage.setItem("_ipmi_kvm_loop_break_nav_done","1");'
+        . 'if(typeof location.replace==="function"){location.replace(U);}else{location.href=U;}'
+        . '}catch(e2){}'
+        . '})();';
+}
+
+/**
+ * Whether an iLO HTML page type is a secondary console helper (jnlp_template, etc.).
+ */
+function ipmiProxyIloDetectSecondaryConsoleHelper(string $pageType): bool
+{
+    return $pageType === 'ilo_secondary_console_helper_page';
+}
+
+/**
+ * Helper pages may contribute bootstrap / launch signals but must not override failed promotion or transport.
+ */
+function ipmiProxyIloHelperContributesToLaunch(string $pageType): bool
+{
+    return in_array($pageType, [
+        'ilo_secondary_console_helper_page',
+        'ilo_helper_page',
+        'ilo_frame_candidate_page',
+    ], true);
+}
+
+/**
+ * When true, helper-side “healthy” hints must not flip aggregate success (caller enforces in FINAL / readiness).
+ */
+function ipmiProxyIloHelperCannotOverrideFailure(bool $transportHealthy, bool $applicationPromotionCommitted): bool
+{
+    return !$transportHealthy || !$applicationPromotionCommitted;
 }
 
 /**
@@ -1793,7 +1864,7 @@ function ipmiProxyInjectKvmAutoLaunchPatch(string $html, string $token, $session
         ? ipmiProxyClassifyIloHtmlDocument($bmcPath, $html)
         : 'ilo_unknown_html_page';
     $patchMode = ($plan['vendor_family'] ?? '') === 'ilo'
-        ? ipmiProxyDetermineIloPatchMode($pageType, $plan)
+        ? ipmiProxyDetermineIloPatchMode($pageType, $plan, $session)
         : 'main_runtime';
     if (ipmiProxyDebugEnabled()) {
         ipmiProxyDebugLog('ilo_runtime_patch_mode_selected', [
@@ -1805,7 +1876,7 @@ function ipmiProxyInjectKvmAutoLaunchPatch(string $html, string $token, $session
     }
 
     if (ipmiProxyShouldInjectShellExitStub($patchMode)) {
-        $targetPath = (string) ($plan['kvm_entry_path'] ?? '/html/application.html?ipmi_kvm_auto=1');
+        $targetPath = (string) ($plan['effective_kvm_entry_path'] ?? $plan['kvm_entry_path'] ?? '/html/application.html?ipmi_kvm_auto=1&ipmi_kvm_force_html5=1');
         $exitFull = ipmiWebBuildProxyUrl($token, $targetPath);
         $exitJs = json_encode($exitFull, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_SLASHES);
         if ($exitJs === false) {
@@ -1839,6 +1910,9 @@ function ipmiProxyInjectKvmAutoLaunchPatch(string $html, string $token, $session
                 'event: ilo_main_runtime_injected | patch_mode: shell_exit_stub | page_type: ' . $pageType
             );
         }
+        if ($persistKvmPlanMysqli instanceof mysqli && preg_match('/^[a-f0-9]{64}$/i', $token)) {
+            ipmiKvmRunStateBumpShellExitStub($persistKvmPlanMysqli, strtolower($token));
+        }
 
         return ipmiProxyInjectIntoHtmlHeadOrBody($html, $patch);
     }
@@ -1868,6 +1942,54 @@ function ipmiProxyInjectKvmAutoLaunchPatch(string $html, string $token, $session
         }
         if (ipmiKvmBugLogTokenMatchesActiveRun($token)) {
             ipmiKvmBugLogAppendSection('SERVER', 'event: ilo_helper_runtime_injected | patch_mode: helper_minimal | page_type: ' . $pageType);
+        }
+
+        return ipmiProxyInjectIntoHtmlHeadOrBody($html, $patch);
+    }
+
+    // Bounded shell_exit_stub cap: do not inject full shell runtime (would regress to index.html loops).
+    if (ipmiProxyShouldInjectNoRuntime($patchMode)) {
+        $targetPath = (string) ($plan['effective_kvm_entry_path'] ?? $plan['kvm_entry_path'] ?? '/html/application.html?ipmi_kvm_auto=1&ipmi_kvm_force_html5=1');
+        $exitFull = ipmiWebBuildProxyUrl($token, $targetPath);
+        $exitJs = json_encode($exitFull, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_SLASHES);
+        if ($exitJs === false) {
+            $exitJs = '""';
+        }
+        $loopBreakBody = ipmiProxyBuildIloShellLoopBreakerMinimalJs($pxJs, $dbgLit, $exitJs, is_array($kvmBugForHelper) ? $kvmBugForHelper : null);
+        $injectMeta = [
+            'mode'       => 'shell_loop_break_minimal',
+            'js_ok'      => true,
+            'js_reason'  => '',
+            'js_depth'   => 0,
+            'page_type'  => $pageType,
+            'patch_mode' => $patchMode,
+        ];
+        $scriptOpen = '<script data-ipmi-proxy-kvm-autolaunch="1" data-ipmi-kvm-js-valid="1" data-ipmi-kvm-patch-mode="shell_loop_break_minimal">';
+        $patch = $scriptOpen . $loopBreakBody . '</script>';
+        if ($injectOut !== null) {
+            $injectOut = $injectMeta;
+        }
+        if (ipmiProxyDebugEnabled()) {
+            ipmiProxyDebugLog('ilo_shell_loop_break_minimal_injected', [
+                'page_type' => $pageType,
+                'target'    => substr($targetPath, 0, 160),
+                'effective_kvm_entry_path' => (string) ($plan['effective_kvm_entry_path'] ?? $plan['kvm_entry_path'] ?? ''),
+            ]);
+        }
+        if (ipmiKvmBugLogTokenMatchesActiveRun($token)) {
+            ipmiKvmBugLogAppendSection(
+                'SERVER',
+                'event: ilo_shell_loop_break_minimal_injected | patch_mode: no_runtime | page_type: ' . $pageType
+                    . ' | note: application_promotion_single_client_nav_after_stub_cap'
+            );
+        }
+        if ($persistKvmPlanMysqli instanceof mysqli && preg_match('/^[a-f0-9]{64}$/i', $token)) {
+            ipmiKvmRunStateStore($persistKvmPlanMysqli, strtolower($token), [
+                'path_state'                    => 'application_path_promoting',
+                'shell_loop_break_minimal_ts'   => time(),
+                'shell_stub_cap_reached'        => 1,
+            ]);
+            ipmiKvmRunStateAdvance($persistKvmPlanMysqli, strtolower($token), 'shell_stub_cap_loop_break', []);
         }
 
         return ipmiProxyInjectIntoHtmlHeadOrBody($html, $patch);

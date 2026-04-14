@@ -80,6 +80,13 @@ try {
         $meta['kvm_buglog_last_meaningful_event_ts'] = $runStartTs;
         $meta['kvm_buglog_console_seq'] = 0;
     });
+    ipmiKvmRunStateAdvance($mysqli, $tok, 'plan_selected', [
+        'run_initialized'        => 1,
+        'kvm_buglog_run_id'      => $runId,
+        'plan_kvm_entry_path'    => $launchPath,
+        'plan_launch_strategy'   => (string) ($launchPlan['launch_strategy'] ?? ''),
+        'plan_vendor_family'     => (string) ($launchPlan['vendor_family'] ?? ''),
+    ]);
     if ($debugProxy) {
       $launchUrl .= (str_contains($launchUrl, '?') ? '&' : '?') . 'ipmi_proxy_debug=1';
       $summary = ipmiWebKvmPlanLogSummary($launchPlan);
