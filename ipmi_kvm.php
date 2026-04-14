@@ -73,15 +73,12 @@ try {
     }
     $runId = (string) ($bugStart['run_id'] ?? '');
     $runStartTs = time();
-    ipmiWebSessionMetaMutate($mysqli, $tok, static function (array &$meta) use ($runId, $tok, $runStartTs, $bugStart): void {
-        $meta['kvm_buglog_run'] = [
-            'v'               => 1,
-            'run_id'          => $runId,
-            'bug_file_rel'    => (string) ($bugStart['bug_file_rel'] ?? ''),
-            'bug_file_index'  => (int) ($bugStart['bug_file_index'] ?? 0),
-            'token_suffix'    => substr($tok, -8),
-            'started_utc'     => gmdate('c') . 'Z',
-        ];
+    ipmiKvmBugFileBindRun($mysqli, $tok, [
+        'run_id'         => $runId,
+        'bug_file_rel'   => (string) ($bugStart['bug_file_rel'] ?? ''),
+        'bug_file_index' => (int) ($bugStart['bug_file_index'] ?? 0),
+    ]);
+    ipmiWebSessionMetaMutate($mysqli, $tok, static function (array &$meta) use ($runStartTs): void {
         $meta['kvm_buglog_last_meaningful_event_ts'] = $runStartTs;
         $meta['kvm_buglog_console_seq'] = 0;
     });

@@ -1,3 +1,2 @@
-# Local KVM diagnostic log (per-run)
-bugs.txt
-bugs
+# Local KVM diagnostic log (per-run) 
+bugs/*.txt

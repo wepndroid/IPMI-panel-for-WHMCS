@@ -86,7 +86,7 @@ function ipmiProxyRewriteIloSocketJs(string $body, string $bmcPath, string $toke
     }
 
     $targetWs = (($bmcScheme === 'http') ? 'ws' : 'wss') . '://' . $bmcIp . '/wss/ircport';
-    $replacement = 'this.sessionKey = options.sessionKey, this.sockaddr = ((self.location && self.location.protocol === "https:") ? "wss://" : "ws://") + ((self.location && self.location.host) ? self.location.host : options.host) + "/ipmi_ws_relay.php?token='
+    $replacement = 'this.sessionKey = options.sessionKey, this.sockaddr = (function(){var S=false;try{if(typeof window!=="undefined"&&window.top&&window.top.location&&window.top.location.protocol==="https:")S=true;}catch(e1){}try{if(!S&&self.location&&self.location.protocol==="https:")S=true;}catch(e2){}return S?"wss://":"ws://";})()+((function(){try{if(typeof window!=="undefined"&&window.top&&window.top.location&&window.top.location.host)return window.top.location.host;}catch(e3){}try{if(self.location&&self.location.host)return self.location.host;}catch(e4){}return options.host;})())+"/ipmi_ws_relay.php?token='
         . rawurlencode($token)
         . '&target=" + encodeURIComponent('
         . json_encode($targetWs, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_SLASHES)
@@ -118,8 +118,22 @@ function ipmiProxyRewriteIloSocketJs(string $body, string $bmcPath, string $toke
         $body,
         1
     );
+    if (is_string($updated2)) {
+        $body = $updated2;
+    }
 
-    return is_string($updated2) ? $updated2 : $body;
+    $needleTight = 'this.sessionKey = options.sessionKey,this.sockaddr="wss://"+options.host+"/wss/ircport",';
+    if (strpos($body, $needleTight) !== false) {
+        return str_replace($needleTight, $replacement, $body);
+    }
+    $updated3 = preg_replace(
+        '/this\.sessionKey\s*=\s*options\.sessionKey\s*,\s*this\.sockaddr\s*=\s*"wss:\/\/"\s*\+\s*options\.host\s*\+\s*"\/wss\/ircport"\s*,/s',
+        $replacement,
+        $body,
+        1
+    );
+
+    return is_string($updated3) ? $updated3 : $body;
 }
 
 /**

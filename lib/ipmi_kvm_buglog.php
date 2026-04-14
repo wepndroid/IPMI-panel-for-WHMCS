@@ -217,6 +217,35 @@ function ipmiKvmBugFilePathForRun(mysqli $mysqli, string $token): ?string
 }
 
 /**
+ * Persist kvm_buglog_run file binding (same fields as ipmi_kvm.php after ipmiKvmBugLogStartRun).
+ *
+ * @param array{run_id: string, bug_file_rel: string, bug_file_index?: int} $bind
+ */
+function ipmiKvmBugFileBindRun(mysqli $mysqli, string $token, array $bind): void
+{
+    if (!preg_match('/^[a-f0-9]{64}$/', strtolower($token))) {
+        return;
+    }
+    $tok = strtolower($token);
+    $runId = trim((string) ($bind['run_id'] ?? ''));
+    $rel = trim((string) ($bind['bug_file_rel'] ?? ''));
+    if ($runId === '' || $rel === '' || str_contains($rel, '..') || str_starts_with($rel, '/')) {
+        return;
+    }
+    $idx = (int) ($bind['bug_file_index'] ?? 0);
+    ipmiWebSessionMetaMutate($mysqli, $tok, static function (array &$meta) use ($runId, $rel, $idx, $tok): void {
+        $meta['kvm_buglog_run'] = [
+            'v'              => 1,
+            'run_id'         => $runId,
+            'bug_file_rel'   => $rel,
+            'bug_file_index' => $idx,
+            'token_suffix'   => substr($tok, -8),
+            'started_utc'    => gmdate('c') . 'Z',
+        ];
+    });
+}
+
+/**
  * @deprecated Legacy singleton bugs.txt path; do not use for writes. Kept for one-off tooling only.
  */
 function ipmiKvmBugLogRootPath(): string
