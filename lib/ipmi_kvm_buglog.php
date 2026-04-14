@@ -388,6 +388,9 @@ function ipmiKvmBugLogMaybeRefreshFinalAfterRelayEvent(mysqli $mysqli, string $t
     }
 
     if ($pri >= 1 && $hasFinal && $hasStored) {
+        if (!ipmiKvmBugLogSettleWindowPassed($mysqli, $token, 12)) {
+            return;
+        }
         if (($now - $lastTs) < (($pri >= 2) ? 2 : 5)) {
             return;
         }
@@ -445,8 +448,148 @@ function ipmiKvmBugLogRelayDebugEvent(string $token, string $event, array $detai
     }
     ipmiKvmBugLogAppendSection('TRANSPORT', 'event: ' . implode(' ', $parts));
     if ($mysqli instanceof mysqli) {
+        ipmiKvmBugLogTouchMeaningfulEvent($mysqli, $token);
         ipmiKvmBugLogMaybeRefreshFinalAfterRelayEvent($mysqli, $token, $event);
     }
+}
+
+/**
+ * Update session timestamp for settle-window finalization (browser + relay + console).
+ */
+function ipmiKvmBugLogTouchMeaningfulEvent(?mysqli $mysqli, string $token): void
+{
+    if (!$mysqli instanceof mysqli || !preg_match('/^[a-f0-9]{64}$/', strtolower($token))) {
+        return;
+    }
+    $tok = strtolower($token);
+    ipmiWebSessionMetaMutate($mysqli, $tok, static function (array &$meta): void {
+        $meta['kvm_buglog_last_meaningful_event_ts'] = time();
+    });
+}
+
+/**
+ * Next monotonic seq for [BROWSER_CONSOLE] lines (server-assigned when client sends 0).
+ */
+function ipmiKvmBugLogNextBrowserConsoleSeq(mysqli $mysqli, string $token): int
+{
+    if (!preg_match('/^[a-f0-9]{64}$/', strtolower($token))) {
+        return 0;
+    }
+    $tok = strtolower($token);
+    $seq = 0;
+    ipmiWebSessionMetaMutate($mysqli, $tok, static function (array &$meta) use (&$seq): void {
+        $seq = (int) ($meta['kvm_buglog_console_seq'] ?? 0) + 1;
+        $meta['kvm_buglog_console_seq'] = $seq;
+    });
+
+    return $seq;
+}
+
+/**
+ * Append one ordered console transcript line (no noise dedupe — full stream).
+ *
+ * @param array<string, mixed>|string|null $detailMsg
+ */
+function ipmiKvmBugLogAppendBrowserConsoleLine(
+    ?mysqli $mysqli,
+    string $token,
+    int $clientSeq,
+    string $level,
+    string $source,
+    string $eventText,
+    $detailMsg
+): void {
+    if (!ipmiKvmBugLogTokenMatchesActiveRun($token)) {
+        return;
+    }
+    $level = strtolower(preg_replace('/[^a-z]/', '', $level) ?? '');
+    if ($level === '') {
+        $level = 'log';
+    }
+    $level = substr($level, 0, 12);
+    $source = str_replace(["\r", "\n"], ' ', substr(trim($source), 0, 160));
+    $eventText = str_replace(["\r", "\n"], ' ', substr(trim($eventText), 0, 220));
+    if ($detailMsg !== null && !is_string($detailMsg)) {
+        $detailMsg = json_encode($detailMsg, JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE);
+    }
+    $detailStr = is_string($detailMsg) ? trim($detailMsg) : '';
+    $detailStr = str_replace(["\r", "\n"], ' ', $detailStr);
+    $detailStr = ipmiKvmBugLogMaskSecrets($detailStr, 12);
+    if (strlen($detailStr) > 900) {
+        $detailStr = substr($detailStr, 0, 900) . '…';
+    }
+    $seq = $clientSeq > 0 ? $clientSeq : 0;
+    if ($seq <= 0 && $mysqli instanceof mysqli) {
+        $seq = ipmiKvmBugLogNextBrowserConsoleSeq($mysqli, $token);
+    }
+    if ($seq <= 0) {
+        $seq = 1;
+    }
+    $line = 'seq: ' . $seq
+        . ' | level: ' . $level
+        . ' | source: ' . ($source !== '' ? $source : 'browser')
+        . ' | event: ' . ($eventText !== '' ? $eventText : 'line')
+        . ' | detail: ' . ($detailStr !== '' ? $detailStr : '-');
+    ipmiKvmBugLogAppendSection('BROWSER_CONSOLE', $line);
+    if ($mysqli instanceof mysqli) {
+        ipmiKvmBugLogTouchMeaningfulEvent($mysqli, $token);
+    }
+}
+
+/**
+ * Remove prior [BROWSER_SUMMARY] block before rewriting at [FINAL] time.
+ */
+function ipmiKvmBugLogStripBrowserSummarySection(string $raw): string
+{
+    $next = preg_replace('#(?:\n\[BROWSER_SUMMARY\][^\n]*)+#', "\n", $raw);
+    $next = is_string($next) ? preg_replace('#(?:\n\[BROWSER\] norm_summary \|[^\n]*)+#', "\n", $next) : $raw;
+
+    return is_string($next) ? $next : $raw;
+}
+
+/**
+ * Regenerated normalized browser summary (counts from aggregate scan).
+ *
+ * @param array<string, mixed> $agg
+ */
+function ipmiKvmBugLogFormatBrowserSummarySection(array $agg): string
+{
+    $pfx = '[BROWSER] norm_summary | ';
+    $lines = [
+        $pfx . 'note: recomputed_when_[FINAL]_refreshed_from_full_bugs_txt_scan',
+    ];
+    $lines[] = $pfx . 'event: browser_console_entry_count | count: ' . (string) ((int) ($agg['browser_console_entry_count'] ?? 0));
+    $lines[] = $pfx . 'event: browser_console_error_count | count: ' . (string) ((int) ($agg['browser_console_error_count'] ?? 0));
+    $lines[] = $pfx . 'event: browser_console_warn_count | count: ' . (string) ((int) ($agg['browser_console_warn_count'] ?? 0));
+    $lines[] = $pfx . 'event: browser_ws_attempted | signal: ' . (!empty($agg['browser_ws_attempted']) ? 'yes' : 'no');
+    $lines[] = $pfx . 'event: browser_ws_failed_connect | count: ' . (string) ((int) ($agg['browser_ws_failed_connect_count'] ?? 0));
+    $lines[] = $pfx . 'event: browser_ws_error | count: ' . (string) ((int) ($agg['browser_ws_socket_error_events'] ?? 0));
+    $lines[] = $pfx . 'event: browser_ws_handshake_fail_lines | count: ' . (string) ((int) ($agg['browser_ws_error_count'] ?? 0));
+    $lines[] = $pfx . 'event: browser_ws_close | count: ' . (string) ((int) ($agg['browser_ws_close_count'] ?? 0));
+    $lines[] = $pfx . 'event: browser_dom_exception | count: ' . (string) ((int) ($agg['browser_dom_exception_count'] ?? 0));
+    $lines[] = $pfx . 'event: browser_mutation_observer_invalid_target | count: ' . (string) ((int) ($agg['browser_mutation_observer_invalid_target_count'] ?? 0));
+    $lines[] = $pfx . 'event: browser_null_children_access | count: ' . (string) ((int) ($agg['browser_null_children_access_count'] ?? 0));
+    $lines[] = $pfx . 'event: browser_unhandled_exception | count: ' . (string) ((int) ($agg['browser_unhandled_exception_count'] ?? 0));
+    $lines[] = $pfx . 'event: browser_unhandled_rejection | count: ' . (string) ((int) ($agg['browser_unhandled_rejection_count'] ?? 0));
+    $lines[] = $pfx . 'event: browser_fetch_http_error | count: ' . (string) ((int) ($agg['browser_fetch_http_error_count'] ?? 0));
+    $lines[] = $pfx . 'event: browser_fetch_502 | count: ' . (string) ((int) ($agg['browser_fetch_502_count'] ?? 0));
+    $lines[] = $pfx . 'event: browser_transport_verdict_tick | latest: ' . (trim((string) ($agg['browser_transport_verdict_last'] ?? '')) !== ''
+        ? substr(trim((string) $agg['browser_transport_verdict_last']), 0, 80)
+        : 'unknown');
+    $lines[] = $pfx . 'event: relay_request_count | count: ' . (string) ((int) ($agg['relay_request_count'] ?? 0));
+    $lines[] = $pfx . 'event: relay_browser_attempt_correlated | count: ' . (string) ((int) ($agg['relay_browser_attempt_correlated_count'] ?? 0));
+    $lines[] = $pfx . 'event: relay_browser_attempt_none | count: ' . (string) ((int) ($agg['relay_browser_attempt_none_count'] ?? 0));
+    $ids = trim((string) ($agg['browser_attempt_ids_seen_csv'] ?? ''));
+    $noneN = (int) ($agg['relay_browser_attempt_none_count'] ?? 0);
+    $corrN = (int) ($agg['relay_browser_attempt_correlated_count'] ?? 0);
+    $mismatch = $ids !== '' && $noneN > 0 && $corrN === 0;
+    $lines[] = $pfx . 'event: relay_correlation_mismatch_suspected | signal: ' . ($mismatch ? 'yes' : 'no');
+    $lines[] = $pfx . 'event: browser_attempt_ids_seen | ids: ' . ($ids !== '' ? $ids : 'none');
+    $lines[] = $pfx . 'event: browser_stalled_max_ticks | count: ' . (string) ((int) ($agg['browser_stalled_max_ticks_count'] ?? 0));
+    $lines[] = $pfx . 'event: session_ready_heuristic | signal: ' . (!empty($agg['session_ready_signal']) ? 'yes' : 'no');
+    $lines[] = $pfx . 'event: live_display_heuristic | signal: ' . (!empty($agg['live_display_heuristic_signal']) ? 'yes' : 'no');
+
+    return implode("\n", $lines);
 }
 
 /**
@@ -664,12 +807,49 @@ function ipmiKvmBugLogIngestBrowserEvent(mysqli $mysqli, array $payload): array
 
     if ($ev === 'kvm_final_summary') {
         ipmiKvmBugLogPersistLastFinalPayload($mysqli, $token, $payload);
+        ipmiKvmBugLogTouchMeaningfulEvent($mysqli, $token);
+
+        return ['ok' => true];
+    }
+
+    if ($ev === 'browser_console_line' && strtoupper(trim($section)) === 'BROWSER_CONSOLE') {
+        $d = is_array($detail) ? $detail : [];
+        $evName = strtolower(trim((string) ($d['event'] ?? '')));
+        ipmiKvmBugLogAppendBrowserConsoleLine(
+            $mysqli,
+            $token,
+            (int) ($d['seq'] ?? 0),
+            (string) ($d['level'] ?? 'log'),
+            (string) ($d['source'] ?? ''),
+            (string) ($d['event'] ?? 'line'),
+            $d['detail'] ?? ($d['message'] ?? null)
+        );
+        if ($evName === 'browser_mutation_observer_invalid_target') {
+            ipmiKvmBugLogAppendOncePerRun($mysqli, $token, 'b_mo_inv', 'BUG', 'code: BROWSER_MUTATION_OBSERVER_INVALID_TARGET | summary: MutationObserver.observe skipped non-Node target');
+        }
+        if ($evName === 'browser_null_children_access') {
+            ipmiKvmBugLogAppendOncePerRun($mysqli, $token, 'b_null_ch', 'BUG', 'code: BROWSER_NULL_CHILDREN_ACCESS | summary: Safe-guarded null/undefined .children access in patched code path');
+        }
 
         return ['ok' => true];
     }
 
     if ($ev === 'kvm_run_finalize') {
-        ipmiKvmBugLogAppendSection('NOTE', 'event: kvm_run_finalize_received | note: flush deferred [FINAL] (browser unload or explicit finalize)');
+        $fd = is_array($payload['detail'] ?? null) ? $payload['detail'] : [];
+        $force = !empty($fd['force_finalize']) || !empty($fd['force']);
+        $reason = strtolower(trim((string) ($fd['reason'] ?? '')));
+        $bypassSettle = $force
+            || $reason === 'pagehide'
+            || $reason === 'helper_pagehide'
+            || $reason === 'unload'
+            || $reason === 'max_ticks'
+            || str_contains($reason, 'mark_run_closed');
+        if (!$bypassSettle && !ipmiKvmBugLogSettleWindowPassed($mysqli, $token, 12)) {
+            ipmiKvmBugLogAppendSection('NOTE', 'event: kvm_run_finalize_deferred | note: settle_window_not_quiet_since_last_meaningful_browser_relay_or_console_event');
+
+            return ['ok' => true];
+        }
+        ipmiKvmBugLogAppendSection('NOTE', 'event: kvm_run_finalize_received | note: flush deferred [FINAL] (browser unload, settle passed, or force_finalize)');
         ipmiKvmBugLogPatchFinalFromSessionOrMinimal($mysqli, $token);
 
         return ['ok' => true];
@@ -725,6 +905,8 @@ function ipmiKvmBugLogIngestBrowserEvent(mysqli $mysqli, array $payload): array
         ipmiKvmBugLogMaybeRefreshFinalAfterRelayEvent($mysqli, $token, $browserFinalPri[$ev]);
     }
 
+    ipmiKvmBugLogTouchMeaningfulEvent($mysqli, $token);
+
     return ['ok' => true];
 }
 
@@ -764,7 +946,7 @@ function ipmiKvmBugLogComputeAggregateFromRaw(string $raw): array
         'browser_ws_socket_error_events'  => 0,
     ];
     if ($raw === '') {
-        return $agg;
+        return ipmiKvmBugLogAugmentAggregateFromTranscript('', $agg);
     }
     $agg['relay_request_count'] = substr_count($raw, 'ipmi_ws_relay_request_received');
     $agg['browser_ws_failed_connect_count'] = (int) preg_match_all('/event:\s*browser_ws_failed_connect\b/', $raw);
@@ -836,6 +1018,132 @@ function ipmiKvmBugLogComputeAggregateFromRaw(string $raw): array
         || !empty($agg['upstream_connect_attempted'])
         || ((int) ($agg['relay_pump_starts'] ?? 0) > 0)
         || ((int) ($agg['relay_request_count'] ?? 0) > 0);
+
+    return ipmiKvmBugLogAugmentAggregateFromTranscript($raw, $agg);
+}
+
+/**
+ * Derive browser-console transcript metrics + relay/browser_attempt correlation from full bugs.txt.
+ *
+ * @param array<string, mixed> $agg
+ * @return array<string, mixed>
+ */
+function ipmiKvmBugLogAugmentAggregateFromTranscript(string $raw, array $agg): array
+{
+    if ($raw === '') {
+        return $agg;
+    }
+    $agg['browser_console_entry_count'] = 0;
+    $agg['browser_console_error_count'] = 0;
+    $agg['browser_console_warn_count'] = 0;
+    $agg['browser_console_log_count'] = 0;
+    $agg['browser_console_info_count'] = 0;
+    $agg['browser_console_debug_count'] = 0;
+    $agg['browser_dom_exception_count'] = 0;
+    $agg['browser_mutation_observer_invalid_target_count'] = 0;
+    $agg['browser_null_children_access_count'] = 0;
+    $agg['browser_unhandled_exception_count'] = 0;
+    $agg['browser_unhandled_rejection_count'] = 0;
+    $agg['browser_fetch_http_error_count'] = 0;
+    $agg['browser_fetch_502_count'] = 0;
+    $agg['browser_transport_verdict_tick_count'] = (int) preg_match_all('/event:\s*browser_transport_verdict_tick\b/', $raw);
+    $agg['browser_stalled_max_ticks_count'] = 0;
+    $agg['browser_console_socket_error_lines'] = 0;
+    $agg['relay_browser_attempt_correlated_count'] = 0;
+    $agg['relay_browser_attempt_none_count'] = 0;
+    $agg['relay_requests_correlated_to_browser_attempts'] = 0;
+    $agg['browser_attempt_ids_seen_csv'] = '';
+
+    if (preg_match_all('/^\[BROWSER_CONSOLE\]\s+(.+)$/m', $raw, $cm)) {
+        $agg['browser_console_entry_count'] = count($cm[1]);
+        foreach ($cm[1] as $line) {
+            if (preg_match('/\|\s*level:\s*(\w+)\s*\|/', $line, $lm)) {
+                $lv = strtolower($lm[1]);
+                if ($lv === 'error') {
+                    $agg['browser_console_error_count']++;
+                } elseif ($lv === 'warn') {
+                    $agg['browser_console_warn_count']++;
+                } elseif ($lv === 'info') {
+                    $agg['browser_console_info_count']++;
+                } elseif ($lv === 'debug') {
+                    $agg['browser_console_debug_count']++;
+                } else {
+                    $agg['browser_console_log_count']++;
+                }
+            }
+            if (preg_match('/\|\s*event:\s*([^|]+)\s*\|/', $line, $em)) {
+                $enet = trim($em[1]);
+                $el = strtolower($enet);
+                if ($el === 'browser_unhandled_exception' || str_contains($el, 'uncaught')) {
+                    $agg['browser_unhandled_exception_count']++;
+                }
+                if ($el === 'browser_unhandled_rejection') {
+                    $agg['browser_unhandled_rejection_count']++;
+                }
+                if ($el === 'browser_mutation_observer_invalid_target') {
+                    $agg['browser_mutation_observer_invalid_target_count']++;
+                }
+                if ($el === 'browser_null_children_access') {
+                    $agg['browser_null_children_access_count']++;
+                }
+                if (preg_match('/^browser_fetch_(\d+)$/', $enet, $fm)) {
+                    $agg['browser_fetch_http_error_count']++;
+                    if ($fm[1] === '502') {
+                        $agg['browser_fetch_502_count']++;
+                    }
+                }
+            }
+            $low = strtolower($line);
+            if (str_contains($low, 'domexception')
+                || (str_contains($low, 'mutationobserver') && str_contains($low, "not of type 'node'"))
+                || str_contains($low, 'not of type "node"')) {
+                $agg['browser_dom_exception_count']++;
+            }
+            if (str_contains($low, 'socket.js') && str_contains($low, 'level: error')) {
+                $agg['browser_console_socket_error_lines']++;
+            }
+            if (str_contains($low, 'ilo_console_stalled') || (str_contains($low, 'max_ticks') && str_contains($low, 'reason'))) {
+                $agg['browser_stalled_max_ticks_count']++;
+            }
+        }
+    }
+
+    $attemptIds = [];
+    if (preg_match_all('/browser_attempt=([^\s&]+)/', $raw, $am)) {
+        foreach ($am[1] as $aid) {
+            $aid = trim($aid, ',');
+            if ($aid !== '' && strcasecmp($aid, 'none') !== 0) {
+                $attemptIds[$aid] = true;
+            }
+        }
+    }
+    if (preg_match_all('/"attempt_id"\s*:\s*"([^"]+)"/', $raw, $jm)) {
+        foreach ($jm[1] as $aid) {
+            if ($aid !== '' && strcasecmp($aid, 'none') !== 0) {
+                $attemptIds[$aid] = true;
+            }
+        }
+    }
+    $ids = array_keys($attemptIds);
+    sort($ids);
+    $agg['browser_attempt_ids_seen_csv'] = $ids !== [] ? implode(',', array_slice($ids, 0, 24)) : '';
+
+    if (preg_match_all('/ipmi_ws_relay_request_received[^\n]*browser_attempt=([^\s&]+)/', $raw, $rm)) {
+        foreach ($rm[1] as $ba) {
+            $ba = trim($ba, ',');
+            if ($ba === '' || strcasecmp($ba, 'none') === 0) {
+                $agg['relay_browser_attempt_none_count']++;
+            } else {
+                $agg['relay_browser_attempt_correlated_count']++;
+            }
+        }
+    }
+    $agg['relay_requests_correlated_to_browser_attempts'] = (int) $agg['relay_browser_attempt_correlated_count'];
+
+    $wsConsoleEv = (int) preg_match_all('/\|\s*event:\s*browser_ws_(failed_connect|error)\b/', $raw);
+    if (((int) ($agg['browser_console_socket_error_lines'] ?? 0)) >= 1 || $wsConsoleEv >= 1) {
+        $agg['browser_ws_attempted'] = true;
+    }
 
     return $agg;
 }
@@ -935,6 +1243,15 @@ function ipmiKvmTransportAggregateFinalize(array $agg): array
         if ($pumps >= 2 && ($upWsFail >= 1 || $idle || $httpErr >= 1)) {
             $out['transport_unstable'] = true;
         }
+    }
+
+    $bSockLines = (int) ($agg['browser_console_socket_error_lines'] ?? 0);
+    if ($bSockLines >= 2 && $partial) {
+        $out['transport_unstable'] = true;
+    }
+    $relN = (int) ($agg['relay_request_count'] ?? 0);
+    if ($bSockLines >= 3 && $relN >= 1) {
+        $out['transport_unstable'] = true;
     }
 
     $out['transport_failed'] = false;
@@ -1497,6 +1814,20 @@ function ipmiKvmBugLogPatchFinalBlock(array $payload, ?mysqli $mysqli = null): v
         . $line('browser_ws_error_count', (string) ((int) ($agg['browser_ws_error_count'] ?? 0)))
         . $line('browser_ws_close_count', (string) ((int) ($agg['browser_ws_close_count'] ?? 0)))
         . $line('browser_ws_failed_connect_count', (string) ((int) ($agg['browser_ws_failed_connect_count'] ?? 0)))
+        . $line('browser_console_entry_count', (string) ((int) ($agg['browser_console_entry_count'] ?? 0)))
+        . $line('browser_console_error_count', (string) ((int) ($agg['browser_console_error_count'] ?? 0)))
+        . $line('browser_console_warn_count', (string) ((int) ($agg['browser_console_warn_count'] ?? 0)))
+        . $line('browser_console_log_count', (string) ((int) ($agg['browser_console_log_count'] ?? 0)))
+        . $line('browser_console_info_count', (string) ((int) ($agg['browser_console_info_count'] ?? 0)))
+        . $line('browser_console_debug_count', (string) ((int) ($agg['browser_console_debug_count'] ?? 0)))
+        . $line('browser_dom_exception_count', (string) ((int) ($agg['browser_dom_exception_count'] ?? 0)))
+        . $line('browser_unhandled_exception_count', (string) ((int) ($agg['browser_unhandled_exception_count'] ?? 0)))
+        . $line('browser_unhandled_rejection_count', (string) ((int) ($agg['browser_unhandled_rejection_count'] ?? 0)))
+        . $line('browser_transport_verdict_tick_count', (string) ((int) ($agg['browser_transport_verdict_tick_count'] ?? 0)))
+        . $line('browser_stalled_max_ticks_count', (string) ((int) ($agg['browser_stalled_max_ticks_count'] ?? 0)))
+        . $line('browser_attempt_ids_seen', (string) ($agg['browser_attempt_ids_seen_csv'] ?? 'none'))
+        . $line('relay_requests_correlated_to_browser_attempts', (string) ((int) ($agg['relay_requests_correlated_to_browser_attempts'] ?? 0)))
+        . $line('browser_attempt_none_count', (string) ((int) ($agg['relay_browser_attempt_none_count'] ?? 0)))
         . $line('relay_request_count', (string) ((int) ($agg['relay_request_count'] ?? 0)))
         . $line('browser_noise_collapsed_summary', $noiseSummary)
         . $line('upstream_connect_attempted', (string) ($merged['upstream_connect_attempted'] ?? 'unknown'))
@@ -1519,7 +1850,7 @@ function ipmiKvmBugLogPatchFinalBlock(array $payload, ?mysqli $mysqli = null): v
         . $line('transport_verdict_snapshot', ($merged['transport_verdict_snapshot'] ?? '') !== '' ? (string) $merged['transport_verdict_snapshot'] : 'unknown')
         . $line('final_failure_reason', $failureReason !== '' ? $failureReason : 'none')
         . $line('ended_at_utc', $ended)
-        . $line('aggregate_source', 'full_bugs_txt_scan_relay_transport_browser_helper_server_plus_last_kvm_final_summary_snapshot | final_refresh_count=' . (string) $refreshCount)
+        . $line('aggregate_source', 'full_bugs_txt_scan_relay_transport_browser_browser_console_transcript_helper_server_plus_last_kvm_final_summary_snapshot | final_refresh_count=' . (string) $refreshCount)
         . "==================================================\n"
         . "KVM RUN END\n";
 
@@ -1538,7 +1869,13 @@ function ipmiKvmBugLogPatchFinalBlock(array $payload, ?mysqli $mysqli = null): v
             'browser_ws_error_count'        => (string) ((int) ($agg['browser_ws_error_count'] ?? 0)),
             'browser_ws_close_count'        => (string) ((int) ($agg['browser_ws_close_count'] ?? 0)),
             'browser_ws_failed_connect_count' => (string) ((int) ($agg['browser_ws_failed_connect_count'] ?? 0)),
+            'browser_console_entry_count'   => (string) ((int) ($agg['browser_console_entry_count'] ?? 0)),
+            'browser_console_error_count'   => (string) ((int) ($agg['browser_console_error_count'] ?? 0)),
+            'browser_console_warn_count'    => (string) ((int) ($agg['browser_console_warn_count'] ?? 0)),
+            'browser_dom_exception_count'   => (string) ((int) ($agg['browser_dom_exception_count'] ?? 0)),
             'relay_request_count'           => (string) ((int) ($agg['relay_request_count'] ?? 0)),
+            'relay_correlated_browser_attempt' => (string) ((int) ($agg['relay_requests_correlated_to_browser_attempts'] ?? 0)),
+            'relay_browser_attempt_none'    => (string) ((int) ($agg['relay_browser_attempt_none_count'] ?? 0)),
             'upstream_connect_attempted'    => (string) ($merged['upstream_connect_attempted'] ?? ''),
             'upstream_tls_ok'               => (string) ($merged['upstream_tls_ok'] ?? ''),
             'upstream_ws_ok'                => (string) ($merged['upstream_ws_ok'] ?? ''),
@@ -1553,7 +1890,9 @@ function ipmiKvmBugLogPatchFinalBlock(array $payload, ?mysqli $mysqli = null): v
     }
 
     $stripped = ipmiKvmBugLogStripFinalSections($raw);
-    $out = rtrim($stripped) . "\n\n" . $finalBody;
+    $stripped = ipmiKvmBugLogStripBrowserSummarySection($stripped);
+    $summaryBlock = ipmiKvmBugLogFormatBrowserSummarySection($agg);
+    $out = rtrim($stripped) . "\n\n" . $summaryBlock . "\n\n" . $finalBody;
 
     $fp = @fopen($path, 'cb');
     if ($fp === false) {
@@ -1894,13 +2233,26 @@ function ipmiKvmBrowserRelayCorrelationMerge(array $a, array $b): array
 }
 
 /**
- * Placeholder: true until kvm_buglog_last_transport_ts is maintained server-side per event.
+ * True when no meaningful browser/relay/console event for quietSeconds (session meta).
  */
 function ipmiKvmBugLogSettleWindowPassed(mysqli $mysqli, string $token, int $quietSeconds = 12): bool
 {
-    unset($mysqli, $token, $quietSeconds);
+    if (!preg_match('/^[a-f0-9]{64}$/', strtolower($token))) {
+        return true;
+    }
+    $tok = strtolower($token);
+    $session = ipmiWebLoadSession($mysqli, $tok);
+    if (!$session) {
+        return true;
+    }
+    $meta = $session['session_meta'] ?? [];
+    $last = (int) ($meta['kvm_buglog_last_meaningful_event_ts'] ?? 0);
+    if ($last <= 0) {
+        return true;
+    }
+    $quietSeconds = max(3, min(120, $quietSeconds));
 
-    return true;
+    return (time() - $last) >= $quietSeconds;
 }
 
 /**

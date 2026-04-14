@@ -69,13 +69,16 @@ try {
         'delivery_tier'    => (string) ($launchPlan['delivery_tier'] ?? ''),
         'user_facing_mode' => (string) ($launchPlan['user_facing_kvm_mode'] ?? ''),
     ]);
-    ipmiWebSessionMetaMutate($mysqli, $tok, static function (array &$meta) use ($runId, $tok): void {
+    $runStartTs = time();
+    ipmiWebSessionMetaMutate($mysqli, $tok, static function (array &$meta) use ($runId, $tok, $runStartTs): void {
         $meta['kvm_buglog_run'] = [
             'v'            => 1,
             'run_id'       => $runId,
             'token_suffix' => substr($tok, -8),
             'started_utc'  => gmdate('c') . 'Z',
         ];
+        $meta['kvm_buglog_last_meaningful_event_ts'] = $runStartTs;
+        $meta['kvm_buglog_console_seq'] = 0;
     });
     if ($debugProxy) {
       $launchUrl .= (str_contains($launchUrl, '?') ? '&' : '?') . 'ipmi_proxy_debug=1';
