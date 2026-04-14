@@ -3849,6 +3849,164 @@ function ipmiWebShouldAbandonIloSpeculativeShellLaunch(array $session, array $pl
 }
 
 /**
+ * Run-scoped KVM path state from session meta (iLO shell vs application promotion).
+ *
+ * @param array<string, mixed> $session
+ * @return array<string, mixed>
+ */
+function ipmiKvmRunStateLoad(array $session): array
+{
+    $meta = is_array($session['session_meta'] ?? null) ? $session['session_meta'] : [];
+
+    return is_array($meta['kvm_run_path_state'] ?? null) ? $meta['kvm_run_path_state'] : [];
+}
+
+/**
+ * True when this KVM run must not use speculative /index.html shell autolaunch again (one-way for the run).
+ *
+ * @param array<string, mixed> $session
+ */
+function ipmiKvmIsShellAbandonedForRun(array $session): bool
+{
+    $meta = is_array($session['session_meta'] ?? null) ? $session['session_meta'] : [];
+    $ab = is_array($meta['kvm_shell_abandon'] ?? null) ? $meta['kvm_shell_abandon'] : [];
+    if (trim((string) ($ab['reason'] ?? '')) !== '') {
+        return true;
+    }
+    $st = is_array($meta['kvm_run_path_state'] ?? null) ? $meta['kvm_run_path_state'] : [];
+    $ps = (string) ($st['path_state'] ?? '');
+    $terminal = ['shell_path_abandoned', 'application_path_promoting', 'application_path_active', 'application_path_confirmed'];
+
+    return in_array($ps, $terminal, true);
+}
+
+/**
+ * Whether the plan still points at the speculative iLO shell entry (/index.html or equivalent).
+ *
+ * @param array<string, mixed> $plan
+ */
+function ipmiWebKvmPlanLooksLikeIloShellFirstEntry(array $plan): bool
+{
+    $s = strtolower((string) ($plan['launch_strategy'] ?? ''));
+    if ($s === 'ilo_speculative_shell_autolaunch') {
+        return true;
+    }
+    $p = strtolower((string) ($plan['kvm_entry_path'] ?? ''));
+    if (str_contains($p, 'index.html')) {
+        return true;
+    }
+    if ($p === '/' || $p === '') {
+        return true;
+    }
+
+    return false;
+}
+
+/**
+ * After shell failure or speculative abandonment, force effective navigation to /html/application.html for the rest of the run.
+ * Idempotent; safe on every request including cache hits (must run even when _kvm_delivery_merged_v1 is set).
+ *
+ * @param array<string, mixed> $plan
+ * @param array<string, mixed> $session
+ * @return array<string, mixed>
+ */
+function ipmiWebKvmApplyRunScopedShellAbandonOverride(array $plan, array $session): array
+{
+    if ((string) ($plan['vendor_family'] ?? '') !== 'ilo') {
+        return $plan;
+    }
+    $onShellEntry = ipmiWebKvmPlanLooksLikeIloShellFirstEntry($plan);
+    $forceApp = ipmiKvmIsShellAbandonedForRun($session)
+        || (!empty($plan['speculative_shell_abandoned']) && $onShellEntry);
+    if (!$forceApp) {
+        return $plan;
+    }
+    $prePath = (string) ($plan['kvm_entry_path'] ?? '/');
+    $preStrat = (string) ($plan['launch_strategy'] ?? '');
+    if (empty($plan['run_initial_kvm_entry_path']) && ipmiWebKvmPlanLooksLikeIloShellFirstEntry(array_merge($plan, [
+        'kvm_entry_path'     => $prePath,
+        'launch_strategy'    => $preStrat,
+    ]))) {
+        $plan['run_initial_kvm_entry_path'] = $prePath;
+        $plan['run_initial_launch_strategy'] = $preStrat;
+    }
+    $forceHtml5 = !empty($plan['html5_markers']);
+    $appPath = $forceHtml5
+        ? '/html/application.html?ipmi_kvm_auto=1&ipmi_kvm_force_html5=1'
+        : '/html/application.html?ipmi_kvm_auto=1';
+    $plan['kvm_entry_path'] = $appPath;
+    $plan['launch_strategy'] = $forceHtml5 ? 'ilo_application_force_html5' : 'ilo_application_autolaunch';
+    $plan['effective_kvm_entry_path'] = $appPath;
+    $plan['effective_launch_strategy'] = (string) $plan['launch_strategy'];
+    $plan['shell_runtime_forbidden'] = true;
+    $plan['kvm_forced_application_path'] = true;
+    $plan['speculative_shell_abandoned'] = true;
+    $plan['native_route_speculative'] = false;
+    $sup = (string) ($plan['autolaunch_suppression_detail'] ?? '');
+    $hardBlock = ($sup === 'hard_blocker_license_or_feature');
+    if (!$hardBlock) {
+        $plan['should_attempt_proxy_autolaunch'] = true;
+        $plan['effective_should_attempt_proxy_autolaunch'] = true;
+    }
+    $st = ipmiKvmRunStateLoad($session);
+    $meta = is_array($session['session_meta'] ?? null) ? $session['session_meta'] : [];
+    $shellAb = is_array($meta['kvm_shell_abandon'] ?? null) ? $meta['kvm_shell_abandon'] : [];
+    $plan['kvm_run_path_state_snapshot'] = [
+        'path_state'             => (string) ($st['path_state'] ?? ''),
+        'primary_abandon_reason' => (string) ($st['primary_abandon_reason'] ?? ($shellAb['reason'] ?? '')),
+        'application_committed'  => in_array((string) ($st['path_state'] ?? ''), ['application_path_active', 'application_path_confirmed'], true),
+    ];
+
+    return $plan;
+}
+
+/**
+ * @param array<string, mixed> $session
+ * @param array<string, mixed> $plan
+ */
+function ipmiKvmShouldUseShellPath(array $session, array $plan): bool
+{
+    if ((string) ($plan['vendor_family'] ?? '') !== 'ilo') {
+        return false;
+    }
+    if (!empty($plan['shell_runtime_forbidden']) || !empty($plan['kvm_forced_application_path'])) {
+        return false;
+    }
+    if (ipmiKvmIsShellAbandonedForRun($session)) {
+        return false;
+    }
+
+    return ((string) ($plan['launch_strategy'] ?? '')) === 'ilo_speculative_shell_autolaunch';
+}
+
+/**
+ * @param array<string, mixed> $session
+ * @param array<string, mixed> $plan
+ */
+function ipmiKvmShouldForceApplicationPath(array $session, array $plan): bool
+{
+    if ((string) ($plan['vendor_family'] ?? '') !== 'ilo') {
+        return false;
+    }
+
+    return ipmiKvmIsShellAbandonedForRun($session) || !empty($plan['kvm_forced_application_path']);
+}
+
+/**
+ * Effective path/strategy after run-scoped overrides (for PLAN debug / clients).
+ *
+ * @param array<string, mixed> $plan
+ * @return array{kvm_entry_path: string, launch_strategy: string}
+ */
+function ipmiKvmEffectivePlanForRun(array $plan): array
+{
+    return [
+        'kvm_entry_path'    => (string) ($plan['effective_kvm_entry_path'] ?? $plan['kvm_entry_path'] ?? '/'),
+        'launch_strategy' => (string) ($plan['effective_launch_strategy'] ?? $plan['launch_strategy'] ?? ''),
+    ];
+}
+
+/**
  * Attach delivery tier, user-facing KVM mode, and honest client diagnostics to a launch plan.
  * Safe on cache hits: re-evaluates abandonment using current session meta.
  *
@@ -3859,7 +4017,7 @@ function ipmiWebShouldAbandonIloSpeculativeShellLaunch(array $session, array $pl
 function ipmiWebKvmLaunchPlanMergeDelivery(array $plan, array $session): array
 {
     if (!empty($plan['_kvm_delivery_merged_v1'])) {
-        return $plan;
+        return ipmiWebKvmApplyRunScopedShellAbandonOverride($plan, $session);
     }
     $family = (string) ($plan['vendor_family'] ?? '');
     $strategy = (string) ($plan['launch_strategy'] ?? '');
@@ -3958,7 +4116,7 @@ function ipmiWebKvmLaunchPlanMergeDelivery(array $plan, array $session): array
     $plan['panel_controlled_session_intent'] = ($deliveryTier === 'panel_controlled_proxy_session');
     $plan['_kvm_delivery_merged_v1'] = true;
 
-    return $plan;
+    return ipmiWebKvmApplyRunScopedShellAbandonOverride($plan, $session);
 }
 
 /**

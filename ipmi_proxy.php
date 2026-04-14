@@ -1512,15 +1512,18 @@ function ipmiProxyClassifyIloHtmlDocument(string $bmcPath, string $html = ''): s
 /**
  * Determine the patch mode for a classified iLO HTML document.
  *
- * @return string One of: main_runtime, shell_runtime, helper_runtime_minimal, no_runtime, debug_stub_only.
+ * @return string One of: main_runtime, shell_runtime, shell_exit_stub, helper_runtime_minimal, no_runtime, debug_stub_only.
  */
 function ipmiProxyDetermineIloPatchMode(string $pageType, ?array $plan = null): string
 {
-    $strategy = (string) ($plan['launch_strategy'] ?? '');
     switch ($pageType) {
         case 'ilo_main_application_page':
             return 'main_runtime';
         case 'ilo_shell_page':
+            if (!empty($plan['shell_runtime_forbidden'])) {
+                return 'shell_exit_stub';
+            }
+
             return 'shell_runtime';
         case 'ilo_frame_candidate_page':
             return 'main_runtime';
@@ -1538,6 +1541,21 @@ function ipmiProxyDetermineIloPatchMode(string $pageType, ?array $plan = null): 
 function ipmiProxyShouldInjectMainRuntime(string $patchMode): bool
 {
     return $patchMode === 'main_runtime' || $patchMode === 'shell_runtime';
+}
+
+function ipmiProxyShouldInjectShellRuntime(string $patchMode): bool
+{
+    return $patchMode === 'shell_runtime';
+}
+
+function ipmiProxyShouldInjectApplicationRuntime(string $patchMode): bool
+{
+    return $patchMode === 'main_runtime';
+}
+
+function ipmiProxyShouldInjectShellExitStub(string $patchMode): bool
+{
+    return $patchMode === 'shell_exit_stub';
 }
 
 function ipmiProxyShouldInjectHelperRuntime(string $patchMode): bool
@@ -1572,6 +1590,21 @@ function ipmiProxyBuildIloHelperRuntimeJs(string $pxJs, string $dbgLit, ?array $
         . 'try{if(window.sessionStorage&&sessionStorage.getItem("_ipmi_kvm_auto_flow")==="1"){'
         . '_kvmDbg("ilo_helper_activity_seen",{page:String(location.pathname||"").substring(0,120),title:String(document.title||"").substring(0,80)});'
         . '}}catch(e){}'
+        . '})();';
+}
+
+/**
+ * Minimal iLO shell-page script: navigate to proxied application.html (no shell polling / full runtime).
+ */
+function ipmiProxyBuildIloShellExitStubJs(string $exitProxyUrlJsLiteral): string
+{
+    return '(function(){'
+        . 'var U=' . $exitProxyUrlJsLiteral . ';'
+        . 'try{'
+        . 'var p=String(location.pathname||"").toLowerCase();'
+        . 'if(p.indexOf("application.html")>=0)return;'
+        . 'if(typeof location.replace==="function"){location.replace(U);}else{location.href=U;}'
+        . '}catch(e){}'
         . '})();';
 }
 
@@ -1640,6 +1673,13 @@ function ipmiProxyInjectKvmAutoLaunchPatch(string $html, string $token, $session
         'client_visible_kvm_state' => (string) ($plan['client_visible_kvm_state'] ?? ''),
         'speculative_shell_abandoned' => !empty($plan['speculative_shell_abandoned']) ? 1 : 0,
         'preferred_native_path' => (string) ($plan['preferred_native_path'] ?? ''),
+        'shell_runtime_forbidden' => !empty($plan['shell_runtime_forbidden']) ? 1 : 0,
+        'kvm_forced_application_path' => !empty($plan['kvm_forced_application_path']) ? 1 : 0,
+        'effective_kvm_entry_path' => (string) ($plan['effective_kvm_entry_path'] ?? $plan['kvm_entry_path'] ?? '/'),
+        'effective_launch_strategy' => (string) ($plan['effective_launch_strategy'] ?? $plan['launch_strategy'] ?? ''),
+        'run_initial_kvm_entry_path' => (string) ($plan['run_initial_kvm_entry_path'] ?? ''),
+        'run_initial_launch_strategy' => (string) ($plan['run_initial_launch_strategy'] ?? ''),
+        'kvm_run_path_state_snapshot' => is_array($plan['kvm_run_path_state_snapshot'] ?? null) ? $plan['kvm_run_path_state_snapshot'] : [],
     ];
     $metaLite = is_array($session['session_meta'] ?? null) ? $session['session_meta'] : [];
     if (
@@ -1712,7 +1752,47 @@ function ipmiProxyInjectKvmAutoLaunchPatch(string $html, string $token, $session
             'page_type' => $pageType,
             'patch_mode' => $patchMode,
             'bmcPath' => $bmcPath,
+            'shell_runtime_forbidden' => !empty($plan['shell_runtime_forbidden']) ? 1 : 0,
         ]);
+    }
+
+    if (ipmiProxyShouldInjectShellExitStub($patchMode)) {
+        $targetPath = (string) ($plan['kvm_entry_path'] ?? '/html/application.html?ipmi_kvm_auto=1');
+        $exitFull = ipmiWebBuildProxyUrl($token, $targetPath);
+        $exitJs = json_encode($exitFull, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_UNESCAPED_SLASHES);
+        if ($exitJs === false) {
+            $exitJs = '""';
+        }
+        $stubBody = ipmiProxyBuildIloShellExitStubJs($exitJs);
+        $injectMeta = [
+            'mode'       => 'shell_exit_stub',
+            'js_ok'      => true,
+            'js_reason'  => '',
+            'js_depth'   => 0,
+            'page_type'  => $pageType,
+            'patch_mode' => $patchMode,
+        ];
+        $scriptOpen = '<script data-ipmi-proxy-kvm-autolaunch="1" data-ipmi-kvm-js-valid="1" data-ipmi-kvm-patch-mode="shell_exit_stub">';
+        $patch = $scriptOpen . $stubBody . '</script>';
+        if ($injectOut !== null) {
+            $injectOut = $injectMeta;
+        }
+        if (ipmiProxyDebugEnabled()) {
+            ipmiProxyDebugLog('ilo_shell_exit_stub_injected', [
+                'page_type' => $pageType,
+                'target'    => substr($targetPath, 0, 160),
+                'effective_kvm_entry_path' => (string) ($plan['effective_kvm_entry_path'] ?? $plan['kvm_entry_path'] ?? ''),
+                'shell_runtime_forbidden'  => !empty($plan['shell_runtime_forbidden']) ? 1 : 0,
+            ]);
+        }
+        if (ipmiKvmBugLogTokenMatchesActiveRun($token)) {
+            ipmiKvmBugLogAppendSection(
+                'SERVER',
+                'event: ilo_main_runtime_injected | patch_mode: shell_exit_stub | page_type: ' . $pageType
+            );
+        }
+
+        return ipmiProxyInjectIntoHtmlHeadOrBody($html, $patch);
     }
 
     // Helper pages get only the minimal helper runtime (never the full main runtime)
@@ -1823,10 +1903,31 @@ function ipmiProxyInjectKvmAutoLaunchPatch(string $html, string $token, $session
             'page_type'  => $pageType,
             'patch_mode' => $patchMode,
             'bytes'      => strlen($autoLaunchBody),
+            'effective_kvm_entry_path' => (string) ($plan['effective_kvm_entry_path'] ?? $plan['kvm_entry_path'] ?? ''),
+            'shell_runtime_forbidden'  => !empty($plan['shell_runtime_forbidden']) ? 1 : 0,
         ]);
     }
     if (ipmiKvmBugLogTokenMatchesActiveRun($token)) {
         ipmiKvmBugLogAppendSection('SERVER', 'event: ilo_main_runtime_injected | patch_mode: ' . $patchMode . ' | page_type: ' . $pageType);
+    }
+    if (
+        $persistKvmPlanMysqli instanceof mysqli
+        && $pageType === 'ilo_main_application_page'
+        && $patchMode === 'main_runtime'
+    ) {
+        ipmiKvmRunStateStore($persistKvmPlanMysqli, $token, [
+            'path_state'                  => 'application_path_active',
+            'application_html_served_ts'  => time(),
+        ]);
+        if (ipmiKvmBugLogTokenMatchesActiveRun($token)) {
+            ipmiKvmBugLogAppendOncePerRun(
+                $persistKvmPlanMysqli,
+                $token,
+                'application_path_html_served_committed',
+                'SERVER',
+                'event: application_path_html_served_committed | page_type: ilo_main_application_page | patch_mode: main_runtime'
+            );
+        }
     }
 
     return ipmiProxyInjectIntoHtmlHeadOrBody($html, $patch);

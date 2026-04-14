@@ -356,12 +356,39 @@ function ipmiKvmBugLogIngestBrowserEvent(mysqli $mysqli, array $payload): array
         'event'   => (string) ($payload['event'] ?? ''),
         'detail'  => $payload['detail'] ?? null,
     ]);
-    ipmiKvmBugLogAppendSection($section, $line);
-
     $ev = strtolower((string) ($payload['event'] ?? ''));
+    $noisyBrowser = in_array($ev, ['shell_launch_no_effect', 'ilo_starthtml5irc_no_effect'], true);
+    $browserDedupeKey = $noisyBrowser ? ipmiKvmBugLogCanonicalEventKey('BROWSER', $ev, '') : '';
+    $me = is_array($session['session_meta'] ?? null) ? $session['session_meta'] : [];
+    $evDedupe = is_array($me['kvm_buglog_dedupe']['events'] ?? null) ? $me['kvm_buglog_dedupe']['events'] : [];
+    $skipBrowserLine = $browserDedupeKey !== '' && isset($evDedupe[$browserDedupeKey]);
+    if (!$skipBrowserLine) {
+        ipmiKvmBugLogAppendSection($section, $line);
+    }
+    if ($browserDedupeKey !== '') {
+        ipmiWebSessionMetaMutate($mysqli, $token, static function (array &$meta) use ($browserDedupeKey): void {
+            $d = is_array($meta['kvm_buglog_dedupe'] ?? null) ? $meta['kvm_buglog_dedupe'] : ['v' => 1, 'events' => []];
+            $evMap = is_array($d['events'] ?? null) ? $d['events'] : [];
+            if (!isset($evMap[$browserDedupeKey])) {
+                $evMap[$browserDedupeKey] = ['first_ts' => time(), 'last_ts' => time(), 'count' => 1];
+            } else {
+                $evMap[$browserDedupeKey]['count'] = (int) ($evMap[$browserDedupeKey]['count'] ?? 0) + 1;
+                $evMap[$browserDedupeKey]['last_ts'] = time();
+            }
+            $d['events'] = array_slice($evMap, -64, null, true);
+            $d['v'] = 1;
+            $meta['kvm_buglog_dedupe'] = $d;
+        });
+    }
+
     if ($ev === 'shell_launch_no_effect' || $ev === 'ilo_starthtml5irc_no_effect') {
-        ipmiKvmBugLogAppendBug('SHELL_LAUNCH_NO_EFFECT', 'Shell HTML5 launch left DOM/transport unchanged', '');
-        ipmiKvmShellAbandonPersist($mysqli, $token, 'SHELL_LAUNCH_NO_EFFECT');
+        ipmiKvmRecordShellAbandonReason($mysqli, $token, 'SHELL_LAUNCH_NO_EFFECT', '');
+    }
+    if ($ev === 'application_path_loaded') {
+        ipmiKvmRunStateStore($mysqli, $token, [
+            'path_state' => 'application_path_active',
+            'ts'         => time(),
+        ]);
     }
     if ($ev === 'kvm_final_summary') {
         ipmiKvmBugLogUpdateFinalSummary($payload);
@@ -411,11 +438,15 @@ function ipmiKvmBugLogComputeAggregateFromRaw(string $raw): array
         + substr_count($raw, 'ipmi_ws_relay_upstream_tcp_failed');
     $agg['relay_pump_starts'] = substr_count($raw, 'ipmi_ws_relay_frame_pump_started');
     $agg['relay_closed_events'] = substr_count($raw, 'ipmi_ws_relay_closed');
-    $agg['application_path_signal'] = (bool) preg_match('/event:\s*application_path_loaded\b/', $raw);
+    $agg['application_path_signal'] = (bool) preg_match('/event:\s*application_path_loaded\b/', $raw)
+        || (bool) preg_match('/event:\s*application_path_html_served_committed\b/', $raw);
     $agg['shell_abandon_signal'] = str_contains($raw, 'shell_path_abandoned_for_application')
         || str_contains($raw, 'SHELL_SSE_403')
         || str_contains($raw, 'SHELL_SESSION_INFO_403')
         || str_contains($raw, 'code: SHELL_LAUNCH_NO_EFFECT');
+    $agg['shell_runtime_inject_count'] = (int) preg_match_all('/ilo_main_runtime_injected[^\n]*patch_mode:\s*shell_runtime\b/', $raw);
+    $agg['shell_exit_stub_inject_count'] = (int) preg_match_all('/ilo_main_runtime_injected[^\n]*patch_mode:\s*shell_exit_stub\b/', $raw);
+    $agg['shell_abandon_server_events_count'] = substr_count($raw, 'shell_path_abandoned_for_application');
     $agg['launch_attempt_signal'] = (bool) preg_match(
         '/event:\s*(ilo_launch_triggered|ilo_html5_console_launch_attempted|shell_escalation_console_href|application_path_loaded|shell_launch_no_effect|shell_path_abandon_flag_loaded)\b/',
         $raw
@@ -497,6 +528,15 @@ function ipmiKvmBugLogMergeFinalDetailWithAggregate(array $agg, array $detail): 
  */
 function ipmiKvmBugLogDeriveFinalTransportHealthy(array $agg, array $merged, string $verdict): bool
 {
+    $shellPathVerdicts = [
+        'shell_abandonment_loop',
+        'shell_runtime_reinjected_after_abandon',
+        'shell_path_failed_not_promoted',
+        'application_promotion_not_committed',
+    ];
+    if (in_array($verdict, $shellPathVerdicts, true)) {
+        return false;
+    }
     $badVerdict = in_array($verdict, [
         'transport_unhealthy_console_not_confirmed',
         'transport_unstable_console_not_confirmed',
@@ -543,6 +583,174 @@ function ipmiKvmBugLogDeriveFinalTransportHealthy(array $agg, array $merged, str
 }
 
 /**
+ * Parse bugs.txt [PLAN] selected_path (initial KVM route at run start).
+ */
+function ipmiKvmBugLogParseInitialPlanSelectedPath(string $raw): string
+{
+    if (preg_match('/\[PLAN\][\s\S]*?\nselected_path:\s*([^\n]+)/', $raw, $m)) {
+        return trim($m[1]);
+    }
+    if (preg_match('/^selected_path:\s*([^\n]+)/m', $raw, $m)) {
+        return trim($m[1]);
+    }
+
+    return '';
+}
+
+/**
+ * First server or BUG shell-abandon code in the run log.
+ */
+function ipmiKvmBugLogParseFirstShellAbandonCode(string $raw): string
+{
+    if (preg_match('/shell_path_abandoned_for_application\s*\|\s*code:\s*(\S+)/i', $raw, $m)) {
+        return trim($m[1]);
+    }
+    if (preg_match('/\[BUG\]\s*code:\s*(SHELL_[A-Z0-9_]+)/', $raw, $m)) {
+        return trim($m[1]);
+    }
+
+    return '';
+}
+
+/**
+ * Append one bugs.txt line per run (session meta gate) — e.g. server-side application.html commit.
+ */
+function ipmiKvmBugLogAppendOncePerRun(mysqli $mysqli, string $token, string $onceKey, string $section, string $lineBody): void
+{
+    if (!preg_match('/^[a-f0-9]{64}$/', $token)) {
+        return;
+    }
+    $onceKey = substr(preg_replace('/[^a-z0-9_]/i', '_', $onceKey), 0, 64);
+    $ref = ['go' => false];
+    ipmiWebSessionMetaMutate($mysqli, $token, function (array &$meta) use ($onceKey, &$ref): void {
+        $once = is_array($meta['kvm_buglog_once'] ?? null) ? $meta['kvm_buglog_once'] : [];
+        if (!empty($once[$onceKey])) {
+            return;
+        }
+        $once[$onceKey] = time();
+        $meta['kvm_buglog_once'] = array_slice($once, -24, null, true);
+        $ref['go'] = true;
+    });
+    if (!empty($ref['go'])) {
+        ipmiKvmBugLogAppendSection($section, $lineBody);
+    }
+}
+
+/**
+ * Stable key for per-run bugs.txt dedupe (category + code + optional material hash).
+ */
+function ipmiKvmBugLogCanonicalEventKey(string $category, string $code, string $detailMaterialHash = ''): string
+{
+    return strtolower(trim($category)) . '|' . trim($code) . '|' . trim($detailMaterialHash);
+}
+
+/**
+ * Merge kvm_run_path_state (bounded) in session meta.
+ */
+function ipmiKvmRunStateStore(mysqli $mysqli, string $token, array $patch): void
+{
+    if (!preg_match('/^[a-f0-9]{64}$/', $token)) {
+        return;
+    }
+    $patch = array_slice($patch, 0, 24);
+    ipmiWebSessionMetaMutate($mysqli, $token, static function (array &$meta) use ($patch): void {
+        $prev = is_array($meta['kvm_run_path_state'] ?? null) ? $meta['kvm_run_path_state'] : [];
+        $meta['kvm_run_path_state'] = array_merge($prev, $patch + ['v' => 1]);
+    });
+}
+
+/**
+ * Persist shell abandon + run path state + optional first-seen BUG line (deduped per run in session meta).
+ */
+function ipmiKvmRecordShellAbandonReason(mysqli $mysqli, string $token, string $reasonCode, string $detailMaterial = ''): void
+{
+    if (!preg_match('/^[a-f0-9]{64}$/', $token)) {
+        return;
+    }
+    $mat = $detailMaterial !== '' ? substr(hash('sha256', $detailMaterial), 0, 12) : '';
+    $bugKey = ipmiKvmBugLogCanonicalEventKey('BUG', $reasonCode, $mat);
+    $session = ipmiWebLoadSession($mysqli, $token);
+    $me = is_array($session['session_meta'] ?? null) ? $session['session_meta'] : [];
+    $ev0 = is_array($me['kvm_buglog_dedupe']['events'] ?? null) ? $me['kvm_buglog_dedupe']['events'] : [];
+    if (!isset($ev0[$bugKey])) {
+        if ($reasonCode === 'SHELL_LAUNCH_NO_EFFECT') {
+            ipmiKvmBugLogAppendBug('SHELL_LAUNCH_NO_EFFECT', 'Shell HTML5 launch left DOM/transport unchanged', $detailMaterial);
+        } else {
+            ipmiKvmBugLogAppendBug($reasonCode, 'Shell abandon reason recorded', $detailMaterial);
+        }
+    }
+    ipmiWebSessionMetaMutate($mysqli, $token, static function (array &$meta) use ($bugKey): void {
+        $d = is_array($meta['kvm_buglog_dedupe'] ?? null) ? $meta['kvm_buglog_dedupe'] : ['v' => 1, 'events' => []];
+        $ev = is_array($d['events'] ?? null) ? $d['events'] : [];
+        if (!isset($ev[$bugKey])) {
+            $ev[$bugKey] = ['first_ts' => time(), 'last_ts' => time(), 'count' => 1];
+        } else {
+            $ev[$bugKey]['count'] = (int) ($ev[$bugKey]['count'] ?? 0) + 1;
+            $ev[$bugKey]['last_ts'] = time();
+        }
+        $d['events'] = array_slice($ev, -64, null, true);
+        $d['v'] = 1;
+        $meta['kvm_buglog_dedupe'] = $d;
+    });
+    ipmiKvmShellAbandonPersist($mysqli, $token, $reasonCode, '');
+}
+
+/**
+ * Force effective application-path plan for this run (browser/server promotion).
+ */
+function ipmiKvmPlanForceApplicationOverride(mysqli $mysqli, string $token): void
+{
+    ipmiKvmShellAbandonPersist($mysqli, $token, 'APPLICATION_PROMOTION_TRIGGERED', '');
+    ipmiKvmRunStateStore($mysqli, $token, [
+        'path_state'   => 'application_path_promoting',
+        'promotion_ts' => time(),
+    ]);
+}
+
+/**
+ * Override browser verdict when file aggregates show shell-path loop / failed promotion.
+ *
+ * @param array<string, mixed> $agg
+ * @param array<string, mixed> $merged
+ * @return array{verdict: string, source: string, shell_loop_metrics: string}
+ */
+function ipmiKvmComputeFinalVerdict(array $agg, array $merged, string $browserVerdict): array
+{
+    $app = (string) ($merged['application_path_loaded'] ?? 'unknown');
+    $sr = (int) ($agg['shell_runtime_inject_count'] ?? 0);
+    $stub = (int) ($agg['shell_exit_stub_inject_count'] ?? 0);
+    $abandonN = (int) ($agg['shell_abandon_server_events_count'] ?? 0);
+    $shellSig = !empty($agg['shell_abandon_signal']);
+    $metrics = 'shell_runtime_injections=' . $sr
+        . ' shell_exit_stub_injections=' . $stub
+        . ' shell_abandon_server_events=' . $abandonN
+        . ' application_path_loaded=' . $app;
+
+    if ($shellSig && $sr >= 2 && $stub === 0 && ($app === 'no' || $app === 'unknown')) {
+        return ['verdict' => 'shell_runtime_reinjected_after_abandon', 'source' => 'aggregate_file', 'shell_loop_metrics' => $metrics];
+    }
+    if ($abandonN >= 2 && $sr >= 2 && ($app === 'no' || $app === 'unknown')) {
+        return ['verdict' => 'shell_abandonment_loop', 'source' => 'aggregate_file', 'shell_loop_metrics' => $metrics];
+    }
+    if ($shellSig && ($app === 'no' || $app === 'unknown') && $sr >= 1 && $stub === 0) {
+        return ['verdict' => 'shell_path_failed_not_promoted', 'source' => 'aggregate_file', 'shell_loop_metrics' => $metrics];
+    }
+    if ($shellSig && ($app === 'no' || $app === 'unknown') && $stub >= 3) {
+        return ['verdict' => 'application_promotion_not_committed', 'source' => 'aggregate_file', 'shell_loop_metrics' => $metrics];
+    }
+
+    return ['verdict' => $browserVerdict, 'source' => 'browser', 'shell_loop_metrics' => $metrics];
+}
+
+/**
+ * @param array<string, mixed> $payload
+ */
+function ipmiKvmFinalizeRunSummary(array $payload): void
+{
+    ipmiKvmBugLogPatchFinalBlock($payload);
+}
+
+/**
  * Write [FINAL] at end of bugs.txt from browser payload + full-file aggregates (authoritative).
  *
  * @param array<string, mixed> $payload
@@ -569,12 +777,24 @@ function ipmiKvmBugLogPatchFinalBlock(array $payload): void
     }
     $agg = ipmiKvmBugLogComputeAggregateFromRaw($raw);
     $merged = ipmiKvmBugLogMergeFinalDetailWithAggregate($agg, $detail);
+    $resolved = ipmiKvmComputeFinalVerdict($agg, $merged, $verdict !== '' ? $verdict : 'pending');
+    if (($resolved['source'] ?? '') === 'aggregate_file' && ($resolved['verdict'] ?? '') !== '') {
+        $verdict = (string) $resolved['verdict'];
+    }
     $transportHealthy = ipmiKvmBugLogDeriveFinalTransportHealthy($agg, $merged, $verdict);
     $ended = gmdate('c') . 'Z';
     $failureReason = trim((string) ($detail['final_failure_reason'] ?? $detail['reason'] ?? $detail['transport_why'] ?? ''));
+    $shellPathVerdicts = [
+        'shell_abandonment_loop',
+        'shell_runtime_reinjected_after_abandon',
+        'shell_path_failed_not_promoted',
+        'application_promotion_not_committed',
+    ];
     if ($failureReason === '') {
         if (!$transportHealthy && $verdict === 'transport_unhealthy_console_not_confirmed') {
             $failureReason = 'no_sustained_relay_frame_flow_or_transport_unstable';
+        } elseif (in_array($verdict, $shellPathVerdicts, true)) {
+            $failureReason = 'kvm_shell_path_not_resolved_before_end:' . $verdict;
         }
     }
     $failureReason = substr($failureReason, 0, 400);
@@ -583,11 +803,34 @@ function ipmiKvmBugLogPatchFinalBlock(array $payload): void
         return $k . ': ' . $v . "\n";
     };
 
+    $srCount = (int) ($agg['shell_runtime_inject_count'] ?? 0);
+    $stubCount = (int) ($agg['shell_exit_stub_inject_count'] ?? 0);
+    $appLoaded = (string) ($merged['application_path_loaded'] ?? 'unknown');
+    $shellAbandonMerged = (string) ($merged['shell_path_abandoned'] ?? 'unknown');
+    $abandonCode = ipmiKvmBugLogParseFirstShellAbandonCode($raw);
+    $initialPlanPath = ipmiKvmBugLogParseInitialPlanSelectedPath($raw);
+    $specShellRuntimeUsed = $srCount > 0 ? 'yes' : 'no';
+    $shellActiveSignal = ($srCount > 0 || $stubCount > 0) ? 'yes' : 'no';
+    $reinjectAfterAbandon = in_array($verdict, ['shell_runtime_reinjected_after_abandon', 'shell_abandonment_loop'], true)
+        || (!empty($agg['shell_abandon_signal']) && $srCount >= 2 && $stubCount === 0)
+        ? 'yes'
+        : 'no';
+    $promotionCommitted = ($appLoaded === 'yes') ? 'yes' : 'no';
+
     $finalBody = '[FINAL]' . "\n"
         . $line('verdict', $verdict !== '' ? $verdict : 'pending')
+        . $line('verdict_source', (string) ($resolved['source'] ?? 'browser'))
+        . $line('shell_loop_metrics', (string) ($resolved['shell_loop_metrics'] ?? ''))
+        . $line('plan_initial_selected_path', $initialPlanPath !== '' ? $initialPlanPath : 'unknown')
+        . $line('effective_kvm_path_note', '/html/application.html after shell abandon (session plan override; not re-logged each request)')
+        . $line('kvm_speculative_shell_active_signal', $shellActiveSignal)
+        . $line('speculative_shell_full_runtime_used', $specShellRuntimeUsed)
+        . $line('shell_path_abandoned', $shellAbandonMerged)
+        . $line('shell_abandon_reason_code', $abandonCode !== '' ? $abandonCode : 'unknown')
+        . $line('application_promotion_committed', $promotionCommitted)
+        . $line('shell_runtime_reinjected_after_abandon', $reinjectAfterAbandon)
         . $line('strong_confirmation', !empty($detail['strong_confirmation']) ? 'yes' : 'no')
-        . $line('application_path_loaded', (string) ($merged['application_path_loaded'] ?? 'unknown'))
-        . $line('shell_path_abandoned', (string) ($merged['shell_path_abandoned'] ?? 'unknown'))
+        . $line('application_path_loaded', $appLoaded)
         . $line('launch_attempted', (string) ($merged['launch_attempted'] ?? 'unknown'))
         . $line('browser_ws_handshake_ok', (string) ($merged['browser_ws_handshake_ok'] ?? 'unknown'))
         . $line('upstream_tls_ok', (string) ($merged['upstream_tls_ok'] ?? 'unknown'))
@@ -626,19 +869,39 @@ function ipmiKvmBugLogPatchFinalBlock(array $payload): void
 }
 
 /**
- * Persist shell abandonment reason for next injected PLAN (iLO).
+ * Persist shell abandonment reason for next injected PLAN (iLO) + run-scoped path state (one-way).
+ *
+ * @param string $snapshotBmcPath Optional BMC path when abandon first observed (for diagnostics).
  */
-function ipmiKvmShellAbandonPersist(mysqli $mysqli, string $token, string $reason): void
+function ipmiKvmShellAbandonPersist(mysqli $mysqli, string $token, string $reason, string $snapshotBmcPath = ''): void
 {
     if (!preg_match('/^[a-f0-9]{64}$/', $token)) {
         return;
     }
-    ipmiWebSessionMetaMutate($mysqli, $token, static function (array &$meta) use ($reason): void {
+    ipmiWebSessionMetaMutate($mysqli, $token, static function (array &$meta) use ($reason, $snapshotBmcPath): void {
         $meta['kvm_shell_abandon'] = [
             'v'      => 1,
             'reason' => $reason,
             'ts'     => time(),
         ];
+        $prev = is_array($meta['kvm_run_path_state'] ?? null) ? $meta['kvm_run_path_state'] : [];
+        $reasons = is_array($prev['abandon_reasons'] ?? null) ? $prev['abandon_reasons'] : [];
+        if (!in_array($reason, $reasons, true)) {
+            $reasons[] = $reason;
+        }
+        if ($snapshotBmcPath !== '' && empty($prev['initial_kvm_entry_path'])) {
+            $prev['initial_kvm_entry_path'] = substr($snapshotBmcPath, 0, 240);
+        }
+        $prevPs = (string) ($prev['path_state'] ?? '');
+        $keepAppPath = in_array($prevPs, ['application_path_active', 'application_path_confirmed'], true);
+        $nextPathState = $keepAppPath ? $prevPs : 'shell_path_abandoned';
+        $meta['kvm_run_path_state'] = array_merge($prev, [
+            'v'                       => 1,
+            'path_state'              => $nextPathState,
+            'abandon_reasons'         => array_slice($reasons, 0, 16),
+            'primary_abandon_reason'  => $reason,
+            'ts'                      => time(),
+        ]);
     });
 }
 
@@ -727,16 +990,53 @@ function ipmiProxyIloObserveFrameFlowState(mysqli $mysqli, string $token, bool $
  */
 function ipmiProxyIloAbandonShellPath(mysqli $mysqli, string $token, string $bugCode, string $bmcPath = ''): void
 {
-    ipmiKvmBugLogAppendBug($bugCode, 'Shell KVM path abandoned', $bmcPath);
-    ipmiKvmBugLogAppendSection('SERVER', 'event: shell_path_abandoned_for_application | code: ' . $bugCode);
-    ipmiKvmShellAbandonPersist($mysqli, $token, $bugCode);
+    if (!preg_match('/^[a-f0-9]{64}$/', $token)) {
+        return;
+    }
+    $bugKey = ipmiKvmBugLogCanonicalEventKey('BUG', $bugCode, '');
+    $srvKey = ipmiKvmBugLogCanonicalEventKey('SERVER', 'shell_path_abandon', $bugCode);
+    $session = ipmiWebLoadSession($mysqli, $token);
+    $me = is_array($session['session_meta'] ?? null) ? $session['session_meta'] : [];
+    $ev0 = is_array($me['kvm_buglog_dedupe']['events'] ?? null) ? $me['kvm_buglog_dedupe']['events'] : [];
+    if (!isset($ev0[$bugKey])) {
+        ipmiKvmBugLogAppendBug($bugCode, 'Shell KVM path abandoned', $bmcPath);
+    }
+    if (!isset($ev0[$srvKey])) {
+        ipmiKvmBugLogAppendSection(
+            'SERVER',
+            'event: shell_path_abandoned_for_application | code: ' . $bugCode
+                . ($bmcPath !== '' ? ' | bmc_path: ' . substr($bmcPath, 0, 120) : '')
+        );
+    }
+    ipmiWebSessionMetaMutate($mysqli, $token, static function (array &$meta) use ($bugKey, $srvKey): void {
+        $d = is_array($meta['kvm_buglog_dedupe'] ?? null) ? $meta['kvm_buglog_dedupe'] : ['v' => 1, 'events' => []];
+        $ev = is_array($d['events'] ?? null) ? $d['events'] : [];
+        foreach ([$bugKey, $srvKey] as $k) {
+            if (!isset($ev[$k])) {
+                $ev[$k] = ['first_ts' => time(), 'last_ts' => time(), 'count' => 1];
+            } else {
+                $ev[$k]['count'] = (int) ($ev[$k]['count'] ?? 0) + 1;
+                $ev[$k]['last_ts'] = time();
+            }
+        }
+        $d['events'] = array_slice($ev, -64, null, true);
+        $d['v'] = 1;
+        $meta['kvm_buglog_dedupe'] = $d;
+    });
+    ipmiKvmShellAbandonPersist($mysqli, $token, $bugCode, $bmcPath);
 }
 
 function ipmiProxyIloShouldAbandonShellPath(array $session): bool
 {
-    $m = $session['session_meta']['kvm_shell_abandon'] ?? null;
+    return ipmiKvmIsShellAbandonedForRun($session);
+}
 
-    return is_array($m) && !empty($m['reason']);
+/**
+ * @param array<string, mixed> $session
+ */
+function ipmiProxyIloForceApplicationPathForRun(mysqli $mysqli, string $token): void
+{
+    ipmiKvmPlanForceApplicationOverride($mysqli, $token);
 }
 
 function ipmiKvmBugLogBrowserBeaconEndpoint(): string
