@@ -1,4 +1,4 @@
-ï»¿<?php
+<?php
 
 /**
  * Reverse proxy for IPMI/BMC web UIs.
@@ -96,7 +96,7 @@ function ipmiProxyRewriteWebSocketUrls(string $body, string $bmcHost, string $to
             $out = $tmp;
         }
     }
-    // Template literals: `wss://${host}/path` â€” rewrite when host token matches BMC (minified bundles).
+    // Template literals: `wss://${host}/path` — rewrite when host token matches BMC (minified bundles).
     $tplCb = static function (array $m) use ($bmcHost, $token): string {
         $scheme = strtolower($m[1]);
         $rest = (string) ($m[2] ?? '');
@@ -1326,6 +1326,137 @@ function ipmiProxyValidateGeneratedJsBraceBalance(string $js): array
 }
 
 /**
+ * Replace strings/comments with whitespace for lightweight token analysis.
+ */
+function ipmiProxyGeneratedJsTokenView(string $js): string
+{
+    $n = strlen($js);
+    $out = '';
+    $inStr = false;
+    $strCh = '';
+    $esc = false;
+    $inLineComment = false;
+    $inBlockComment = false;
+    for ($i = 0; $i < $n; $i++) {
+        $c = $js[$i];
+        $next = ($i + 1 < $n) ? $js[$i + 1] : '';
+        if ($inLineComment) {
+            if ($c === "\n") {
+                $inLineComment = false;
+                $out .= "\n";
+            } else {
+                $out .= ' ';
+            }
+            continue;
+        }
+        if ($inBlockComment) {
+            if ($c === '*' && $next === '/') {
+                $inBlockComment = false;
+                $out .= '  ';
+                $i++;
+            } else {
+                $out .= ($c === "\n" ? "\n" : ' ');
+            }
+            continue;
+        }
+        if ($inStr) {
+            $out .= ($c === "\n" ? "\n" : ' ');
+            if ($esc) {
+                $esc = false;
+                continue;
+            }
+            if ($c === '\\' && ($strCh === '"' || $strCh === '\'' || $strCh === '`')) {
+                $esc = true;
+                continue;
+            }
+            if ($c === $strCh) {
+                $inStr = false;
+            }
+            continue;
+        }
+        if ($c === '/' && $next === '/') {
+            $inLineComment = true;
+            $out .= '  ';
+            $i++;
+            continue;
+        }
+        if ($c === '/' && $next === '*') {
+            $inBlockComment = true;
+            $out .= '  ';
+            $i++;
+            continue;
+        }
+        if ($c === '"' || $c === '\'' || $c === '`') {
+            $inStr = true;
+            $strCh = $c;
+            $out .= ' ';
+            continue;
+        }
+        $out .= $c;
+    }
+
+    return $out;
+}
+
+/**
+ * Parser-like checks to catch malformed concatenation boundaries not covered by brace depth.
+ *
+ * @return array{ok: bool, reason: string}
+ */
+function ipmiProxyValidateGeneratedJsWithParserLikeChecks(string $js): array
+{
+    $tv = ipmiProxyGeneratedJsTokenView($js);
+    if (preg_match('/(^|[;{}\\s])catch\\s*\\(/m', $tv) === 1 && preg_match('/\\btry\\b/', $tv) !== 1) {
+        return ['ok' => false, 'reason' => 'catch_without_try_token'];
+    }
+    if (preg_match('/\\}\\s*catch\\s*\\(/', $tv) === 1 && preg_match('/\\btry\\s*\\{[\\s\\S]{0,400}\\}\\s*catch\\s*\\(/', $tv) !== 1) {
+        return ['ok' => false, 'reason' => 'suspicious_try_catch_boundary'];
+    }
+    if (preg_match('/catch\\s*\\([^)]*$/m', $tv) === 1) {
+        return ['ok' => false, 'reason' => 'unterminated_catch_clause'];
+    }
+    if (preg_match('/\\btry\\b(?![\\s\\S]{0,40}\\{)/', $tv) === 1) {
+        return ['ok' => false, 'reason' => 'try_without_block_open'];
+    }
+
+    return ['ok' => true, 'reason' => ''];
+}
+
+/**
+ * Optional JS parser check via node --check.
+ *
+ * @return array{ok: bool, reason: string}
+ */
+function ipmiProxyValidateGeneratedJsWithNodeCheck(string $js): array
+{
+    if (stripos(PHP_OS_FAMILY, 'Windows') === false && stripos(PHP_OS_FAMILY, 'Linux') === false && stripos(PHP_OS_FAMILY, 'Darwin') === false) {
+        return ['ok' => true, 'reason' => 'node_check_skipped_platform'];
+    }
+    if (!function_exists('shell_exec') || !function_exists('sys_get_temp_dir')) {
+        return ['ok' => true, 'reason' => 'node_check_unavailable'];
+    }
+    $tmp = rtrim((string) sys_get_temp_dir(), "/\\") . DIRECTORY_SEPARATOR . 'ipmi_kvm_js_check_' . bin2hex(random_bytes(5)) . '.js';
+    if (@file_put_contents($tmp, $js) === false) {
+        return ['ok' => true, 'reason' => 'node_check_temp_write_failed'];
+    }
+    $cmd = 'node --check ' . escapeshellarg($tmp) . ' 2>&1';
+    $out = shell_exec($cmd);
+    @unlink($tmp);
+    if (!is_string($out)) {
+        return ['ok' => true, 'reason' => 'node_check_not_available'];
+    }
+    $low = strtolower($out);
+    if ($low === '' || str_contains($low, 'syntaxerror') === false) {
+        return ['ok' => true, 'reason' => ''];
+    }
+    if (str_contains($low, "unexpected token 'catch'")) {
+        return ['ok' => false, 'reason' => 'node_syntax_unexpected_catch'];
+    }
+
+    return ['ok' => false, 'reason' => 'node_syntax_error'];
+}
+
+/**
  * @return array{ok: bool, reason: string, depth: int, bytes: int}
  */
 function ipmiProxyValidateGeneratedIloJs(string $fullPatchJs): array
@@ -1337,6 +1468,20 @@ function ipmiProxyValidateGeneratedIloJs(string $fullPatchJs): array
         'depth'  => (int) $bal['depth'],
         'bytes'  => strlen($fullPatchJs),
     ];
+    if ($out['ok']) {
+        $p = ipmiProxyValidateGeneratedJsWithParserLikeChecks($fullPatchJs);
+        if (!$p['ok']) {
+            $out['ok'] = false;
+            $out['reason'] = $p['reason'];
+        }
+    }
+    if ($out['ok'] && strlen($fullPatchJs) <= 1600000) {
+        $n = ipmiProxyValidateGeneratedJsWithNodeCheck($fullPatchJs);
+        if (!$n['ok']) {
+            $out['ok'] = false;
+            $out['reason'] = $n['reason'];
+        }
+    }
     if ($out['ok'] && stripos($fullPatchJs, 'function tryClickIloDiscoveryLaunch') !== false) {
         if (preg_match('/catch\s*\(\s*_q\s*\)\s*\{\s*\}\s*return""\s*;\s*\}\s*function\s+collectContexts\s*\(/', $fullPatchJs) !== 1) {
             $out['ok'] = false;
@@ -1387,6 +1532,14 @@ function ipmiProxyDumpInvalidGeneratedJsContext(string $js, string $reason, int 
             'depth'  => $depth,
         ]);
     }
+}
+
+function ipmiProxyBuildSafeFallbackRuntime(string $reason = ''): string
+{
+    $reason = substr(trim($reason), 0, 120);
+    return '(function(){try{if(typeof console!=="undefined"&&console.warn){console.warn("ilo_runtime_patch_disabled_due_to_invalid_js",'
+        . json_encode(['reason' => $reason], JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE)
+        . ');}}catch(e){}})();';
 }
 
 /**
@@ -1727,7 +1880,7 @@ function ipmiProxyIloHelperContributesToLaunch(string $pageType): bool
 }
 
 /**
- * When true, helper-side â€œhealthyâ€ hints must not flip aggregate success (caller enforces in FINAL / readiness).
+ * When true, helper-side “healthy” hints must not flip aggregate success (caller enforces in FINAL / readiness).
  */
 function ipmiProxyIloHelperCannotOverrideFailure(bool $transportHealthy, bool $applicationPromotionCommitted): bool
 {
@@ -2055,7 +2208,7 @@ function ipmiProxyInjectKvmAutoLaunchPatch(string $html, string $token, $session
                 ? (' data-ipmi-kvm-js-reason="' . htmlspecialchars((string) $jsVal['reason'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '"')
                 : '')
             . '>';
-        $stubBody = '(function(){try{if(typeof console!=="undefined"&&console.warn)console.warn("ilo_runtime_patch_disabled_due_to_invalid_js");}catch(e){}})();';
+        $stubBody = ipmiProxyBuildSafeFallbackRuntime((string) $jsVal['reason']);
         $patch = $scriptOpen . $stubBody . '</script>';
 
         if ($injectOut !== null) {
@@ -2379,7 +2532,7 @@ function ipmiProxyDetermineFinalUserFacingKvmMode(array $plan): string
 }
 
 /**
- * Non-blocking banner: session is panel-proxied (Tier B) â€” native console not strongly confirmed yet.
+ * Non-blocking banner: session is panel-proxied (Tier B) — native console not strongly confirmed yet.
  */
 function ipmiProxyInjectKvmPanelControlledBanner(string $html): string
 {
@@ -2471,7 +2624,7 @@ function ipmiProxyRewriteBmcResponseBody(string $body, string $bmcIp, string $to
         }
     }
 
-    // Root-relative rewrites: do NOT key off '"/js/' for JS bundles â€” jquery.min.js often contains that
+    // Root-relative rewrites: do NOT key off '"/js/' for JS bundles — jquery.min.js often contains that
     // substring. iLO HTML pages are small: always rewrite root-relative paths when vendor is iLO.
     // Supermicro/ASRockRack also depend on root-relative /cgi/ and /res/ assets.
     $typeNorm = ipmiWebNormalizeBmcType((string) $bmcType);
@@ -2735,7 +2888,7 @@ if (PHP_SAPI === 'cli' && getenv('IPMI_VALIDATE_KVM_JS') === '1') {
     exit($nodeCode === 0 ? 0 : 1);
 }
 
-// Default 30s max_execution_time kills mid-response after headers â†’ Chrome ERR_CONNECTION_RESET + "200 (OK)".
+// Default 30s max_execution_time kills mid-response after headers ? Chrome ERR_CONNECTION_RESET + "200 (OK)".
 // Large BMC assets + URL rewrites can exceed 30s on slow links; SSE uses set_time_limit(0) below.
 set_time_limit(300);
 ignore_user_abort(true);
@@ -2939,7 +3092,7 @@ if (!$panelUserId) {
 }
 
 // Release session lock immediately: the browser loads HTML + /js/iLO.js + CSS in parallel; holding
-// the lock here blocks those requests until the BMC response finishes â†’ failed script load, iLO undefined.
+// the lock here blocks those requests until the BMC response finishes ? failed script load, iLO undefined.
 if (session_status() === PHP_SESSION_ACTIVE) {
     session_write_close();
 }
@@ -3160,7 +3313,7 @@ function ipmiProxyIsIloEventStreamPath(string $bmcPath): bool
 }
 
 /**
- * Named HTML fragments (legacy allowlist â€” broader detection uses heuristics + context).
+ * Named HTML fragments (legacy allowlist — broader detection uses heuristics + context).
  */
 function ipmiProxyIloRuntimeFragmentPathNamed(string $bmcPath): bool
 {
@@ -3183,7 +3336,7 @@ function ipmiProxyIloRuntimeFragmentPathNamed(string $bmcPath): bool
 }
 
 /**
- * Full application / heavy HTML pages â€” never treat as small bootstrap fragments.
+ * Full application / heavy HTML pages — never treat as small bootstrap fragments.
  */
 function ipmiProxyIloHtmlFragmentPathStrictExclude(string $pLower): bool
 {
@@ -3679,7 +3832,7 @@ function ipmiProxyIloCanUpgradeToStrongConfirmation(array $confirmation): bool
 }
 
 /**
- * Read capability blob only (feature existence â€” not per-attempt confirmation).
+ * Read capability blob only (feature existence — not per-attempt confirmation).
  *
  * @param array<string, mixed> $session
  * @return array<string, mixed>
@@ -3865,7 +4018,7 @@ function ipmiProxyIloRecordStuckLoadingEscalation(array $readinessState): array
 }
 
 /**
- * Shellâ†’console launch discovery (server-side correlation; browser events are authoritative).
+ * Shell?console launch discovery (server-side correlation; browser events are authoritative).
  *
  * @return array<string, mixed>
  */
@@ -4042,7 +4195,7 @@ function ipmiProxyIloFinalizeReadinessFromDiscovery(array $readiness, array $dis
 }
 
 /**
- * Promote a narrow set of transport-shaped /html routes when native HTML5 is already proven â€” not bootstrap-critical.
+ * Promote a narrow set of transport-shaped /html routes when native HTML5 is already proven — not bootstrap-critical.
  *
  * @param array<string, mixed> $final role row from ipmiProxyClassifyIloPathRole + contextualize
  * @param array<string, mixed> $bootstrapState
@@ -4383,7 +4536,7 @@ function ipmiProxyIsIloBootstrapPath(string $bmcPath): bool
 }
 
 /**
- * Paths where a failed transport or 401/403/502 likely indicates stale iLO session â€” safe to try one auth refresh + retry.
+ * Paths where a failed transport or 401/403/502 likely indicates stale iLO session — safe to try one auth refresh + retry.
  */
 function ipmiProxyIsIloRecoverableRuntimePath(string $bmcPath): bool
 {
@@ -6086,7 +6239,7 @@ function ipmiProxyIloDebugFailureAxisFromReason(string $kind, string $reason): s
 }
 
 /**
- * Single authoritative iLO buffered (non-SSE) recovery: refresh â†’ reload DB row â†’ rebuild headers â†’ one retry.
+ * Single authoritative iLO buffered (non-SSE) recovery: refresh ? reload DB row ? rebuild headers ? one retry.
  *
  * @param array<string, mixed> $result
  */
@@ -6894,7 +7047,7 @@ function ipmiProxyRecoverBmcAuthBeforeSse(array &$session, mysqli $mysqli, strin
 
 /**
  * Long-lived Server-Sent Events (and similar) must be streamed. Buffering the full response
- * in PHP (CURLOPT_RETURNTRANSFER) blocks until the BMC closes the stream â†’ endless "loading".
+ * in PHP (CURLOPT_RETURNTRANSFER) blocks until the BMC closes the stream ? endless "loading".
  */
 function ipmiProxyShouldStreamBmcRequest(string $method, string $bmcPath): bool
 {
@@ -6993,7 +7146,7 @@ function ipmiProxyTryEmitStaticFallback(string $bmcPath): bool
 }
 
 /**
- * Stream SSE or long-poll JSON from the BMC. Aborts before sending bytes if status is 401/403/502/503 (502/503: recoverable upstream â€” proxy may refresh auth and retry once).
+ * Stream SSE or long-poll JSON from the BMC. Aborts before sending bytes if status is 401/403/502/503 (502/503: recoverable upstream — proxy may refresh auth and retry once).
  *
  * @return array{ok: bool, auth_rejected: bool, applied_resolve: bool, curl_errno?: int, curl_error?: string, sse_recoverable_http?: bool, sse_recover_http_code?: int}
  */

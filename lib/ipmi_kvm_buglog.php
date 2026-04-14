@@ -2915,11 +2915,13 @@ function ipmiKvmBugHistorySummarizeRegressionPatterns(): array
     }
     $primary = ipmiKvmBugHistoryPrimaryReferenceIndex();
     $primaryRel = ipmiKvmBugHistoryPrimaryReferenceRel();
+    $explicit6Exists = is_file(ipmiKvmBugFilePathForIndex(6));
     $explicit5Exists = is_file(ipmiKvmBugFilePathForIndex(5));
     $explicit4Exists = is_file(ipmiKvmBugFilePathForIndex(4));
-    $designatedIdx = 5;
+    $designatedIdx = 6;
     $designatedRel = ipmiKvmBugFileRelForIndex($designatedIdx);
-    $designatedRaw = $explicit5Exists ? ipmiKvmBugHistoryLoad($designatedRel) : null;
+    $designatedRaw = $explicit6Exists ? ipmiKvmBugHistoryLoad($designatedRel) : null;
+    $historicalBugs5Raw = $explicit5Exists ? ipmiKvmBugHistoryLoad(ipmiKvmBugFileRelForIndex(5)) : null;
     $historicalBugs4Raw = $explicit4Exists ? ipmiKvmBugHistoryLoad(ipmiKvmBugFileRelForIndex(4)) : null;
 
     return [
@@ -2929,11 +2931,15 @@ function ipmiKvmBugHistorySummarizeRegressionPatterns(): array
         'primary_reference_explanation' => 'On disk, the latest preserved run is the highest bugsN.txt index (e.g. bugs6.txt when N=6 is max).',
         'designated_human_reference_index' => $designatedIdx,
         'designated_human_reference_rel' => $designatedRel,
-        'designated_human_reference_note' => 'Client regression review treats bugs/bugs5.txt as the main written reference when present; older runs (bugs1–bugs4) are history only.',
+        'designated_human_reference_note' => 'Client regression review treats bugs/bugs6.txt as the main written reference when present; older runs (bugs1, bugs2, bugs4, bugs5) are history evidence.',
         'designated_human_reference_loaded' => $designatedRaw !== null,
         'designated_human_reference_final_snapshot' => $designatedRaw !== null ? ipmiKvmBugHistoryParseFinalSnapshot($designatedRaw) : [],
+        'historical_bugs5_reference_loaded' => $historicalBugs5Raw !== null,
+        'historical_bugs5_final_snapshot' => $historicalBugs5Raw !== null ? ipmiKvmBugHistoryParseFinalSnapshot($historicalBugs5Raw) : [],
         'historical_bugs4_reference_loaded' => $historicalBugs4Raw !== null,
         'historical_bugs4_final_snapshot' => $historicalBugs4Raw !== null ? ipmiKvmBugHistoryParseFinalSnapshot($historicalBugs4Raw) : [],
+        'explicit_bugs6_txt_present' => $explicit6Exists,
+        'bugs6_matches_primary_reference' => $primary === 6 && $explicit6Exists,
         'explicit_bugs5_txt_present' => $explicit5Exists,
         'bugs5_matches_primary_reference' => $primary === 5 && $explicit5Exists,
         'explicit_bugs4_txt_present' => $explicit4Exists,
